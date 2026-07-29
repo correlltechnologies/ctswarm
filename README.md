@@ -52,9 +52,35 @@ Then:
 ```bash
 ctswarm doctor      # what is wired up, what is missing
 ctswarm bench       # qualify local models, write the routing table
-ctswarm serve       # start the router + approval service
+ctswarm capacity    # remaining headroom per runtime, and which one gets picked
+ctswarm route       # explain what the router would choose for a role, and why
+ctswarm serve       # start the router
+ctswarm committee   # put a judgement call to an independent multi-model vote
+ctswarm usage       # model usage, cost, and the local-inference fraction
 ctswarm verify      # run the self-verification probe suite
 ```
+
+## Verification committees
+
+Section 2 of the plan calls for committees rather than one model's judgment, and
+section 9 requires "multiple independent models **and** deterministic scanners"
+for security, because "committee agreement alone cannot establish security".
+
+Two rules make that real rather than decorative:
+
+**Independence is by model family, not model count.** Three Qwen models agreeing
+is one opinion sampled three times: they share training data, tokenizer, and
+failure modes, so they are wrong together and confidently. Quorum requires
+distinct families, same-family votes collapse to one, and a split family resolves
+to its *reject*.
+
+**Scanners are authoritative; models are advisory.** A unanimous panel cannot
+vote away a secret-scanner hit or a failing test. Models may add findings, never
+subtract them.
+
+Unparseable votes abstain rather than approve, ties escalate to a human, and only
+bench-eligible models may sit: a reviewer that cannot emit parseable output is
+not a reviewer.
 
 ## The two-tier switching model
 
