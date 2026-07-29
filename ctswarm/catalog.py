@@ -16,11 +16,10 @@ Two hard rules encoded here:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
-from .platform_detect import Accelerator, HostProfile
+from .platform_detect import HostProfile
 
 
 class Tier(str, Enum):
@@ -75,8 +74,8 @@ class ModelSpec:
     # Mixture-of-experts models tolerate spilling past accelerator memory far
     # better than dense ones, because only a fraction of parameters are active
     # per token. None means dense.
-    active_params_b: Optional[float] = None
-    total_params_b: Optional[float] = None
+    active_params_b: float | None = None
+    total_params_b: float | None = None
     tiers: tuple[Tier, ...] = ()
     notes: str = ""
     # False when the reference has not been confirmed to resolve on a registry.
@@ -84,7 +83,7 @@ class ModelSpec:
     verified_ref: bool = False
     # Minimum backend version, when the model refuses to pull on older releases.
     # Recorded so doctor can explain a failed pull instead of leaving a gap.
-    requires_ollama: Optional[str] = None
+    requires_ollama: str | None = None
 
     @property
     def is_moe(self) -> bool:

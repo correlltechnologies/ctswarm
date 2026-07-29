@@ -20,8 +20,8 @@ Every task is checkable programmatically. Nothing here is graded by another mode
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
 
 # A deliberately unambiguous tool. If a model cannot call this correctly, no
 # amount of prompt engineering will make the 22-agent tool surface work.
@@ -87,11 +87,11 @@ class Task:
     name: str
     category: str  # tool_call | schema | long_context | instruction | cancel
     messages: list[dict]
-    tools: Optional[list[dict]] = None
-    response_format: Optional[dict] = None
+    tools: list[dict] | None = None
+    response_format: dict | None = None
     max_tokens: int = 512
     # Returns (passed, detail). Never calls a model.
-    check: Optional[Callable[[dict], tuple[bool, str]]] = None
+    check: Callable[[dict], tuple[bool, str]] | None = None
     timeout_s: float = 90.0
     weight: float = 1.0
     metadata: dict = field(default_factory=dict)
@@ -111,7 +111,7 @@ def _tool_calls(body: dict) -> list[dict]:
     return _first_message(body).get("tool_calls") or []
 
 
-def _parse_args(call: dict) -> Optional[dict]:
+def _parse_args(call: dict) -> dict | None:
     """Decode tool-call arguments, tolerating the dict form some models emit."""
     import json
 

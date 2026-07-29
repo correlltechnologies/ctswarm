@@ -116,4 +116,6 @@ tags: [ctswarm, index, auto-generated]
 - [[correll-voice-crm/docs/integration]]
 - [[correll-voice-crm/docs/phase-4-handoff]]
 - [[correll-voice-crm/PRODUCT]]
+- [[docs/SLACK]]
+- [[docs/VERIFIED]]
 

@@ -20,7 +20,6 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from ..backends import Backend
 from ..backends.base import ChatRequest
@@ -38,7 +37,7 @@ class TaskResult:
     detail: str
     latency_ms: int
     output_tokens: int = 0
-    failure_kind: Optional[str] = None
+    failure_kind: str | None = None
 
 
 @dataclass
@@ -52,7 +51,7 @@ class ModelResult:
     cancel_detail: str = ""
     max_context_ok: int = 0
     tokens_per_s: float = 0.0
-    error: Optional[str] = None
+    error: str | None = None
 
     def rate(self, category: str) -> float:
         """Pass rate within a category, or 0.0 when the category never ran.
@@ -254,7 +253,7 @@ async def bench_model(
     backend: Backend,
     model_ref: str,
     *,
-    tasks: Optional[tuple[Task, ...]] = None,
+    tasks: tuple[Task, ...] | None = None,
     on_progress=None,
 ) -> ModelResult:
     """Run the full suite against one model, sequentially."""
@@ -301,7 +300,7 @@ async def bench_all(
     backend: Backend,
     model_refs: list[str],
     *,
-    tasks: Optional[tuple[Task, ...]] = None,
+    tasks: tuple[Task, ...] | None = None,
     on_progress=None,
     on_model_done=None,
 ) -> list[ModelResult]:
@@ -335,7 +334,7 @@ async def bench_all(
     return results
 
 
-async def _blocked_reason(backend: Backend, model_ref: str) -> Optional[str]:
+async def _blocked_reason(backend: Backend, model_ref: str) -> str | None:
     """Why this model cannot be fairly measured right now, or None."""
     wedged_fn = getattr(backend, "wedged_models", None)
     if wedged_fn:

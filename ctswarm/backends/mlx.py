@@ -15,11 +15,8 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
-from typing import Optional
 
-import httpx
-
-from .openai_compat import OpenAICompatBackend, connect_probe_timeout
+from .openai_compat import OpenAICompatBackend
 
 
 class MLXBackend(OpenAICompatBackend):
@@ -37,7 +34,7 @@ class MLXBackend(OpenAICompatBackend):
             metered=False,
             **kwargs,
         )
-        self._pinned: Optional[str] = None
+        self._pinned: str | None = None
 
     async def list_models(self) -> list[str]:
         models = await super().list_models()

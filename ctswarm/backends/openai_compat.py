@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
 
 import httpx
 
@@ -32,11 +31,11 @@ class OpenAICompatBackend(Backend):
         *,
         name: str,
         base_url: str,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         timeout_s: float = 300.0,
         connect_timeout_s: float = 5.0,
         metered: bool = False,
-        extra_headers: Optional[dict] = None,
+        extra_headers: dict | None = None,
     ) -> None:
         self.name = name
         self.metered = metered

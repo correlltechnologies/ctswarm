@@ -13,7 +13,6 @@ import shutil
 import subprocess
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Optional
 
 
 class Accelerator(str, Enum):
@@ -37,7 +36,7 @@ class HostProfile:
     # with the OS, so we report a usable fraction rather than the raw total.
     accel_memory_gb: float
     system_memory_gb: float
-    gpu_name: Optional[str] = None
+    gpu_name: str | None = None
     has_ollama: bool = False
     has_mlx: bool = False
     has_lmstudio: bool = False
@@ -78,7 +77,7 @@ class HostProfile:
         }
 
 
-def _run(cmd: list[str], timeout: int = 10) -> Optional[str]:
+def _run(cmd: list[str], timeout: int = 10) -> str | None:
     """Run a command, returning stripped stdout or None on any failure.
 
     Detection must never raise. A machine that lacks a tool is a normal case, not
@@ -95,7 +94,7 @@ def _run(cmd: list[str], timeout: int = 10) -> Optional[str]:
     return proc.stdout.strip() or None
 
 
-def _detect_cuda() -> tuple[Optional[str], float]:
+def _detect_cuda() -> tuple[str | None, float]:
     """Return (gpu_name, vram_gib) for the largest visible NVIDIA GPU."""
     out = _run(
         [
@@ -121,7 +120,7 @@ def _detect_cuda() -> tuple[Optional[str], float]:
     return best_name, best_mem
 
 
-def _detect_apple() -> tuple[Optional[str], float]:
+def _detect_apple() -> tuple[str | None, float]:
     """Return (chip_name, usable_unified_memory_gib) on Apple Silicon.
 
     Unified memory is shared with the OS and every other process, so handing the
@@ -153,7 +152,7 @@ def _detect_system_memory_gb() -> float:
     # Linux: read MemTotal directly rather than shelling out to free(1), which
     # varies in output format across distributions.
     try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
             for line in handle:
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) / (1024**2)
@@ -191,7 +190,7 @@ def detect_host() -> HostProfile:
     system_memory_gb = _detect_system_memory_gb()
 
     accelerator = Accelerator.CPU
-    gpu_name: Optional[str] = None
+    gpu_name: str | None = None
     accel_memory_gb = 0.0
 
     if os_name == "Darwin" and arch in ("arm64", "aarch64"):

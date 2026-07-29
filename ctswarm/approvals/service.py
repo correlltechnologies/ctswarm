@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..ledger import Ledger
-from .rules import ApprovalRequest, Decision, Risk, classify
+from .rules import Decision, classify
 from .slack import SlackNotifier, verify_signature
 from .store import ApprovalStore
 

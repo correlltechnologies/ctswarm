@@ -20,7 +20,6 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class Risk(str, Enum):
@@ -263,7 +262,7 @@ class ApprovalRequest:
 
 def classify(
     *, action: str, detail: str = "", **card_fields
-) -> Optional[ApprovalRequest]:
+) -> ApprovalRequest | None:
     """Decide whether an action needs approval.
 
     Returns None when the action may proceed autonomously. The never-escalate

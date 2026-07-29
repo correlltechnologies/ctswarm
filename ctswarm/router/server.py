@@ -20,9 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -130,7 +128,7 @@ def _estimate_context(messages: list[dict]) -> int:
     return int(characters / 3.0) + 1024
 
 
-def _parse_virtual(model: str) -> tuple[Optional[Tier], Optional[tuple[str, str]]]:
+def _parse_virtual(model: str) -> tuple[Tier | None, tuple[str, str] | None]:
     """Split a requested model into (tier, explicit pin).
 
     ``ctswarm/med``                 -> (MED, None)
@@ -202,8 +200,8 @@ async def list_models(request: Request) -> JSONResponse:
 @app.get("/routing/explain")
 async def explain(
     request: Request,
-    role: Optional[str] = None,
-    tier: Optional[str] = None,
+    role: str | None = None,
+    tier: str | None = None,
     tools: bool = True,
     context: int = 8192,
 ) -> JSONResponse:

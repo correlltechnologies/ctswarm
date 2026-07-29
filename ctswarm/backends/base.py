@@ -12,7 +12,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 class FailureKind(str):
@@ -52,11 +52,11 @@ class ChatRequest:
 
     messages: list[dict]
     model: str
-    tools: Optional[list[dict]] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
+    tools: list[dict] | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
     stream: bool = False
-    response_format: Optional[dict] = None
+    response_format: dict | None = None
     extra: dict = field(default_factory=dict)
 
     def for_backend(self, model_ref: str) -> dict:
@@ -80,12 +80,12 @@ class ChatRequest:
         return payload
 
     @property
-    def role(self) -> Optional[str]:
+    def role(self) -> str | None:
         """SWE-AF role name, when the caller declared one."""
         return self.extra.get("ctswarm_role")
 
     @property
-    def build_id(self) -> Optional[str]:
+    def build_id(self) -> str | None:
         return self.extra.get("ctswarm_build_id")
 
     @property
@@ -105,7 +105,7 @@ class ChatResponse:
     prompt_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
-    failure_kind: Optional[str] = None
+    failure_kind: str | None = None
     error_detail: str = ""
 
     @property
@@ -148,7 +148,7 @@ def classify_http_failure(status: int, body_text: str) -> str:
     return FailureKind.SERVER_ERROR
 
 
-def inspect_completion(body: dict, *, expected_tools: bool) -> Optional[str]:
+def inspect_completion(body: dict, *, expected_tools: bool) -> str | None:
     """Validate a 200-OK completion, returning a failure kind or None.
 
     An HTTP 200 does not mean the model did its job. This is where most local

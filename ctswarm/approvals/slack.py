@@ -18,7 +18,6 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Optional
 
 import httpx
 
@@ -274,9 +273,9 @@ class SlackNotifier:
     def __init__(
         self,
         *,
-        bot_token: Optional[str],
-        channel: Optional[str],
-        signing_secret: Optional[str] = None,
+        bot_token: str | None,
+        channel: str | None,
+        signing_secret: str | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.channel = channel

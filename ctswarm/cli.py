@@ -14,7 +14,6 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -23,7 +22,7 @@ from rich.table import Table
 from .backends import build_backends
 from .bench.runner import bench_all, write_results
 from .bench.suite import build_suite
-from .catalog import Tier, build_catalog
+from .catalog import build_catalog
 from .ledger import Ledger
 from .platform_detect import detect_host
 from .router.policy import RoutingTable
@@ -170,7 +169,7 @@ def _gh_authed() -> bool:
 
 @app.command()
 def bench(
-    models: Optional[str] = typer.Option(
+    models: str | None = typer.Option(
         None, help="Comma-separated model refs. Default: every installed candidate."
     ),
     backend: str = typer.Option("ollama", help="Backend to bench against."),
@@ -321,7 +320,7 @@ def serve(
 
 
 @app.command()
-def usage(build_id: Optional[str] = typer.Option(None, help="Scope to one build.")) -> None:
+def usage(build_id: str | None = typer.Option(None, help="Scope to one build.")) -> None:
     """Show model usage, cost, and the local-inference fraction."""
     ledger = Ledger()
     summary = ledger.usage_summary(build_id)
@@ -348,3 +347,65 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@app.command()
+def verify(
+    router: str = typer.Option("http://localhost:8090", help="Router base URL."),
+    approvals: str = typer.Option("http://localhost:8091", help="Approval service URL."),
+    sandbox: str = typer.Option("sandbox", help="Path to the sandbox target."),
+    repo: str | None = typer.Option(None, help="Target repo to assert isolation on."),
+    allow_skips: bool = typer.Option(
+        False, help="Exit 0 even when probes were skipped."
+    ),
+    json_out: str | None = typer.Option(None, "--json", help="Write results to a file."),
+) -> None:
+    """Run the self-verification probe suite and print a scoreboard.
+
+    Exits non-zero on any failure, and also on any skip unless --allow-skips is
+    given. A suite that reports green because it quietly skipped its assertions
+    manufactures confidence it did not earn.
+    """
+    from .verify.probes import Status, VerifyContext, run_all
+
+    ctx = VerifyContext(
+        router_url=router.rstrip("/"),
+        approvals_url=approvals.rstrip("/"),
+        sandbox_path=Path(sandbox),
+        repo_path=Path(repo) if repo else None,
+    )
+
+    results = asyncio.run(run_all(ctx))
+
+    console.print("\n[bold]ctswarm verification[/bold]\n")
+    colors = {Status.PASS: "green", Status.FAIL: "red", Status.SKIP: "yellow"}
+    for result in results:
+        color = colors[result.status]
+        console.print(
+            f"  [{color}]{result.status.value:<4}[/{color}]  "
+            f"[bold]{result.name:<18}[/bold]  {result.summary}"
+        )
+
+    failed = [r for r in results if r.status is Status.FAIL]
+    skipped = [r for r in results if r.status is Status.SKIP]
+    passed = [r for r in results if r.status is Status.PASS]
+
+    console.print(
+        f"\n  {len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped\n"
+    )
+
+    if json_out:
+        Path(json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(json_out).write_text(
+            json.dumps([r.to_dict() for r in results], indent=2), encoding="utf-8"
+        )
+        console.print(f"[dim]wrote {json_out}[/dim]\n")
+
+    if failed:
+        raise typer.Exit(1)
+    if skipped and not allow_skips:
+        console.print(
+            "[yellow]Skipped probes are not passes. Re-run with --allow-skips to "
+            "accept, or resolve the preconditions above.[/yellow]\n"
+        )
+        raise typer.Exit(2)

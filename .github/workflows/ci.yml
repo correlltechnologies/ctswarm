@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The factory opens PRs against protected branches. CI is one of the
+# deterministic gates that decides whether they can merge, so it must not be
+# something an agent can weaken: agents get no `workflows` permission.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: ctswarm (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check ctswarm tests
+
+      - name: Test
+        run: pytest tests/ -q
+
+      # Platform detection must never raise, on any runner, including ones with
+      # no GPU at all. A crash here would break bootstrap on a fresh clone.
+      - name: Platform detection survives a bare runner
+        run: python -m ctswarm.platform_detect
+
+      # The anti-slop gate is applied to ctswarm itself. A governance layer that
+      # exempts its own source from its own rules is not credible.
+      - name: Anti-slop self-check
+        run: |
+          python - <<'PY'
+          import sys
+          from ctswarm.evidence.antislop import check_repo
+          report = check_repo("ctswarm")
+          for finding in report.blockers:
+              print(f"BLOCKER {finding.file}:{finding.line} {finding.check}")
+          print(f"{len(report.blockers)} blockers, {len(report.warnings)} warnings")
+          sys.exit(1 if report.blockers else 0)
+          PY
+
+  sandbox:
+    name: sandbox target
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sandbox
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sandbox/package-lock.json
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Includes the OpenAPI contract test. A PR that adds a route without
+      # documenting it fails here, which is the point of the trap.
+      - name: Test
+        run: npm test
+
+      - name: Coverage thresholds
+        run: npm run test:coverage
+
+  trap:
+    name: anti-slop trap is alive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sandbox/package-lock.json
+
+      - run: npm ci
+        working-directory: sandbox
+
+      # Guards the guard. A trap that stops firing would let the whole
+      # verification suite report green without asserting anything, so CI
+      # confirms it still catches an undocumented route.
+      - name: Undocumented route must fail the contract test
+        working-directory: sandbox
+        run: |
+          cp src/routes.ts /tmp/routes.bak
+          python3 - <<'PY'
+          path = "src/routes.ts"
+          marker = '{ method: "delete", path: "/items/:id", summary: "Delete an item" },'
+          source = open(path).read()
+          assert marker in source, "route table shape changed; update this check"
+          open(path, "w").write(source.replace(
+              marker,
+              marker + '\n  { method: "get", path: "/healthz", summary: "Health check" },',
+          ))
+          PY
+          if npm test --silent > /tmp/trap.log 2>&1; then
+            echo "::error::The anti-slop trap did not fire. An undocumented route passed the contract test."
+            cp /tmp/routes.bak src/routes.ts
+            exit 1
+          fi
+          echo "Trap fired correctly:"
+          grep -A2 "served but missing" /tmp/trap.log || true
+          cp /tmp/routes.bak src/routes.ts

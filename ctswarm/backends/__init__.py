@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 from ..platform_detect import HostProfile, detect_host
 from .base import (
@@ -36,7 +35,7 @@ __all__ = [
 
 
 def build_backends(
-    host: Optional[HostProfile] = None, env: Optional[dict] = None
+    host: HostProfile | None = None, env: dict | None = None
 ) -> dict[str, Backend]:
     """Assemble the backends available on this host.
 

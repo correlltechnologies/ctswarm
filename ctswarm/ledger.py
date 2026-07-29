@@ -18,10 +18,11 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -142,14 +143,14 @@ class Ledger:
         backend: str,
         model_ref: str,
         ok: bool,
-        build_id: Optional[str] = None,
-        role: Optional[str] = None,
-        tier: Optional[str] = None,
-        virtual_model: Optional[str] = None,
+        build_id: str | None = None,
+        role: str | None = None,
+        tier: str | None = None,
+        virtual_model: str | None = None,
         prompt_tokens: int = 0,
         output_tokens: int = 0,
         latency_ms: int = 0,
-        failure_kind: Optional[str] = None,
+        failure_kind: str | None = None,
         cost_usd: float = 0.0,
         attempt: int = 1,
     ) -> None:
@@ -183,7 +184,7 @@ class Ledger:
         conn: sqlite3.Connection,
         model_ref: str,
         ok: bool,
-        failure_kind: Optional[str],
+        failure_kind: str | None,
     ) -> None:
         """Advance circuit-breaker state for a model.
 
@@ -225,7 +226,7 @@ class Ledger:
         )
 
     def record_event(
-        self, kind: str, detail: Any = None, build_id: Optional[str] = None
+        self, kind: str, detail: Any = None, build_id: str | None = None
     ) -> None:
         payload = detail if isinstance(detail, str) else json.dumps(detail, default=str)
         with self._lock, self._connect() as conn:
@@ -238,9 +239,9 @@ class Ledger:
         self,
         provider: str,
         *,
-        remaining: Optional[float] = None,
-        limit_value: Optional[float] = None,
-        resets_at: Optional[float] = None,
+        remaining: float | None = None,
+        limit_value: float | None = None,
+        resets_at: float | None = None,
         raw: Any = None,
     ) -> None:
         with self._lock, self._connect() as conn:
@@ -304,14 +305,14 @@ class Ledger:
             failure_kinds=kinds,
         )
 
-    def quota(self, provider: str) -> Optional[dict]:
+    def quota(self, provider: str) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM quota WHERE provider=?", (provider,)
             ).fetchone()
         return dict(row) if row else None
 
-    def events(self, kind: Optional[str] = None, build_id: Optional[str] = None) -> list[dict]:
+    def events(self, kind: str | None = None, build_id: str | None = None) -> list[dict]:
         clauses, params = [], []
         if kind:
             clauses.append("kind=?")
@@ -326,7 +327,7 @@ class Ledger:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def usage_summary(self, build_id: Optional[str] = None) -> dict:
+    def usage_summary(self, build_id: str | None = None) -> dict:
         """Per-backend rollup. Feeds the pilot criterion that at least 80% of
         routine agent calls are served locally."""
         where, params = ("WHERE build_id=?", [build_id]) if build_id else ("", [])

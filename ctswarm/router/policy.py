@@ -16,11 +16,10 @@ is a hard eligibility filter, not a scoring term that good latency can offset.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-from ..catalog import CatalogEntry, ModelSpec, Tier, build_catalog, tier_for_role
+from ..catalog import CatalogEntry, Tier, build_catalog, tier_for_role
 from ..ledger import Ledger
 from ..platform_detect import HostProfile
 
@@ -97,7 +96,7 @@ class BenchScore:
         }
 
     @staticmethod
-    def from_dict(data: dict) -> "BenchScore":
+    def from_dict(data: dict) -> BenchScore:
         return BenchScore(
             model_ref=data["model_ref"],
             backend=data["backend"],
@@ -140,7 +139,7 @@ class Candidate:
 class RoutingDecision:
     """The ordered dispatch plan for one request."""
 
-    primary: Optional[Candidate]
+    primary: Candidate | None
     fallbacks: tuple[Candidate, ...]
     excluded: tuple[tuple[str, str], ...]  # (model_ref, why)
     tier: Tier
@@ -166,13 +165,13 @@ class RoutingTable:
     reason so the behavior is visible rather than silent.
     """
 
-    def __init__(self, scores: Optional[dict[str, BenchScore]] = None) -> None:
+    def __init__(self, scores: dict[str, BenchScore] | None = None) -> None:
         self._scores = dict(scores or {})
 
     def __contains__(self, model_ref: str) -> bool:
         return model_ref in self._scores
 
-    def get(self, model_ref: str) -> Optional[BenchScore]:
+    def get(self, model_ref: str) -> BenchScore | None:
         return self._scores.get(model_ref)
 
     @property
@@ -183,7 +182,7 @@ class RoutingTable:
         return tuple(self._scores.values())
 
     @staticmethod
-    def load(path: str | Path = "bench/results/routing.json") -> "RoutingTable":
+    def load(path: str | Path = "bench/results/routing.json") -> RoutingTable:
         path = Path(path)
         if not path.exists():
             return RoutingTable()
@@ -218,7 +217,7 @@ class Router:
         *,
         host: HostProfile,
         ledger: Ledger,
-        table: Optional[RoutingTable] = None,
+        table: RoutingTable | None = None,
         budget_usd_remaining: float = 0.0,
         prefer_local: bool = True,
     ) -> None:
@@ -241,7 +240,7 @@ class Router:
         privacy: str,
         installed: set[str],
         warm: set[str],
-    ) -> Optional[str]:
+    ) -> str | None:
         """Why this candidate cannot serve the request, or None if it can."""
         spec = entry.spec
 
@@ -313,7 +312,7 @@ class Router:
             score += 0.10
             reasons.append("already resident")
 
-        if self.prefer_local and not entry.spec.backend in ("openrouter",):
+        if self.prefer_local and entry.spec.backend not in ("openrouter",):
             score += 0.05
             reasons.append("local")
 
@@ -324,13 +323,13 @@ class Router:
     def decide(
         self,
         *,
-        role: Optional[str] = None,
-        tier: Optional[Tier] = None,
+        role: str | None = None,
+        tier: Tier | None = None,
         needs_tools: bool = True,
         min_context: int = 8192,
         privacy: str = Privacy.ANY,
-        installed: Optional[set[str]] = None,
-        warm: Optional[set[str]] = None,
+        installed: set[str] | None = None,
+        warm: set[str] | None = None,
         max_fallbacks: int = 3,
     ) -> RoutingDecision:
         """Produce an ordered dispatch chain for one request."""

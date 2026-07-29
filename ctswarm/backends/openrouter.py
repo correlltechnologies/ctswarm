@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
 
 import httpx
 
@@ -100,7 +99,7 @@ class OpenRouterBackend(OpenAICompatBackend):
         """
         return model_ref in self._free_models or model_ref.endswith(":free")
 
-    async def quota(self) -> Optional[dict]:
+    async def quota(self) -> dict | None:
         """Remaining credit and rate-limit state for the configured key.
 
         Returned shape is normalized for the ledger: ``remaining`` is credits

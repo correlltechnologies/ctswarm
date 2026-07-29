@@ -15,11 +15,11 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
 
-from .rules import ApprovalRequest, Decision, Risk
+from .rules import ApprovalRequest, Decision
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS approvals (
@@ -151,7 +151,7 @@ class ApprovalStore:
             ).fetchone()
         return dict(row)
 
-    def current_decision(self, dedupe_key: str) -> Optional[dict]:
+    def current_decision(self, dedupe_key: str) -> dict | None:
         """Latest decision for a request, or None if still open."""
         with self._connect() as conn:
             row = conn.execute(
@@ -161,7 +161,7 @@ class ApprovalStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def get(self, dedupe_key: str) -> Optional[dict]:
+    def get(self, dedupe_key: str) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM approvals WHERE dedupe_key=?", (dedupe_key,)

@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
 
 
 @dataclass(frozen=True)
@@ -69,9 +69,9 @@ class Check:
     why: str
     pattern: re.Pattern
     # Restrict to these suffixes, or None for all source files.
-    suffixes: Optional[frozenset] = None
+    suffixes: frozenset | None = None
     # A line matching this is exempt, used to allow deliberate, declared cases.
-    exempt: Optional[re.Pattern] = None
+    exempt: re.Pattern | None = None
 
 
 # An explicit, greppable opt-out. Anything genuinely intended stays in the
@@ -206,7 +206,7 @@ def scan_text(path: str, text: str) -> list[Finding]:
     return findings
 
 
-def scan_paths(root: str | Path, paths: Optional[Iterable[str]] = None) -> list[Finding]:
+def scan_paths(root: str | Path, paths: Iterable[str] | None = None) -> list[Finding]:
     """Scan a repository, or a specific set of files within it."""
     root = Path(root)
     targets: list[Path]
@@ -281,7 +281,7 @@ class AntiSlopReport:
 
 
 def check_repo(
-    repo: str | Path, *, base_ref: Optional[str] = None
+    repo: str | Path, *, base_ref: str | None = None
 ) -> AntiSlopReport:
     """Run the anti-slop gate over a repository or its diff."""
     paths = changed_files(repo, base_ref) if base_ref else None
