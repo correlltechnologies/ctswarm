@@ -143,6 +143,10 @@ class RoutingDecision:
     fallbacks: tuple[Candidate, ...]
     excluded: tuple[tuple[str, str], ...]  # (model_ref, why)
     tier: Tier
+    # Set when no model was eligible at the requested tier and the request was
+    # served from a lower one. Surfaced so a build can escalate to a cloud
+    # runtime rather than unknowingly planning with an under-provisioned model.
+    degraded_from: Tier | None = None
 
     @property
     def chain(self) -> tuple[Candidate, ...]:
@@ -154,6 +158,7 @@ class RoutingDecision:
             "primary": self.primary.to_dict() if self.primary else None,
             "fallbacks": [c.to_dict() for c in self.fallbacks],
             "excluded": [{"model": m, "why": w} for m, w in self.excluded],
+            "degraded": self.degraded_from.value if self.degraded_from else None,
         }
 
 
@@ -244,6 +249,8 @@ class Router:
         """Why this candidate cannot serve the request, or None if it can."""
         spec = entry.spec
 
+        if spec.quarantined:
+            return "quarantined: known to wedge the shared inference queue"
         if entry.placement == "unavailable":
             return f"does not fit host memory ({spec.weight_gb}GB)"
         if tier not in spec.tiers:
@@ -339,31 +346,55 @@ class Router:
 
         eligible: list[Candidate] = []
         excluded: list[tuple[str, str]] = []
+        degraded_from: Tier | None = None
 
-        for entry in self._catalog:
-            reason = self._ineligible_reason(
-                entry,
-                tier=resolved_tier,
-                needs_tools=needs_tools,
-                min_context=min_context,
-                privacy=privacy,
-                installed=installed,
-                warm=warm,
-            )
-            if reason:
-                excluded.append((entry.spec.ref, reason))
-                continue
-            score, why = self._score(entry, warm)
-            eligible.append(
-                Candidate(
-                    backend=entry.spec.backend,
-                    model_ref=entry.spec.ref,
-                    tier=resolved_tier,
-                    score=score,
-                    reason=why,
-                    metered=False,
+        # Tiers are ranked priors, not hard partitions, and the catalog's tier
+        # assignments are guesses that the bench supersedes. When a tier has no
+        # eligible model, serving the request from the next tier down beats
+        # returning nothing: an empty high tier would hard-fail every planning
+        # role and stall the build before it began.
+        #
+        # This is a *degradation*, and it is labelled as one. A 9B model that
+        # aced the bench is still not evidence of architectural reasoning depth,
+        # which the bench does not measure. The decision says so rather than
+        # quietly presenting a med-tier model as a high-tier one.
+        for attempt_tier in _tier_descent(resolved_tier):
+            eligible = []
+            attempt_excluded: list[tuple[str, str]] = []
+
+            for entry in self._catalog:
+                reason = self._ineligible_reason(
+                    entry,
+                    tier=attempt_tier,
+                    needs_tools=needs_tools,
+                    min_context=min_context,
+                    privacy=privacy,
+                    installed=installed,
+                    warm=warm,
                 )
-            )
+                if reason:
+                    attempt_excluded.append((entry.spec.ref, reason))
+                    continue
+                score, why = self._score(entry, warm)
+                if attempt_tier is not resolved_tier:
+                    why = f"{why}; DEGRADED from {resolved_tier.value} tier"
+                eligible.append(
+                    Candidate(
+                        backend=entry.spec.backend,
+                        model_ref=entry.spec.ref,
+                        tier=resolved_tier,
+                        score=score,
+                        reason=why,
+                        metered=False,
+                    )
+                )
+
+            if eligible:
+                if attempt_tier is not resolved_tier:
+                    degraded_from = attempt_tier
+                excluded = attempt_excluded
+                break
+            excluded = attempt_excluded
 
         eligible.sort(key=lambda c: c.score, reverse=True)
 
@@ -377,7 +408,19 @@ class Router:
             fallbacks=tuple(chain[1:]),
             excluded=tuple(excluded),
             tier=resolved_tier,
+            degraded_from=degraded_from,
         )
+
+
+def _tier_descent(tier: Tier) -> tuple[Tier, ...]:
+    """The tier itself, then progressively lower tiers to fall back through.
+
+    Never ascends. Promoting a low-tier model into a planning role would be a
+    silent quality regression in the direction that matters most, since planning
+    errors propagate across every issue in the build.
+    """
+    order = (Tier.HIGH, Tier.MED, Tier.LOW)
+    return order[order.index(tier):]
 
 
 def _diversify(candidates: list[Candidate], *, limit: int) -> list[Candidate]:

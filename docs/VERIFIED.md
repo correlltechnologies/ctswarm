@@ -48,11 +48,46 @@ on any of this in a new environment.
 | Anti-slop gates fire | `scan_text` against crafted samples | All 8 checks fire; **zero false positives** on the clean sandbox |
 | Approval rule invariants | `pytest tests/` | 24/24 passing |
 
+## Bench results (2026-07-29, RTX 5070 / 11.9GB VRAM)
+
+Produced by `ctswarm bench`. Eligibility requires tool-call >= 90%, schema >= 85%,
+and clean cancellation, because those are the behaviors that stall a DAG rather
+than merely degrade output.
+
+| Model | Tools | Schema | Long ctx | Instr | tok/s | Verdict |
+|---|---|---|---|---|---|---|
+| `qwen3.5:9b` | 100% | 100% | 100% | 100% | 94 | **ELIGIBLE** |
+| `granite4.1:8b` | 100% | 100% | near-miss | 100% | 96 | **ELIGIBLE** |
+| `qwen3.5:4b` | 100% | 50% | 100% | 100% | 141 | no: schema |
+| `qwen3.6` | 75% | 50% | 100% | 100% | 19 | no: too slow to be reliable |
+| `qwen2.5-coder:7b` | **25%** | 100% | 100% | 100% | 2 | no: answers in prose instead of calling tools |
+| `ornith:9b` | — | — | — | — | — | **QUARANTINED** |
+| `granite4.1:3b` | — | — | — | — | — | unmeasured (blocked by ornith's wedge) |
+
+Notes that matter more than the numbers:
+
+- **`qwen2.5-coder:7b` is the cautionary result.** It is nominally the "coder"
+  model and it is the least suitable for agent work in the set, failing 3 of 4
+  tool tasks by describing the call in prose instead of emitting one. Reputation
+  and name are not predictive of agent fitness; this is the entire argument for
+  measuring.
+- **`granite4.1:8b`'s long-context "failure" is a near miss.** It retrieved the
+  needle from a 16k-token context but transcribed `CTSARM-NEEDLE-8F31A2`,
+  dropping a character. Retrieval works; exact transcription does not. Still
+  disqualifying for a coder role, since an agent that corrupts an identifier
+  emits code that does not compile, but it is not a retrieval failure.
+- **The high tier is empty.** No installed model qualifies for planning roles.
+  The router degrades to the med tier and labels the decision
+  `DEGRADED from high tier` rather than returning nothing. Resolving this
+  properly means either upgrading Ollama to pull `laguna-xs-2.1`, or routing
+  planning roles to the `claude_code` / `codex` runtime, which is what the
+  original plan recommends for architecture work anyway.
+
 ## Known-bad findings
 
 | Finding | Evidence | Consequence |
 |---|---|---|
-| `ornith:9b` does not reliably complete | Two independent hangs (tool-calling and a trivial "Say OK"), each >90s with no output, requiring a service restart | Matches the owner's prior report. Must not be given an agent role unless a bench run contradicts this. |
+| **`ornith:9b` wedges the entire inference queue** | Three separate events on 2026-07-29: a tool-calling request, a trivial "Say OK", and once mid-bench. Each entered a runaway generation that never terminated, pinned the GPU at ~92%, and required `sudo systemctl restart ollama`. `ollama stop` does not clear it. | **Quarantined in the catalog**, excluded from routing regardless of score. Note it passed one complete bench run cleanly *in between* wedges, so a single green result does not clear it. The third wedge also blocked `granite4.1:3b` from being measured at all. This is the one failure class that damages the host rather than just the model, which is why quarantine overrides measurement. |
 | `ollama 0.31.1` cannot pull `laguna-xs-2.1` | Pull fails with a download prompt rather than a version error | The best local high-tier candidate is unavailable until Ollama is upgraded. `qwen3.6` covers the tier meanwhile. |
 | Ollama loaded `ornith:9b` with a 4096 context | `/api/ps` reported `context_length: 4096` despite the model advertising 262144 | Advertised context is not effective context. The bench measures real retrieval rather than trusting metadata. |
 

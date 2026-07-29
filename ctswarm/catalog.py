@@ -84,6 +84,11 @@ class ModelSpec:
     # Minimum backend version, when the model refuses to pull on older releases.
     # Recorded so doctor can explain a failed pull instead of leaving a gap.
     requires_ollama: str | None = None
+    # Excluded from routing regardless of any bench score. Reserved for models
+    # that damage the *host*, not merely themselves: a model that wedges the
+    # shared inference queue takes every other model down with it, so an
+    # occasional good score cannot justify the risk of scheduling it.
+    quarantined: bool = False
 
     @property
     def is_moe(self) -> bool:
@@ -210,9 +215,14 @@ OLLAMA_CANDIDATES: tuple[ModelSpec, ...] = (
         tools=True,
         total_params_b=9.0,
         tiers=(Tier.MED, Tier.LOW),
-        notes="Agentic-coding tuned. Reported locally as failing to complete "
-        "messages; bench must confirm before any role assignment.",
+        notes="DO NOT USE. Wedges intermittently: enters a runaway generation "
+        "that never terminates, pins the GPU, and blocks the entire ollama queue "
+        "for every other model until the service is restarted. Observed three "
+        "times on 2026-07-29, including once mid-bench where it also blocked "
+        "granite4.1:3b. It passed one full bench run cleanly in between, so a "
+        "single green result does not clear it.",
         verified_ref=True,
+        quarantined=True,
     ),
     ModelSpec(
         ref="granite4.1:3b",
