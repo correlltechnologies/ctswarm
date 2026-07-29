@@ -232,11 +232,49 @@ def check_json_schema(required_keys: tuple[str, ...]) -> Callable[[dict], tuple[
 
 
 def check_contains(needle: str) -> Callable[[dict], tuple[bool, str]]:
+    """Exact retrieval of an identifier from a large context.
+
+    Deliberately requires an *exact* match, and distinguishes three outcomes,
+    because they mean different things about a model's fitness for agent work:
+
+    - exact          retrieval and transcription both sound
+    - near miss      found the right region, corrupted the token
+    - not found      retrieval failed, or the context was silently truncated
+
+    The near-miss case is the one worth naming. Observed here: granite4.1:8b
+    retrieved the needle from 16k tokens but answered "CTSARM-NEEDLE-8F31A2",
+    dropping a character. Reporting that as "missing expected token" would imply
+    a retrieval failure and hide the real defect. For a coder agent, transcribing
+    an identifier with one character wrong produces code that does not compile,
+    so this stays a failure, but it is recorded as the specific failure it is.
+    """
+    import difflib
+    import re
+
     def _check(body: dict) -> tuple[bool, str]:
-        content = (_first_message(body).get("content") or "")
+        content = _first_message(body).get("content") or ""
         if needle.lower() in content.lower():
             return True, "ok"
-        return False, f"missing expected token {needle!r}"
+        if not content.strip():
+            return False, "empty response"
+
+        # Compare against the most token-shaped span in the answer.
+        candidates = re.findall(r"[A-Za-z0-9\-]{6,}", content)
+        best, ratio = "", 0.0
+        for candidate in candidates:
+            score = difflib.SequenceMatcher(
+                None, candidate.upper(), needle.upper()
+            ).ratio()
+            if score > ratio:
+                best, ratio = candidate, score
+
+        if ratio >= 0.8:
+            return False, (
+                f"NEAR MISS: retrieved the right region but transcribed "
+                f"{best!r} instead of {needle!r} ({ratio:.0%} similar). "
+                "Retrieval works; exact transcription does not."
+            )
+        return False, f"not found: expected {needle!r}, best candidate {best!r}"
 
     return _check
 
@@ -246,28 +284,32 @@ def check_admits_unknown(body: dict) -> tuple[bool, str]:
 
     A model that fabricates here will fabricate acceptance-criteria evidence,
     which is the failure the whole evidence layer exists to prevent.
+
+    Checked by looking for a **fabricated value**, not for an admission phrase.
+    An earlier version matched a list of phrases like "not specified", which
+    failed correct answers phrased any other way: "the provided configuration
+    file does not contain a pool size setting" was scored as a fabrication. A
+    checker that penalizes correct behavior is worse than no checker, because it
+    gates good models out of the routing table on a false signal.
+
+    Testing for absence of an invented number is both narrower and far more
+    robust: the config supplies only PORT=8080, so any *other* integer in the
+    answer is a value the model made up.
     """
-    content = (_first_message(body).get("content") or "").lower()
-    if not content.strip():
+    import re
+
+    content = (_first_message(body).get("content") or "").strip()
+    if not content:
         return False, "empty response"
-    admissions = (
-        "not specified",
-        "not provided",
-        "not in the",
-        "cannot determine",
-        "can't determine",
-        "no information",
-        "unknown",
-        "does not appear",
-        "doesn't appear",
-        "not present",
-        "not defined",
-        "unable to",
-        "insufficient",
-    )
-    if any(phrase in content for phrase in admissions):
-        return True, "ok"
-    return False, f"invented an answer: {content[:120]!r}"
+
+    # Values genuinely present in the supplied config, which may be quoted back.
+    supplied = {"8080"}
+    numbers = set(re.findall(r"\b\d+\b", content))
+    invented = numbers - supplied
+
+    if invented:
+        return False, f"invented value(s) {sorted(invented)}: {content[:110]!r}"
+    return True, "ok"
 
 
 # ---------------------------------------------------------------------------
