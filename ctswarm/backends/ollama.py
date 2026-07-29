@@ -53,6 +53,12 @@ NUM_CTX_BUCKETS = (8192, 16384, 32768, 65536, 131072)
 # so erring small is by far the more expensive direction.
 NUM_CTX_SAFETY = 1.5
 
+# Extra output tokens granted to reasoning models on top of what the caller
+# asked for, so their thinking does not consume the answer's budget. Sized from
+# the observed worst case here: ~11k characters of reasoning on a planning task,
+# roughly 3k tokens, plus margin.
+REASONING_ALLOWANCE = 6144
+
 
 def choose_num_ctx(prompt_tokens: int, max_output_tokens: int, ceiling: int) -> int:
     """Pick the smallest bucket that fits the request without truncating."""
@@ -109,6 +115,7 @@ class OllamaBackend(OpenAICompatBackend):
             timeout=httpx.Timeout(chat_timeout_s, connect=5.0),
         )
         self._context_limits: dict[str, int] = {}
+        self._reasoners: dict[str, bool] = {}
 
     async def _context_limit(self, model_ref: str) -> int:
         """The model's own maximum window, cached."""
@@ -118,6 +125,35 @@ class OllamaBackend(OpenAICompatBackend):
             self._context_limits[model_ref] = int(limit) if limit else 0
         return self._context_limits[model_ref]
 
+    async def _is_reasoner(self, model_ref: str) -> bool:
+        """Whether the model emits thinking tokens before answering."""
+        if model_ref not in self._reasoners:
+            details = await self.model_details(model_ref)
+            capabilities = details.get("capabilities") or []
+            self._reasoners[model_ref] = "thinking" in capabilities
+        return self._reasoners[model_ref]
+
+    async def _output_budget(self, model_ref: str, requested: int) -> int:
+        """Expand the caller's output budget to cover reasoning.
+
+        ``num_predict`` caps reasoning **and** content together, not just the
+        answer. A caller asking for 2560 tokens of JSON means 2560 tokens of
+        JSON; it does not mean "spend it all thinking and return nothing".
+
+        Measured: qwen3.5:9b on an issue-planning task produced 11,248 characters
+        of reasoning and ZERO content, hitting the 2560 cap with
+        finish_reason=length. The completion was empty and looked, from the
+        outside, exactly like a broken model.
+
+        This matters well beyond the bench. SWE-AF sets its own max_tokens with
+        no knowledge of reasoning overhead, so without this compensation every
+        reasoning model would silently return empty completions for any role
+        whose budget was tuned against a non-reasoning model.
+        """
+        if not await self._is_reasoner(model_ref):
+            return requested
+        return requested + REASONING_ALLOWANCE
+
     async def chat(self, request: ChatRequest, model_ref: str) -> ChatResponse:
         """Generate via the native endpoint with an explicitly sized window."""
         prompt_tokens_est = estimate_prompt_tokens(request.messages)
@@ -125,13 +161,14 @@ class OllamaBackend(OpenAICompatBackend):
         ceiling = min(
             [v for v in (model_ceiling, self.context_ceiling) if v] or [0]
         )
-        num_ctx = choose_num_ctx(
-            prompt_tokens_est, request.max_tokens or 1024, ceiling
-        )
+        # Reasoning models need budget for thinking on top of the answer, and the
+        # context window must hold prompt + reasoning + answer together.
+        output_budget = await self._output_budget(model_ref, request.max_tokens or 1024)
+        num_ctx = choose_num_ctx(prompt_tokens_est, output_budget, ceiling)
 
         options: dict = {"num_ctx": num_ctx, "temperature": request.temperature or 0.0}
         if request.max_tokens:
-            options["num_predict"] = request.max_tokens
+            options["num_predict"] = output_budget
 
         payload: dict = {
             "model": model_ref,
