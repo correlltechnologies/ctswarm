@@ -40,11 +40,18 @@ OLLAMA_DEFAULT_NUM_CTX = 4096
 # Buckets to round a computed window up into. Reusing a small set of sizes lets
 # Ollama keep a model resident across requests instead of reloading it for every
 # slightly different prompt length.
-NUM_CTX_BUCKETS = (4096, 8192, 16384, 32768, 65536, 131072)
+#
+# 4096 is deliberately NOT a bucket. It is Ollama's silent-truncation default,
+# and a reasoning model's thinking tokens consume context beyond the num_predict
+# cap, so a window sized only for prompt+output truncates mid-thought. Observed:
+# qwen3.5:9b failed a schema task at num_ctx=4096 on a ~200-token prompt purely
+# from reasoning overflow.
+NUM_CTX_BUCKETS = (8192, 16384, 32768, 65536, 131072)
 
-# Headroom over the estimated prompt so a request near a bucket edge does not
-# truncate. Truncation is silent, so erring small is the expensive direction.
-NUM_CTX_SAFETY = 1.25
+# Headroom over prompt+output. Generous because reasoning tokens are invisible
+# to the caller's budget but still occupy the window, and truncation is silent,
+# so erring small is by far the more expensive direction.
+NUM_CTX_SAFETY = 1.5
 
 
 def choose_num_ctx(prompt_tokens: int, max_output_tokens: int, ceiling: int) -> int:

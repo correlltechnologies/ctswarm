@@ -228,7 +228,15 @@ async def _swallow(task: asyncio.Task) -> None:
 
 
 async def measure_throughput(backend: Backend, model_ref: str) -> float:
-    """Output tokens per second on a short, fixed generation."""
+    """Output tokens per second on a short, fixed generation.
+
+    Deliberately counts tokens from an unusable response too. Throughput asks
+    "how fast does this model emit tokens", which a truncated or content-free
+    generation answers perfectly well. Requiring ``response.ok`` here reported
+    0 tok/s for every reasoning model, because they exhaust the budget thinking
+    and come back as TRUNCATED_RESPONSE. Speed and correctness are separate
+    measurements and conflating them made the fast models look broken.
+    """
     request = ChatRequest(
         messages=[
             {
@@ -242,10 +250,10 @@ async def measure_throughput(backend: Backend, model_ref: str) -> float:
         temperature=0.0,
     )
     try:
-        response = await asyncio.wait_for(backend.chat(request, model_ref), timeout=180.0)
+        response = await asyncio.wait_for(backend.chat(request, model_ref), timeout=300.0)
     except (asyncio.TimeoutError, Exception):  # noqa: BLE001
         return 0.0
-    if not response.ok or response.latency_ms <= 0 or response.output_tokens <= 0:
+    if response.latency_ms <= 0 or response.output_tokens <= 0:
         return 0.0
     return response.output_tokens / (response.latency_ms / 1000.0)
 
