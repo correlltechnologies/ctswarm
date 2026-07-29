@@ -27,6 +27,7 @@ from .ledger import Ledger
 from .platform_detect import detect_host
 from .router.policy import RoutingTable
 
+
 def _load_dotenv(path: str = ".env") -> None:
     """Load .env into the environment without clobbering real env vars.
 
@@ -444,7 +445,7 @@ def verify(
 @app.command()
 def capacity() -> None:
     """Show remaining headroom per runtime and which one would be chosen."""
-    from .capacity import CapacityManager, Runtime
+    from .capacity import CapacityManager
 
     manager = CapacityManager()
     table = Table("runtime", "available", "remaining", "spent", "why", box=None)
