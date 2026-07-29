@@ -54,6 +54,9 @@ class RouterState:
             host=self.host,
             ledger=self.ledger,
             table=self.table,
+            # Reachable backends, not installed binaries: in a container the
+            # ollama binary is absent but the server is one network hop away.
+            backends=set(self.backends),
             prefer_local=os.environ.get("CTSWARM_PREFER_LOCAL", "1") != "0",
         )
         # Cached so every request does not re-probe the backends. Refreshed on a

@@ -225,13 +225,14 @@ class Router:
         table: RoutingTable | None = None,
         budget_usd_remaining: float = 0.0,
         prefer_local: bool = True,
+        backends: set[str] | None = None,
     ) -> None:
         self.host = host
         self.ledger = ledger
         self.table = table or RoutingTable()
         self.budget_usd_remaining = budget_usd_remaining
         self.prefer_local = prefer_local
-        self._catalog: tuple[CatalogEntry, ...] = build_catalog(host)
+        self._catalog: tuple[CatalogEntry, ...] = build_catalog(host, backends)
 
     # -- eligibility -------------------------------------------------------
 

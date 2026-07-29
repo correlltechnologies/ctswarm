@@ -1,9 +1,16 @@
 # ctswarm overlay for SWE-AF's compose stack.
 #
-# Composed alongside the vendored SWE-AF compose file:
+# Composed alongside the vendored SWE-AF compose file. Paths here are relative to
+# the REPO ROOT, which requires --project-directory:
 #
-#   docker compose -f vendor/SWE-AF/docker-compose.yml \
+#   docker compose --project-directory . \
+#                  -f vendor/SWE-AF/docker-compose.yml \
 #                  -f infra/docker-compose.ctswarm.yml up -d
+#
+# Without --project-directory, compose resolves relative paths against the first
+# -f file's directory (vendor/SWE-AF/), silently pointing the build context and
+# the opencode config at the wrong places. Use `./stack.sh` rather than typing
+# this out.
 #
 # What this overlay adds:
 #   - the ctswarm router, reachable by the SWE-AF agents as an OpenAI-compatible
@@ -19,9 +26,21 @@
 # bound to loopback on the host as the plan requires.
 
 services:
+  # SWE-AF publishes the control plane on host 8080, which collides with almost
+  # anything else a developer runs (here: an existing Supabase stack). Remapped
+  # to a high port and bound to loopback. Only the *host* mapping changes;
+  # in-network callers still use control-plane:8080, so nothing else needs
+  # rewiring.
+  # `!override` is required, not stylistic: compose *merges* sequences across
+  # overlay files, so a plain `ports:` here would append the new mapping while
+  # keeping the base 8080 binding, and the collision would persist.
+  control-plane:
+    ports: !override
+      - "127.0.0.1:${CTSWARM_CONTROL_PLANE_PORT:-18080}:8080"
+
   ctswarm-router:
     build:
-      context: ..
+      context: .
       dockerfile: infra/Dockerfile.router
     environment:
       # host-gateway resolves to the docker host from inside the network, so the
@@ -31,7 +50,8 @@ services:
       - CTSWARM_LMSTUDIO_HOST=${CTSWARM_LMSTUDIO_HOST:-http://host.docker.internal:1234}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - CTSWARM_DB=/state/ctswarm.db
-      - CTSWARM_ROUTING=/state/routing.json
+      # Produced by `ctswarm bench` on the host and bind-mounted read-only.
+      - CTSWARM_ROUTING=/bench-results/routing.json
       - CTSWARM_PREFER_LOCAL=${CTSWARM_PREFER_LOCAL:-1}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -42,7 +62,7 @@ services:
       - ctswarm-state:/state
       # The routing table is produced by `ctswarm bench` on the host and is an
       # input to the containerized router, so it is bind-mounted read-only.
-      - ../bench/results:/bench-results:ro
+      - ./bench/results:/bench-results:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health',timeout=5).status==200 else 1)"]
       interval: 10s
@@ -53,7 +73,7 @@ services:
 
   ctswarm-approvals:
     build:
-      context: ..
+      context: .
       dockerfile: infra/Dockerfile.router
     command:
       - uvicorn
@@ -77,6 +97,12 @@ services:
 
   # SWE-AF's own agent services, extended rather than redefined.
   swe-agent:
+    # --project-directory relocates every relative path, including the ones in
+    # SWE-AF's own compose file, so its `context: .` would resolve to the ctswarm
+    # repo root and fail to find its Dockerfile. Restated here explicitly.
+    build:
+      context: ./vendor/SWE-AF
+      dockerfile: Dockerfile
     environment:
       # Route every tier through ctswarm. These ids are simultaneously valid
       # opencode provider/model references and ctswarm virtual models, which is
@@ -92,7 +118,7 @@ services:
     volumes:
       # opencode reads provider config from XDG config; mounting it here is what
       # makes `ctswarm/*` resolve to the router inside the agent container.
-      - ./opencode/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
       # Claude subscription credentials. Read-only: an agent must never be able
       # to rewrite the credentials it runs under.
       - ${HOME}/.claude:/root/.claude:ro
@@ -101,6 +127,9 @@ services:
         condition: service_healthy
 
   swe-fast:
+    build:
+      context: ./vendor/SWE-AF
+      dockerfile: Dockerfile
     environment:
       - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-open_code}
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
@@ -109,7 +138,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./opencode/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
       - ${HOME}/.claude:/root/.claude:ro
     depends_on:
       ctswarm-router:

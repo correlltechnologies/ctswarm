@@ -318,8 +318,28 @@ class CatalogEntry:
         }
 
 
-def candidates_for(host: HostProfile) -> tuple[ModelSpec, ...]:
-    """Candidate specs appropriate to the host's local backend."""
+def candidates_for(
+    host: HostProfile, backends: set[str] | None = None
+) -> tuple[ModelSpec, ...]:
+    """Candidate specs for the backends actually available.
+
+    ``backends`` is the set of backend names the caller can really reach, which
+    is NOT the same as which binaries are installed locally. The router runs in a
+    container with no ollama binary and reaches the host's server over the docker
+    gateway; keying the catalog off local binaries produced an empty catalog
+    there, so every request returned "no eligible model" with no exclusions to
+    explain why. Reachability is the property that matters, so callers that know
+    it should pass it.
+    """
+    if backends:
+        specs: list[ModelSpec] = []
+        if "mlx" in backends:
+            specs.extend(MLX_CANDIDATES)
+        if backends & {"ollama", "lmstudio"}:
+            specs.extend(OLLAMA_CANDIDATES)
+        if specs:
+            return tuple(specs)
+
     if host.local_backend == "mlx":
         return MLX_CANDIDATES
     if host.local_backend in ("ollama", "lmstudio"):
@@ -330,7 +350,9 @@ def candidates_for(host: HostProfile) -> tuple[ModelSpec, ...]:
     return ()
 
 
-def build_catalog(host: HostProfile) -> tuple[CatalogEntry, ...]:
+def build_catalog(
+    host: HostProfile, backends: set[str] | None = None
+) -> tuple[CatalogEntry, ...]:
     """Full catalog for a host, including entries that will not fit.
 
     Unusable entries are retained deliberately: ``ctswarm doctor`` should be able
@@ -342,7 +364,7 @@ def build_catalog(host: HostProfile) -> tuple[CatalogEntry, ...]:
             placement=spec.placement(host),
             penalty=spec.throughput_penalty(host),
         )
-        for spec in candidates_for(host)
+        for spec in candidates_for(host, backends)
     )
 
 
