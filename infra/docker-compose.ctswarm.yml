@@ -1,0 +1,119 @@
+# ctswarm overlay for SWE-AF's compose stack.
+#
+# Composed alongside the vendored SWE-AF compose file:
+#
+#   docker compose -f vendor/SWE-AF/docker-compose.yml \
+#                  -f infra/docker-compose.ctswarm.yml up -d
+#
+# What this overlay adds:
+#   - the ctswarm router, reachable by the SWE-AF agents as an OpenAI-compatible
+#     endpoint, itself reaching host-local Ollama over the docker host gateway
+#   - the approval service, which receives SWE-AF HITL escalations
+#   - an opencode provider config mounted into the agents so `ctswarm/*` model
+#     ids resolve to the router
+#   - Claude subscription credentials mounted read-only alongside the Codex ones
+#     SWE-AF already mounts
+#
+# Ollama itself is never published. The router reaches it through
+# host.docker.internal, which is a docker-internal route, so port 11434 stays
+# bound to loopback on the host as the plan requires.
+
+services:
+  ctswarm-router:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.router
+    environment:
+      # host-gateway resolves to the docker host from inside the network, so the
+      # local inference server needs no public exposure.
+      - CTSWARM_OLLAMA_HOST=http://host.docker.internal:11434
+      - CTSWARM_MLX_HOST=${CTSWARM_MLX_HOST:-http://host.docker.internal:8081}
+      - CTSWARM_LMSTUDIO_HOST=${CTSWARM_LMSTUDIO_HOST:-http://host.docker.internal:1234}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - CTSWARM_DB=/state/ctswarm.db
+      - CTSWARM_ROUTING=/state/routing.json
+      - CTSWARM_PREFER_LOCAL=${CTSWARM_PREFER_LOCAL:-1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Loopback-bound on purpose. The router must not be reachable off-host.
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ctswarm-state:/state
+      # The routing table is produced by `ctswarm bench` on the host and is an
+      # input to the containerized router, so it is bind-mounted read-only.
+      - ../bench/results:/bench-results:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health',timeout=5).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  ctswarm-approvals:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.router
+    command:
+      - uvicorn
+      - ctswarm.approvals.service:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8091"
+    environment:
+      - CTSWARM_DB=/state/ctswarm.db
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:-}
+      - SLACK_APPROVAL_CHANNEL=${SLACK_APPROVAL_CHANNEL:-}
+      # Where the approval service tells SWE-AF to send decisions back.
+      - AGENTFIELD_SERVER=http://control-plane:8080
+    ports:
+      - "127.0.0.1:8091:8091"
+    volumes:
+      - ctswarm-state:/state
+    restart: unless-stopped
+
+  # SWE-AF's own agent services, extended rather than redefined.
+  swe-agent:
+    environment:
+      # Route every tier through ctswarm. These ids are simultaneously valid
+      # opencode provider/model references and ctswarm virtual models, which is
+      # what lets one string satisfy both systems.
+      - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-open_code}
+      - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
+      - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
+      - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # opencode reads provider config from XDG config; mounting it here is what
+      # makes `ctswarm/*` resolve to the router inside the agent container.
+      - ./opencode/opencode.json:/root/.config/opencode/opencode.json:ro
+      # Claude subscription credentials. Read-only: an agent must never be able
+      # to rewrite the credentials it runs under.
+      - ${HOME}/.claude:/root/.claude:ro
+    depends_on:
+      ctswarm-router:
+        condition: service_healthy
+
+  swe-fast:
+    environment:
+      - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-open_code}
+      - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
+      - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
+      - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./opencode/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ${HOME}/.claude:/root/.claude:ro
+    depends_on:
+      ctswarm-router:
+        condition: service_healthy
+
+volumes:
+  ctswarm-state:

@@ -77,6 +77,45 @@ class OllamaBackend(OpenAICompatBackend):
         except (httpx.HTTPError, ValueError, KeyError, asyncio.TimeoutError, OSError):
             return set()
 
+    async def wedged_models(self) -> set[str]:
+        """Models stuck mid-unload, which block the whole inference queue.
+
+        Ollama reports a model whose runner will not terminate with an ``expires_at``
+        in the past while it is still listed as loaded. Observed in practice: a
+        model entered a runaway generation, sat at "Stopping..." with the GPU at
+        94%, and every request for *any other model* queued behind it forever.
+
+        Detecting this matters because the natural reading of that situation is
+        "the other models are timing out", which would wrongly penalize innocent
+        models in the routing table. The bench and the router both consult this
+        so a wedged server is reported as a server fault instead.
+        """
+        import datetime as _dt
+
+        try:
+            response = await self._native.get("/api/ps")
+            response.raise_for_status()
+            entries = response.json().get("models", [])
+        except (httpx.HTTPError, ValueError, asyncio.TimeoutError, OSError):
+            return set()
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        wedged: set[str] = set()
+        for entry in entries:
+            name = entry.get("name")
+            expires = entry.get("expires_at")
+            if not name or not expires:
+                continue
+            try:
+                deadline = _dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            # Still loaded well past its own expiry means the runner did not
+            # release. A small grace period avoids flagging a normal unload.
+            if deadline < now - _dt.timedelta(seconds=30):
+                wedged.add(name)
+        return wedged
+
     async def model_details(self, model_ref: str) -> dict:
         """Capability metadata for one model, as ``ollama show`` reports it.
 

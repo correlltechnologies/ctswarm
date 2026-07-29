@@ -205,7 +205,43 @@ class Backend(ABC):
 
     @abstractmethod
     async def health(self) -> bool:
-        """Cheap liveness check. Must not raise."""
+        """Cheap liveness check. Must not raise.
+
+        Answers "is the server process up", which is necessary but NOT
+        sufficient. Use ``probe_generation`` before trusting a backend with real
+        work: a single wedged model blocks the whole inference queue while the
+        control endpoints keep answering 200.
+        """
+
+    async def probe_generation(self, model_ref: str, timeout_s: float = 25.0) -> bool:
+        """Confirm the backend can actually *generate*, not merely respond.
+
+        This exists because of an observed failure that the ordinary health check
+        could not see. A local model entered a runaway generation and never
+        terminated. It pinned the GPU and every subsequent request queued behind
+        it indefinitely, yet ``GET /v1/models`` kept returning 200 with a full
+        model list, so the backend looked perfectly healthy while serving nothing.
+
+        Head-of-line blocking like that is invisible to a per-model circuit
+        breaker: the *other* models are fine, they simply never get scheduled.
+        Only issuing a real, tiny generation under a short timeout distinguishes
+        "up" from "working".
+        """
+        import asyncio as _asyncio
+
+        request = ChatRequest(
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
+            model=model_ref,
+            max_tokens=8,
+            temperature=0.0,
+        )
+        try:
+            response = await _asyncio.wait_for(
+                self.chat(request, model_ref), timeout=timeout_s
+            )
+        except (_asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return False
+        return response.ok
 
     @abstractmethod
     async def list_models(self) -> list[str]:

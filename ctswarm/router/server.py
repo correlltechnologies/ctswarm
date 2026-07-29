@@ -152,10 +152,25 @@ def _parse_virtual(model: str) -> tuple[Optional[Tier], Optional[tuple[str, str]
 @app.get("/health")
 async def health(request: Request) -> JSONResponse:
     state: RouterState = request.app.state.ctswarm
-    checks = {name: await backend.health() for name, backend in state.backends.items()}
+    checks: dict[str, dict] = {}
+    for name, backend in state.backends.items():
+        entry: dict = {"reachable": await backend.health()}
+        # Reachability alone is misleading. A wedged runner keeps the control
+        # endpoints answering 200 while serving no inference at all, so surface
+        # it explicitly rather than reporting a healthy backend that cannot work.
+        wedged_fn = getattr(backend, "wedged_models", None)
+        if wedged_fn:
+            wedged = sorted(await wedged_fn())
+            entry["wedged_models"] = wedged
+            entry["degraded"] = bool(wedged)
+        checks[name] = entry
+
+    healthy = any(
+        entry["reachable"] and not entry.get("degraded") for entry in checks.values()
+    )
     return JSONResponse(
         {
-            "ok": any(checks.values()),
+            "ok": healthy,
             "backends": checks,
             "host": state.host.to_dict(),
             "routing_table_measured": not state.table.is_empty,

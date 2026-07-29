@@ -312,6 +312,20 @@ async def bench_all(
     """
     results: list[ModelResult] = []
     for model_ref in model_refs:
+        # A wedged runner blocks the shared inference queue, so every model
+        # benched after it would time out and be recorded as broken. Those
+        # numbers would be worse than no numbers: they would permanently gate
+        # good models out of the routing table on evidence of someone else's
+        # fault. Refuse to measure rather than record a libel.
+        blocked = await _blocked_reason(backend, model_ref)
+        if blocked:
+            results.append(
+                ModelResult(model_ref=model_ref, backend=backend.name, error=blocked)
+            )
+            if on_model_done:
+                on_model_done(results[-1])
+            continue
+
         result = await bench_model(
             backend, model_ref, tasks=tasks, on_progress=on_progress
         )
@@ -319,6 +333,27 @@ async def bench_all(
         if on_model_done:
             on_model_done(result)
     return results
+
+
+async def _blocked_reason(backend: Backend, model_ref: str) -> Optional[str]:
+    """Why this model cannot be fairly measured right now, or None."""
+    wedged_fn = getattr(backend, "wedged_models", None)
+    if wedged_fn:
+        wedged = await wedged_fn()
+        # A model that wedged itself is genuinely broken and worth recording as
+        # such. A model waiting behind someone else's wedge is not.
+        others = wedged - {model_ref}
+        if others:
+            return (
+                f"backend blocked by wedged runner(s) {sorted(others)}; "
+                "restart the inference server before benching"
+            )
+        if model_ref in wedged:
+            return "this model's runner is wedged and will not terminate"
+
+    if not await backend.probe_generation(model_ref, timeout_s=30.0):
+        return "backend did not complete a trivial generation within 30s"
+    return None
 
 
 def write_results(
