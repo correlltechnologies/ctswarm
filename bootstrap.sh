@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+#
+# ctswarm bootstrap: clone to running, on Linux+CUDA or macOS+Apple Silicon.
+#
+# Design rules this script follows:
+#   - Idempotent. Safe to re-run. Never overwrites an existing .env.
+#   - Honest. Reports what it could not do and the exact command to fix it,
+#     rather than continuing and failing later with a confusing error.
+#   - Non-destructive. Does not upgrade or restart services you already run.
+#     A factory that restarts your inference server during setup is a factory
+#     that will restart it during a build.
+#
+# Usage:
+#   ./bootstrap.sh              full setup
+#   ./bootstrap.sh --revendor   re-fetch SWE-AF at the pinned commit
+#   ./bootstrap.sh --no-models  skip model downloads
+#   ./bootstrap.sh --check      report only, change nothing
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# shellcheck disable=SC1091
+source infra/versions.env
+
+REVENDOR=0
+SKIP_MODELS=0
+CHECK_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --revendor)   REVENDOR=1 ;;
+    --no-models)  SKIP_MODELS=1 ;;
+    --check)      CHECK_ONLY=1 ;;
+    -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+YELLOW=$'\033[33m'; RESET=$'\033[0m'
+
+say()   { printf '%s==>%s %s\n' "$BOLD" "$RESET" "$*"; }
+ok()    { printf '  %sok%s   %s\n' "$GREEN" "$RESET" "$*"; }
+warn()  { printf '  %swarn%s %s\n' "$YELLOW" "$RESET" "$*"; }
+fail()  { printf '  %sfail%s %s\n' "$RED" "$RESET" "$*"; }
+note()  { printf '       %s%s%s\n' "$DIM" "$*" "$RESET"; }
+
+TODO=()
+todo() { TODO+=("$1"); }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+say "Detecting platform"
+# ---------------------------------------------------------------------------
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+ACCEL="cpu"
+
+if [[ "$OS" == "Darwin" && ( "$ARCH" == "arm64" || "$ARCH" == "aarch64" ) ]]; then
+  ACCEL="metal"
+  MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  ok "macOS Apple Silicon, ${MEM_GB}GB unified memory"
+elif have nvidia-smi; then
+  ACCEL="cuda"
+  VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+  GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+  MEM_GB=$(( VRAM_MB / 1024 ))
+  ok "${GPU_NAME}, ${MEM_GB}GB VRAM"
+else
+  warn "no GPU detected; local inference will run on CPU and be slow"
+  MEM_GB=4
+fi
+
+# ---------------------------------------------------------------------------
+say "Checking prerequisites"
+# ---------------------------------------------------------------------------
+for tool in git python3 docker; do
+  if have "$tool"; then ok "$tool"; else
+    fail "$tool not found"
+    todo "install $tool"
+  fi
+done
+
+if have python3; then
+  PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+  PY_OK=$(python3 -c 'import sys; print(1 if (3,10) <= sys.version_info < (3,14) else 0)')
+  if [[ "$PY_OK" == "1" ]]; then ok "python $PY_VER"; else
+    fail "python $PY_VER is outside the supported range (3.10 to 3.13)"
+    todo "install python 3.12"
+  fi
+fi
+
+if have docker && docker info >/dev/null 2>&1; then
+  ok "docker daemon reachable"
+else
+  warn "docker daemon not reachable; the SWE-AF stack cannot start"
+  todo "start Docker, or add your user to the docker group"
+fi
+
+have gh && ok "gh cli" || { warn "gh cli missing (needed for PR creation)"; todo "install gh"; }
+
+# ---------------------------------------------------------------------------
+say "Checking local inference backend"
+# ---------------------------------------------------------------------------
+LOCAL_BACKEND="none"
+
+if [[ "$ACCEL" == "metal" ]] && python3 -c 'import mlx_lm' 2>/dev/null; then
+  LOCAL_BACKEND="mlx"
+  ok "mlx-lm available"
+elif have ollama; then
+  if curl -sf --max-time 3 http://localhost:11434/ >/dev/null 2>&1; then
+    LOCAL_BACKEND="ollama"
+    OLLAMA_VER=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+    ok "ollama $OLLAMA_VER running"
+  else
+    warn "ollama installed but not responding on :11434"
+    todo "start ollama (systemctl start ollama, or run 'ollama serve')"
+  fi
+elif [[ "$ACCEL" == "metal" ]]; then
+  warn "no local backend; on Apple Silicon prefer mlx-lm"
+  note "pip install mlx-lm   (or install Ollama for the GGUF path)"
+  todo "install mlx-lm or ollama"
+else
+  warn "no local backend detected"
+  note "install from https://ollama.com/download"
+  todo "install ollama"
+fi
+
+# A wedged runner blocks the whole queue while the control endpoints keep
+# answering 200. Detect it here so setup does not hand over a broken backend.
+if [[ "$LOCAL_BACKEND" == "ollama" ]]; then
+  WEDGED=$(curl -sf --max-time 3 http://localhost:11434/api/ps 2>/dev/null \
+    | python3 -c '
+import json,sys,datetime
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(0)
+now=datetime.datetime.now(datetime.timezone.utc)
+for m in data.get("models",[]):
+    exp=m.get("expires_at")
+    if not exp: continue
+    try: dl=datetime.datetime.fromisoformat(exp.replace("Z","+00:00"))
+    except Exception: continue
+    if dl < now - datetime.timedelta(seconds=30): print(m.get("name",""))
+' 2>/dev/null || true)
+  if [[ -n "$WEDGED" ]]; then
+    fail "wedged model runner(s): $WEDGED"
+    note "these block every request for every other model while /v1/models still returns 200"
+    note "fix: sudo systemctl restart ollama"
+    todo "restart ollama to clear wedged runner(s)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+say "Python environment"
+# ---------------------------------------------------------------------------
+if [[ $CHECK_ONLY -eq 0 ]]; then
+  if [[ ! -d .venv ]]; then
+    python3 -m venv .venv
+    ok "created .venv"
+  else
+    ok ".venv exists"
+  fi
+  ./.venv/bin/pip install -q --upgrade pip >/dev/null 2>&1 || true
+  ./.venv/bin/pip install -q -e ".[dev]"
+  ok "installed ctswarm"
+else
+  note "check mode: skipping venv"
+fi
+
+# ---------------------------------------------------------------------------
+say "Model candidates"
+# ---------------------------------------------------------------------------
+# Chosen by what fits the detected accelerator. Models that would spill past it
+# are not pulled automatically; a 20GB download that then runs at 2 tok/s is not
+# a favor. `ctswarm bench` decides what is actually usable.
+if [[ $SKIP_MODELS -eq 1 || $CHECK_ONLY -eq 1 ]]; then
+  note "skipping model downloads"
+elif [[ "$LOCAL_BACKEND" == "ollama" ]]; then
+  if   (( MEM_GB >= 24 )); then MODELS=("qwen3.5:9b" "granite4.1:8b" "qwen3.5:4b" "granite4.1:3b")
+  elif (( MEM_GB >= 10 )); then MODELS=("qwen3.5:9b" "granite4.1:8b" "qwen3.5:4b" "granite4.1:3b")
+  elif (( MEM_GB >= 6 ));  then MODELS=("qwen3.5:4b" "granite4.1:3b")
+  else                          MODELS=("granite4.1:3b")
+  fi
+  INSTALLED=$(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}')
+  for model in "${MODELS[@]}"; do
+    if grep -qx "$model" <<<"$INSTALLED"; then
+      ok "$model already present"
+    else
+      say "  pulling $model"
+      if ollama pull "$model" >/dev/null 2>&1; then ok "$model"; else
+        warn "$model pull failed (may need a newer ollama)"
+      fi
+    fi
+  done
+elif [[ "$LOCAL_BACKEND" == "mlx" ]]; then
+  note "MLX models download on first use via mlx_lm.server"
+  note "start one with: python -m mlx_lm server --model mlx-community/Qwen3.5-9B-Instruct-4bit --port 8081"
+  todo "start an mlx_lm server before running 'ctswarm bench'"
+fi
+
+# ---------------------------------------------------------------------------
+say "Vendoring SWE-AF at pinned commit"
+# ---------------------------------------------------------------------------
+# Pinned rather than tracking main: SWE-AF is public beta with no tagged release,
+# so following main would change the factory underneath a running pilot.
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  note "check mode: skipping vendor"
+elif [[ -d vendor/SWE-AF/.git ]] && [[ $REVENDOR -eq 0 ]]; then
+  CURRENT=$(git -C vendor/SWE-AF rev-parse HEAD 2>/dev/null || echo none)
+  if [[ "$CURRENT" == "$SWE_AF_COMMIT" ]]; then
+    ok "SWE-AF at pinned ${SWE_AF_COMMIT:0:8}"
+  else
+    warn "SWE-AF at ${CURRENT:0:8}, pin is ${SWE_AF_COMMIT:0:8}"
+    note "re-run with --revendor to move it"
+  fi
+else
+  rm -rf vendor/SWE-AF
+  mkdir -p vendor
+  if git clone -q "$SWE_AF_REPO" vendor/SWE-AF 2>/dev/null; then
+    git -C vendor/SWE-AF checkout -q "$SWE_AF_COMMIT"
+    ok "SWE-AF pinned at ${SWE_AF_COMMIT:0:8} (${SWE_AF_COMMIT_DATE})"
+  else
+    fail "could not clone SWE-AF"
+    todo "check network access to github.com"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+say "Configuration"
+# ---------------------------------------------------------------------------
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  note "check mode: skipping .env"
+elif [[ -f .env ]]; then
+  ok ".env exists (left untouched)"
+else
+  cp .env.example .env
+  # Fill in what can be discovered without prompting. Never invents a value.
+  if have gh && gh auth status >/dev/null 2>&1; then
+    if TOKEN=$(gh auth token 2>/dev/null) && [[ -n "$TOKEN" ]]; then
+      sed -i.bak "s|^GH_TOKEN=.*|GH_TOKEN=${TOKEN}|" .env && rm -f .env.bak
+      ok "GH_TOKEN from gh cli"
+    fi
+  fi
+  ok "created .env from .env.example"
+fi
+
+# Credentials are reported, never auto-acquired: both of these open an
+# interactive browser flow that must not run unattended from a setup script.
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=sk-' .env 2>/dev/null; then
+  ok "claude_code runtime configured"
+else
+  warn "claude_code runtime not configured"
+  note "run: claude setup-token    then put the value in .env"
+  todo "configure CLAUDE_CODE_OAUTH_TOKEN"
+fi
+
+if [[ -f "$HOME/.codex/auth.json" ]]; then
+  ok "codex runtime configured (ChatGPT login found)"
+else
+  warn "codex runtime not configured"
+  note "run: codex login"
+  todo "run codex login"
+fi
+
+if [[ -n "${OPENROUTER_API_KEY:-}" ]] || grep -qE '^OPENROUTER_API_KEY=sk-or' .env 2>/dev/null; then
+  ok "openrouter overflow configured"
+else
+  note "openrouter not configured (optional; used as overflow capacity)"
+fi
+
+if grep -qE '^SLACK_BOT_TOKEN=xox' .env 2>/dev/null; then
+  ok "slack approvals configured"
+else
+  note "slack not configured; the local approval UI at :8091 will be used"
+  note "to enable slack see docs/SLACK.md"
+fi
+
+# ---------------------------------------------------------------------------
+say "Sandbox"
+# ---------------------------------------------------------------------------
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  note "check mode: skipping sandbox"
+elif have npm; then
+  if [[ -d sandbox/node_modules ]]; then
+    ok "sandbox dependencies present"
+  else
+    (cd sandbox && npm install --silent >/dev/null 2>&1) && ok "sandbox dependencies installed" \
+      || { warn "sandbox npm install failed"; todo "cd sandbox && npm install"; }
+  fi
+else
+  warn "npm not found; the sandbox target cannot be built or tested"
+  todo "install Node.js 20+"
+fi
+
+# ---------------------------------------------------------------------------
+say "Summary"
+# ---------------------------------------------------------------------------
+echo
+printf '  platform        %s / %s / %s\n' "$OS" "$ARCH" "$ACCEL"
+printf '  local backend   %s\n' "$LOCAL_BACKEND"
+printf '  swe-af pin      %s\n' "${SWE_AF_COMMIT:0:8}"
+echo
+
+if (( ${#TODO[@]} )); then
+  printf '  %sBefore this can run a build:%s\n' "$BOLD" "$RESET"
+  for item in "${TODO[@]}"; do printf '    - %s\n' "$item"; done
+  echo
+fi
+
+cat <<'NEXT'
+  Next:
+    ./.venv/bin/ctswarm doctor    full inventory of what is wired up
+    ./.venv/bin/ctswarm bench     qualify local models, write the routing table
+    ./.venv/bin/ctswarm serve     start the router on :8090
+    ./.venv/bin/ctswarm verify    run the self-verification probe suite
+
+NEXT

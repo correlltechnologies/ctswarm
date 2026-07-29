@@ -1,0 +1,163 @@
+openapi: 3.0.3
+info:
+  title: ctswarm sandbox service
+  version: 1.0.0
+  description: >
+    A minimal item service used as the verification target for the ctswarm
+    agent factory. Every route served must appear here; the contract test in
+    tests/contract.test.ts enforces that in both directions.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+components:
+  schemas:
+    Item:
+      type: object
+      required: [id, name, quantity, createdAt]
+      properties:
+        id:
+          type: string
+          example: "1"
+        name:
+          type: string
+          maxLength: 200
+          example: "widget"
+        quantity:
+          type: integer
+          minimum: 0
+          example: 12
+        createdAt:
+          type: string
+          format: date-time
+
+    CreateItemRequest:
+      type: object
+      required: [name, quantity]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        quantity:
+          type: integer
+          minimum: 0
+
+    Envelope:
+      type: object
+      required: [success, data, error]
+      properties:
+        success:
+          type: boolean
+        data:
+          nullable: true
+        error:
+          type: string
+          nullable: true
+
+    ErrorEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            success:
+              type: boolean
+              enum: [false]
+            field:
+              type: string
+              description: Which input field failed validation, when applicable.
+
+paths:
+  /items:
+    get:
+      summary: List all items
+      operationId: listItems
+      responses:
+        "200":
+          description: All items
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Item"
+    post:
+      summary: Create an item
+      operationId: createItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateItemRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Item"
+        "400":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /items/{id}:
+    get:
+      summary: Fetch a single item
+      operationId: getItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The item
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Item"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      summary: Delete an item
+      operationId: deleteItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
