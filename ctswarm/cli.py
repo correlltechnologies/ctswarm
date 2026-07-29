@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import typer
@@ -544,3 +545,168 @@ def committee(
             await backend_obj.close()
 
     asyncio.run(run())
+
+
+@app.command()
+def build(
+    goal: str = typer.Argument(..., help="What you want built, in plain language."),
+    repo: str = typer.Option(..., help="Target repository URL."),
+    watch: bool = typer.Option(True, help="Stay attached and stream status."),
+    status_interval: int = typer.Option(
+        900, help="Seconds between status posts when nothing changes."
+    ),
+    max_hours: float = typer.Option(12.0, help="Wall-clock ceiling for the build."),
+    gate_repo: str | None = typer.Option(
+        None, "--gate-repo", help="Local checkout to run scanners and the committee on."
+    ),
+) -> None:
+    """Hand the factory a goal and let it run.
+
+    Picks a runtime from remaining capacity, submits to SWE-AF, posts periodic
+    status to Slack (or records it locally when Slack is unconfigured), and
+    honours pause and stop requests at phase boundaries.
+    """
+    from .approvals.status import StatusNotifier
+    from .orchestrator import Orchestrator
+
+    orchestrator = Orchestrator(status_interval_s=float(status_interval))
+    notifier = StatusNotifier(ledger=orchestrator.ledger)
+
+    async def on_status(record) -> None:
+        delivered = await notifier.post(record)
+        where = "slack" if delivered else "local"
+        console.print(
+            f"  [dim]{time.strftime('%H:%M:%S')}[/dim] "
+            f"[bold]{record.state.value:<10}[/bold] "
+            f"{record.phase_detail[:70] or record.goal[:70]} [dim]({where})[/dim]"
+        )
+
+    async def run() -> None:
+        record = await orchestrator.submit(goal=goal, repo_url=repo)
+        console.print(
+            f"\n[bold]{record.build_id}[/bold] submitted"
+            f"\n  runtime  {record.runtime.value}"
+            f"\n  repo     {repo}"
+            f"\n  control  ctswarm pause/resume/stop {record.build_id}\n"
+        )
+        if record.state.terminal:
+            console.print(f"[red]{record.error}[/red]")
+            raise typer.Exit(1)
+        if not watch:
+            return
+
+        await orchestrator.run_until_done(
+            record, max_hours=max_hours, on_status=on_status
+        )
+
+        if record.state.value == "verifying" or record.state.value == "complete":
+            target = gate_repo
+            if target:
+                console.print("\n[bold]Running gates on the integrated branch[/bold]")
+                gates = await orchestrator.run_gates(record, target)
+                scanners = gates.get("scanners", {})
+                console.print(
+                    f"  scanners: {'passed' if scanners.get('passed') else 'FAILED'}"
+                )
+                for name in scanners.get("failed", []):
+                    console.print(f"    [red]failed[/red] {name}")
+                for name in scanners.get("unavailable", []):
+                    console.print(f"    [yellow]could not run[/yellow] {name}")
+                committee = gates.get("committee", {})
+                if committee.get("skipped"):
+                    console.print(f"  committee: [yellow]skipped[/yellow] {committee['skipped']}")
+                else:
+                    console.print(
+                        f"  committee: {'approved' if committee.get('approved') else 'BLOCKED'}"
+                    )
+                await notifier.post(record)
+            else:
+                console.print(
+                    "\n[yellow]--gate-repo not given, so scanners and the committee "
+                    "did not run. The build is NOT verified.[/yellow]"
+                )
+
+        console.print(f"\n[bold]final state: {record.state.value}[/bold]")
+        if record.pr_url:
+            console.print(f"  {record.pr_url}")
+
+    asyncio.run(run())
+
+
+@app.command()
+def pause(build_id: str) -> None:
+    """Pause a build. No new work starts; in-flight calls finish."""
+    from .orchestrator import Orchestrator
+
+    Orchestrator().request_pause(build_id, who="cli")
+    console.print(f"pause requested for {build_id}")
+
+
+@app.command()
+def resume(build_id: str) -> None:
+    """Resume a paused build."""
+    from .orchestrator import Orchestrator
+
+    Orchestrator().request_resume(build_id, who="cli")
+    console.print(f"resume requested for {build_id}")
+
+
+@app.command()
+def stop(build_id: str) -> None:
+    """Stop a build. Work so far stays on its branch."""
+    from .orchestrator import Orchestrator
+
+    Orchestrator().request_stop(build_id, who="cli")
+    console.print(f"stop requested for {build_id}")
+
+
+@app.command()
+def status(build_id: str | None = typer.Argument(None)) -> None:
+    """Show build status and what the team is working on."""
+    from .orchestrator import Orchestrator, load_build
+
+    orchestrator = Orchestrator()
+    ledger = orchestrator.ledger
+
+    if build_id is None:
+        submitted = ledger.events(kind="build_submitted")
+        if not submitted:
+            console.print("no builds recorded yet")
+            return
+        table = Table("build", "state", "goal", box=None)
+        for event in submitted[-15:]:
+            bid = event["build_id"]
+            record = load_build(ledger, bid)
+            detail = json.loads(event["detail"]) if event["detail"] else {}
+            table.add_row(
+                bid,
+                orchestrator.control_state(bid)
+                if record is None
+                else record.state.value,
+                (detail.get("goal") or "")[:60],
+            )
+        console.print(table)
+        return
+
+    record = load_build(ledger, build_id)
+    if record is None:
+        console.print(f"[red]unknown build {build_id}[/red]")
+        raise typer.Exit(1)
+
+    usage = ledger.usage_summary(build_id)
+    console.print(
+        f"\n[bold]{build_id}[/bold]  {record.state.value}"
+        f"\n  goal        {record.goal[:100]}"
+        f"\n  runtime     {record.runtime.value}"
+        f"\n  control     {orchestrator.control_state(build_id)}"
+        f"\n  model calls {usage['total_calls']} ({usage['local_fraction']:.0%} local)"
+        f"\n  spend       ${usage['total_cost_usd']:.2f}\n"
+    )
+    history = ledger.events(kind="build_status", build_id=build_id)
+    for event in history[-8:]:
+        detail = json.loads(event["detail"]) if event["detail"] else {}
+        console.print(
+            f"  [dim]{time.strftime('%H:%M:%S', time.localtime(event['ts']))}[/dim] "
+            f"{detail.get('state','')}  {(detail.get('detail') or '')[:60]}"
+        )
+    console.print()

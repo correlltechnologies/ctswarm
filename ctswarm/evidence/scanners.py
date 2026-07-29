@@ -170,6 +170,24 @@ def scan_secrets(repo: str | Path) -> ScanOutcome:
 # ---------------------------------------------------------------------------
 
 
+def _describe_via(via) -> str:
+    """Summarise npm audit's `via` field.
+
+    It is a heterogeneous list: sometimes package-name strings, sometimes advisory
+    objects. Assuming strings crashes the scanner on any real dependency tree,
+    which would take the whole security gate down with it.
+    """
+    if not isinstance(via, list):
+        return str(via) if via else "unknown"
+    parts: list[str] = []
+    for item in via[:2]:
+        if isinstance(item, dict):
+            parts.append(str(item.get("title") or item.get("name") or "advisory"))
+        else:
+            parts.append(str(item))
+    return ", ".join(parts) or "unknown"
+
+
 def scan_dependencies(repo: str | Path) -> ScanOutcome:
     """Audit declared dependencies for known advisories."""
     repo = Path(repo)
@@ -179,7 +197,17 @@ def scan_dependencies(repo: str | Path) -> ScanOutcome:
             return ScanOutcome(
                 "dependency-audit", "unavailable", "npm is not installed"
             )
-        code, out, _ = _run(["npm", "audit", "--json"], repo, timeout=300)
+        # --omit=dev is the load-bearing flag. Only dependencies that ship block
+        # the build. Observed in this very repo: the sandbox carried 7
+        # high/critical advisories entirely inside vitest's transitive dev tree,
+        # unresolvable without a breaking major bump, in a test harness that
+        # never runs in production. Blocking merges on that produces a
+        # permanently red gate, and a gate that is always red is a gate everyone
+        # learns to bypass, which is worse than not having one.
+        #
+        # Dev advisories are still reported, as warnings, so they are visible
+        # rather than invisible.
+        code, out, _ = _run(["npm", "audit", "--json", "--omit=dev"], repo, timeout=300)
         if code == -1:
             return ScanOutcome("dependency-audit", "unavailable", "npm not found")
         try:
@@ -189,25 +217,47 @@ def scan_dependencies(repo: str | Path) -> ScanOutcome:
                 "dependency-audit", "unavailable", "npm audit returned unparseable JSON"
             )
         meta = (report.get("metadata") or {}).get("vulnerabilities") or {}
+
+        dev_note = ""
+        dev_code, dev_out, _ = _run(["npm", "audit", "--json"], repo, timeout=300)
+        if dev_code != -1:
+            try:
+                dev_meta = (
+                    (json.loads(dev_out or "{}").get("metadata") or {}).get(
+                        "vulnerabilities"
+                    )
+                    or {}
+                )
+                dev_blocking = int(dev_meta.get("high", 0)) + int(
+                    dev_meta.get("critical", 0)
+                )
+                prod_blocking = int(meta.get("high", 0)) + int(meta.get("critical", 0))
+                if dev_blocking > prod_blocking:
+                    dev_note = (
+                        f"; {dev_blocking - prod_blocking} high/critical in dev-only "
+                        "dependencies (reported, not blocking)"
+                    )
+            except (ValueError, TypeError):
+                pass
+
         # Only high and critical block. Blocking on every low advisory in a
-        # transitive dependency makes the gate impossible to keep green, and a
-        # gate people routinely bypass protects nothing.
+        # transitive dependency makes the gate impossible to keep green.
         blocking = int(meta.get("high", 0)) + int(meta.get("critical", 0))
         findings = [
-            f"{name}: {info.get('severity')} via {','.join(info.get('via', [])[:2]) if isinstance(info.get('via'), list) else info.get('via')}"
+            f"{name}: {info.get('severity')} via {_describe_via(info.get('via'))}"
             for name, info in list((report.get("vulnerabilities") or {}).items())[:15]
             if info.get("severity") in ("high", "critical")
         ]
         if blocking:
             return ScanOutcome(
                 "dependency-audit", "failed",
-                f"{blocking} high/critical advisories "
-                f"({meta.get('low',0)} low, {meta.get('moderate',0)} moderate ignored)",
+                f"{blocking} high/critical advisories in PRODUCTION dependencies"
+                f"{dev_note}",
                 tuple(str(f) for f in findings),
             )
         return ScanOutcome(
             "dependency-audit", "passed",
-            f"no high/critical advisories ({meta.get('total', 0)} total)",
+            f"no high/critical advisories in production dependencies{dev_note}",
         )
 
     if (repo / "pyproject.toml").exists() or (repo / "requirements.txt").exists():

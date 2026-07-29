@@ -292,6 +292,27 @@ async def slack_interactivity(request: Request) -> JSONResponse:
     dedupe_key = actions[0].get("value", "")
     user = (interaction.get("user") or {}).get("username", "slack-user")
 
+    # Build controls (pause / resume / stop) are not approvals. They are
+    # always-safe owner actions on a live build, so they take a separate path
+    # and never touch the approval record.
+    if action_id.startswith("build_"):
+        from ..orchestrator import Orchestrator
+
+        orchestrator = Orchestrator(ledger=_ledger())
+        build_id = dedupe_key
+        if action_id == "build_pause":
+            orchestrator.request_pause(build_id, who=user)
+            return JSONResponse({"text": f"Pausing {build_id}. No new work will start."})
+        if action_id == "build_resume":
+            orchestrator.request_resume(build_id, who=user)
+            return JSONResponse({"text": f"Resuming {build_id}."})
+        if action_id == "build_stop":
+            orchestrator.request_stop(build_id, who=user)
+            return JSONResponse(
+                {"text": f"Stopping {build_id}. Work so far stays on its branch."}
+            )
+        return JSONResponse({"error": f"unknown build action {action_id}"}, status_code=400)
+
     try:
         decision = Decision(action_id)
     except ValueError:
