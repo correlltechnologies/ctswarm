@@ -35,6 +35,18 @@ class FailureKind(str):
     CANCELLED = "cancelled"
 
 
+# Token budget that leaves room for a reasoning model to think before answering.
+#
+# Measured on this hardware: qwen3.5:4b spends 181 reasoning tokens and 2 content
+# tokens to answer "Reply with exactly: OK". With max_tokens=8 or 64 it returns
+# finish_reason=length and EMPTY content, which is indistinguishable from a
+# broken model unless you know to look for it.
+#
+# The consequence is general: any max_tokens tuned against non-thinking models
+# silently converts thinking models into apparent failures. Anywhere ctswarm
+# sizes a budget, it must clear reasoning overhead first.
+REASONING_BUDGET = 1024
+
 # Errors that mean "stop immediately, retrying cannot help". SWE-AF learned this
 # the hard way (issue #49): retrying an exhausted-credit error through every
 # layer produces a misleading downstream error instead of the real cause.
@@ -213,35 +225,49 @@ class Backend(ABC):
         control endpoints keep answering 200.
         """
 
-    async def probe_generation(self, model_ref: str, timeout_s: float = 25.0) -> bool:
+    async def probe_generation(
+        self, model_ref: str, timeout_s: float = 120.0
+    ) -> tuple[bool, str]:
         """Confirm the backend can actually *generate*, not merely respond.
 
-        This exists because of an observed failure that the ordinary health check
-        could not see. A local model entered a runaway generation and never
-        terminated. It pinned the GPU and every subsequent request queued behind
-        it indefinitely, yet ``GET /v1/models`` kept returning 200 with a full
-        model list, so the backend looked perfectly healthy while serving nothing.
+        Returns ``(ok, reason)``. The reason is not decorative: an earlier version
+        returned a bare bool and callers reported every failure as a timeout,
+        which sent debugging in exactly the wrong direction.
 
-        Head-of-line blocking like that is invisible to a per-model circuit
-        breaker: the *other* models are fine, they simply never get scheduled.
-        Only issuing a real, tiny generation under a short timeout distinguishes
-        "up" from "working".
+        This exists because of an observed failure the ordinary health check could
+        not see. A local model entered a runaway generation and never terminated.
+        It pinned the GPU and every subsequent request queued behind it, yet
+        ``GET /v1/models`` kept returning 200 with a full model list, so the
+        backend looked perfectly healthy while serving nothing. Head-of-line
+        blocking like that is invisible to a per-model circuit breaker: the other
+        models are fine, they simply never get scheduled.
+
+        ``max_tokens`` is deliberately generous. Reasoning models spend their
+        budget on thinking tokens before emitting any content, so a probe sized
+        for a two-token answer can never pass. Measured here: qwen3.5:4b spends
+        181 reasoning tokens and 2 content tokens to answer "Reply with exactly:
+        OK". A tight budget makes every thinking model look broken.
         """
         import asyncio as _asyncio
 
         request = ChatRequest(
             messages=[{"role": "user", "content": "Reply with exactly: OK"}],
             model=model_ref,
-            max_tokens=8,
+            max_tokens=REASONING_BUDGET,
             temperature=0.0,
         )
         try:
             response = await _asyncio.wait_for(
                 self.chat(request, model_ref), timeout=timeout_s
             )
-        except (_asyncio.TimeoutError, Exception):  # noqa: BLE001
-            return False
-        return response.ok
+        except _asyncio.TimeoutError:
+            return False, f"no response within {timeout_s:.0f}s"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+
+        if response.ok:
+            return True, "ok"
+        return False, f"{response.failure_kind}: {response.error_detail[:120]}"
 
     @abstractmethod
     async def list_models(self) -> list[str]:

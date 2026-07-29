@@ -1,10 +1,15 @@
 # Source planning document (not committed by request)
 *.docx
 
-# Secrets and local config
-.env
-.env.local
-*.local.env
+# Secrets and local config.
+#
+# Broad on purpose. During setup a copied template landed as
+# ".env copy.example", which the previous narrow rules did not match, so a live
+# OAuth token sat one `git add -A` away from being committed. Ignore every .env
+# variant and re-include only the template.
+.env*
+!.env.example
+*.env
 secrets/
 *.pem
 *.key

@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ..backends import Backend
-from ..backends.base import ChatRequest
+from ..backends.base import REASONING_BUDGET, ChatRequest
 from ..router.policy import BenchScore, RoutingTable
 from .suite import Task, build_suite
 
@@ -201,7 +201,8 @@ async def measure_cancellation(backend: Backend, model_ref: str) -> tuple[bool, 
     probe = ChatRequest(
         messages=[{"role": "user", "content": "Reply with exactly: OK"}],
         model=model_ref,
-        max_tokens=16,
+        # Must clear reasoning overhead; see REASONING_BUDGET.
+        max_tokens=REASONING_BUDGET,
         temperature=0.0,
     )
     try:
@@ -237,7 +238,7 @@ async def measure_throughput(backend: Backend, model_ref: str) -> float:
             }
         ],
         model=model_ref,
-        max_tokens=400,
+        max_tokens=1024,
         temperature=0.0,
     )
     try:
@@ -350,8 +351,11 @@ async def _blocked_reason(backend: Backend, model_ref: str) -> str | None:
         if model_ref in wedged:
             return "this model's runner is wedged and will not terminate"
 
-    if not await backend.probe_generation(model_ref, timeout_s=30.0):
-        return "backend did not complete a trivial generation within 30s"
+    # Generous timeout: this is the first call against the model, so it includes
+    # cold-loading weights from disk onto the accelerator.
+    ok, reason = await backend.probe_generation(model_ref, timeout_s=180.0)
+    if not ok:
+        return f"failed a trivial generation ({reason})"
     return None
 
 

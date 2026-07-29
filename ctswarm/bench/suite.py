@@ -89,10 +89,19 @@ class Task:
     messages: list[dict]
     tools: list[dict] | None = None
     response_format: dict | None = None
-    max_tokens: int = 512
+    # Budgets throughout this suite clear reasoning overhead. Thinking models
+    # spend their allowance on reasoning tokens before emitting any content, so a
+    # budget sized for the visible answer scores them as broken rather than
+    # measuring them. Observed here: qwen3.5:4b spends 181 reasoning tokens to
+    # produce a 2-token answer, returning finish_reason=length and empty content
+    # at max_tokens=64.
+    max_tokens: int = 1536
     # Returns (passed, detail). Never calls a model.
     check: Callable[[dict], tuple[bool, str]] | None = None
-    timeout_s: float = 90.0
+    # Generous: the first call against a model includes cold-loading its weights
+    # onto the accelerator, and reasoning models emit far more tokens than their
+    # visible answer suggests.
+    timeout_s: float = 180.0
     weight: float = 1.0
     metadata: dict = field(default_factory=dict)
 
@@ -402,7 +411,7 @@ def build_suite(*, long_context_chars: int = 60_000) -> tuple[Task, ...]:
                 },
             ],
             check=check_json_schema(("approved", "severity", "findings", "summary")),
-            max_tokens=800,
+            max_tokens=2048,
         ),
         Task(
             name="schema_issue_plan",
@@ -421,7 +430,7 @@ def build_suite(*, long_context_chars: int = 60_000) -> tuple[Task, ...]:
                 },
             ],
             check=check_json_schema(("issues", "rationale")),
-            max_tokens=1200,
+            max_tokens=2560,
         ),
         # -- long_context -------------------------------------------------
         Task(
@@ -440,7 +449,7 @@ def build_suite(*, long_context_chars: int = 60_000) -> tuple[Task, ...]:
                 },
             ],
             check=check_contains(NEEDLE_TOKEN),
-            max_tokens=128,
+            max_tokens=1024,
             timeout_s=180.0,
             metadata={"context_chars": long_context_chars},
         ),
@@ -463,6 +472,6 @@ def build_suite(*, long_context_chars: int = 60_000) -> tuple[Task, ...]:
                 },
             ],
             check=check_admits_unknown,
-            max_tokens=256,
+            max_tokens=1024,
         ),
     )
