@@ -362,8 +362,16 @@ def write_results(
     routing_path: str | Path = "bench/results/routing.json",
     detail_path: str | Path = "bench/results/detail.json",
 ) -> RoutingTable:
-    """Persist measurements and produce the routing table."""
-    table = RoutingTable({r.model_ref: r.to_score() for r in results})
+    """Persist measurements and produce the routing table.
+
+    Models that could not be measured are written to the detail file but NOT to
+    the routing table. Recording a blocked model's all-zero scores would look
+    identical to having measured it and found it terrible, which permanently
+    gates it out of every agent role on evidence that was never collected.
+    Absent from the table means "unmeasured", which is the truth.
+    """
+    measured = [r for r in results if r.error is None]
+    table = RoutingTable({r.model_ref: r.to_score() for r in measured})
     table.save(routing_path)
 
     detail_path = Path(detail_path)

@@ -226,6 +226,14 @@ def bench(
             )
 
         def on_model_done(result) -> None:
+            if result.error:
+                # Distinct from a failing verdict. "Could not measure" and
+                # "measured and found unfit" must never look the same.
+                console.print(
+                    f"  [bold]{result.model_ref}[/bold] -> [yellow]BLOCKED[/yellow]  "
+                    f"{result.error}\n"
+                )
+                return
             score = result.to_score()
             verdict = (
                 "[green]ELIGIBLE[/green]"
