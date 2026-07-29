@@ -27,6 +27,36 @@ from .ledger import Ledger
 from .platform_detect import detect_host
 from .router.policy import RoutingTable
 
+def _load_dotenv(path: str = ".env") -> None:
+    """Load .env into the environment without clobbering real env vars.
+
+    Deliberately does not overwrite an already-set variable: an explicit
+    `FOO=bar ctswarm ...` must win over the file, and a CI-injected secret must
+    not be silently replaced by a stale local one.
+
+    Written by hand rather than pulled in as a dependency because it needs to run
+    before anything else and the parsing rules here are a dozen lines.
+    """
+    file = Path(path)
+    if not file.exists():
+        return
+    try:
+        lines = file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 app = typer.Typer(
     add_completion=False,
     help="Governance, routing, and evidence layer around SWE-AF.",
@@ -409,3 +439,107 @@ def verify(
             "accept, or resolve the preconditions above.[/yellow]\n"
         )
         raise typer.Exit(2)
+
+
+@app.command()
+def capacity() -> None:
+    """Show remaining headroom per runtime and which one would be chosen."""
+    from .capacity import CapacityManager, Runtime
+
+    manager = CapacityManager()
+    table = Table("runtime", "available", "remaining", "spent", "why", box=None)
+    for name, info in manager.report().items():
+        table.add_row(
+            name,
+            _ok(info["available"]),
+            f"{info['fraction_remaining']:.0%}",
+            f"${info['spent_usd']:.2f}",
+            info["reason"],
+        )
+    console.print("\n[bold]Runtime capacity[/bold]")
+    console.print(table)
+
+    routine, why_routine = manager.select()
+    strong, why_strong = manager.select(require_strong=True)
+    console.print(
+        f"\n  routine build   [bold]{routine.value}[/bold]  [dim]{why_routine}[/dim]"
+        f"\n  planning/verify [bold]{strong.value}[/bold]  [dim]{why_strong}[/dim]\n"
+    )
+    console.print(
+        "[dim]Subscription headroom is reconstructed from observed per-call usage,\n"
+        "not polled: neither the claude nor codex CLI exposes a quota endpoint.\n"
+        "An actual rate-limit response overrides the estimate.[/dim]\n"
+    )
+
+
+@app.command()
+def committee(
+    question: str = typer.Argument(..., help="The judgement call to put to a vote."),
+    context_file: str | None = typer.Option(
+        None, "--file", help="File whose contents are the evidence."
+    ),
+    rule: str = typer.Option(
+        "majority", help="majority | unanimous | any_reject_blocks"
+    ),
+    min_families: int = typer.Option(
+        2, help="Distinct model families required for a valid quorum."
+    ),
+) -> None:
+    """Put a question to an independent multi-model committee.
+
+    Members are drawn one per model family from bench-eligible models, because
+    three models from the same family are one opinion sampled three times.
+    """
+    from .backends import build_backends
+    from .committee import Rule, convene, eligible_members
+
+    context = Path(context_file).read_text(encoding="utf-8") if context_file else ""
+    table = RoutingTable.load()
+    members = eligible_members(table)
+
+    if len(members) < min_families:
+        console.print(
+            f"[red]only {len(members)} eligible model family/families "
+            f"({members}); {min_families} required[/red]\n"
+            "[yellow]Run `ctswarm bench`, or add a second backend "
+            "(OPENROUTER_API_KEY) for genuine independence.[/yellow]"
+        )
+        raise typer.Exit(2)
+
+    host = detect_host()
+    backends = build_backends(host)
+    backend = backends.get("ollama") or next(iter(backends.values()))
+
+    async def run() -> None:
+        result = await convene(
+            question=question,
+            context=context,
+            backend=backend,
+            members=members,
+            rule=Rule(rule),
+            min_families=min_families,
+        )
+        verdict = (
+            "[green]APPROVED[/green]" if result.approved else "[red]BLOCKED[/red]"
+        )
+        console.print(f"\n{verdict}  [dim]{result.reason}[/dim]\n")
+        for vote in result.votes:
+            colour = {"approve": "green", "reject": "red", "abstain": "yellow"}[
+                vote.verdict.value
+            ]
+            console.print(
+                f"  [{colour}]{vote.verdict.value:<8}[/{colour}] "
+                f"{vote.model_ref:<18} [dim]({vote.family})[/dim] "
+                f"conf={vote.confidence:.2f}"
+            )
+            if vote.reasoning:
+                console.print(f"           [dim]{vote.reasoning[:150]}[/dim]")
+            for finding in vote.findings[:3]:
+                console.print(f"           [yellow]![/yellow] {finding[:120]}")
+        if result.needs_human:
+            console.print("\n[yellow]Escalated: requires a human decision.[/yellow]")
+        console.print()
+        for backend_obj in backends.values():
+            await backend_obj.close()
+
+    asyncio.run(run())
