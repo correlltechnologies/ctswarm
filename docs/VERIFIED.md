@@ -55,7 +55,7 @@ on any of this in a new environment.
 | Narrow Claude credential mount | Docker mount inspection | Container sees one 942-byte credential instead of the 653 MB / 7,631-file host Claude profile |
 | Patched SWE-AF regression suite | Ephemeral production image with local source mounted | 71 focused tests passed (git fast path, coding loop, issue build) |
 | ctswarm suite after production-readiness fixes | `pytest -q`; `ruff check ctswarm tests` | 61/61 passing; lint clean |
-| Root CI-equivalent suite | Python lint/tests/platform/anti-slop plus sandbox typecheck/tests/coverage | All pass; anti-slop has 0 blockers; sandbox 18/18; 90.15% statement coverage |
+| Root CI suite | Local equivalent plus GitHub Actions pull-request and post-merge runs | All three jobs pass on merged `main`; anti-slop has 0 blockers; sandbox 18/18; 90.15% statement coverage |
 | Always-on scheduler | Live queue submission, service recreation, and control API | Recovered the same in-flight execution after two recreations; no duplicate submission |
 | Scheduler concurrency | One active full build plus a queued sentinel | `active=1`, `queued=1`, `max_concurrent=1`; stopped sentinel reached terminal `stopped` with no execution ID |
 | Docker resilience settings | Live `docker inspect` of all seven services | Every service uses `unless-stopped` and `json-file` rotation at 10 MB × 5 |

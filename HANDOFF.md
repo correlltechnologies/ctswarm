@@ -27,9 +27,8 @@ The core branch-and-PR factory works end to end:
 - A full five-issue Claude build completed planning, isolated worktrees,
   dependency-ordered parallel execution, deterministic merges, integration
   testing, final verification, and draft-PR creation.
-- Root CI failures that predated the local-model work are fixed locally:
-  Python lint/tests, platform detection, anti-slop self-scan, sandbox typecheck,
-  sandbox tests, and coverage all pass.
+- Root CI failures that predated the local-model work are fixed. Pull-request
+  CI and the post-merge `main` run both pass Python, sandbox, and anti-slop jobs.
 
 There is no required engineering gap left for the current autonomous
 branch-and-draft-PR scope. Production deployment remains deliberately outside
@@ -199,6 +198,7 @@ sandbox typecheck            passed
 sandbox tests                18 passed
 sandbox coverage             90.15% statements
 stack                        7 services healthy/running
+GitHub CI                    3/3 jobs passed on merged main
 ```
 
 The sandbox draft PR's fresh-checkout validation is recorded in section 2.
