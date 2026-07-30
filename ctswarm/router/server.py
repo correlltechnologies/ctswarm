@@ -23,7 +23,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..backends import Backend, ChatRequest, build_backends
 from ..backends.base import FATAL_FAILURES, FailureKind
@@ -267,11 +267,7 @@ async def chat_completions(request: Request) -> JSONResponse:
         temperature=payload.get("temperature"),
         max_tokens=payload.get("max_tokens"),
         response_format=payload.get("response_format"),
-        # Streaming is accepted but resolved non-streaming. Mid-stream failover
-        # would require replaying already-emitted tokens, which cannot be done
-        # correctly, and silently degrading reliability to preserve streaming is
-        # the wrong trade for an autonomous factory.
-        stream=False,
+        stream=bool(payload.get("stream")),
         extra={
             key: value
             for key, value in payload.items()
@@ -337,6 +333,25 @@ async def chat_completions(request: Request) -> JSONResponse:
 
     resolved_tier = (tier or (tier_for_role(role) if role else Tier.MED)).value
     attempts: list[dict] = []
+
+    # Streaming must be honoured, not silently downgraded. opencode (and any
+    # AI-SDK client) requests SSE and extracts no text at all from a plain JSON
+    # body: the first real build failed exactly this way, with opencode exiting
+    # 0, printing nothing, and reporting 0 tokens while the router had happily
+    # served a valid non-streaming completion.
+    #
+    # Failover is still available, but only up to the first byte. After that the
+    # response is committed.
+    if chat_request.stream:
+        return await _stream_response(
+            state,
+            chat_request,
+            chain,
+            requested_model=requested_model,
+            role=role,
+            tier=resolved_tier,
+            build_id=build_id,
+        )
 
     for attempt_number, (backend_name, model_ref) in enumerate(chain, start=1):
         backend = state.backends.get(backend_name)
@@ -448,3 +463,114 @@ def _pinned_chain(
         if model_ref in refs:
             return [(name, model_ref)]
     return []
+
+
+async def _stream_response(
+    state: RouterState,
+    chat_request: ChatRequest,
+    chain: list[tuple[str, str]],
+    *,
+    requested_model: str,
+    role: str | None,
+    tier: str,
+    build_id: str | None,
+) -> StreamingResponse:
+    """Serve a streaming completion, failing over only before the first byte."""
+    import json as _json
+
+    for attempt_number, (backend_name, model_ref) in enumerate(chain, start=1):
+        backend = state.backends.get(backend_name)
+        if backend is None or not hasattr(backend, "stream"):
+            continue
+
+        iterator = backend.stream(chat_request, model_ref)
+        try:
+            kind, payload = await iterator.__anext__()
+        except StopAsyncIteration:
+            continue
+
+        if kind == "error":
+            state.ledger.record_call(
+                backend=backend_name,
+                model_ref=model_ref,
+                ok=False,
+                build_id=build_id,
+                role=role,
+                tier=tier,
+                virtual_model=requested_model,
+                failure_kind=payload.failure_kind,
+                attempt=attempt_number,
+            )
+            if payload.failure_kind in NON_RETRYABLE:
+                break
+            # Nothing has been sent yet, so trying the next candidate is safe.
+            continue
+
+        async def body(
+            it=iterator, backend_name=backend_name, model_ref=model_ref,
+            attempt_number=attempt_number,
+        ):
+            output_chars = 0
+            try:
+                async for chunk_kind, value in it:
+                    if chunk_kind == "chunk":
+                        if value:
+                            output_chars += len(value)
+                        yield f"{value}\n".encode()
+                    elif chunk_kind == "done":
+                        state.ledger.record_call(
+                            backend=backend_name,
+                            model_ref=model_ref,
+                            ok=True,
+                            build_id=build_id,
+                            role=role,
+                            tier=tier,
+                            virtual_model=requested_model,
+                            # Streamed responses carry no usage block until the
+                            # final chunk, and not every provider sends one, so
+                            # this is a character-derived estimate rather than a
+                            # measured count. Marked as such instead of being
+                            # presented as exact.
+                            output_tokens=output_chars // 4,
+                            latency_ms=value or 0,
+                            attempt=attempt_number,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                # Mid-stream failure. The client already has partial content, so
+                # emit a terminating error rather than switching models: a
+                # different model continuing mid-sentence corrupts the answer.
+                error = _json.dumps(
+                    {"error": {"message": f"stream interrupted: {exc}", "type": "stream_error"}}
+                )
+                yield f"data: {error}\n\n".encode()
+                state.ledger.record_call(
+                    backend=backend_name,
+                    model_ref=model_ref,
+                    ok=False,
+                    build_id=build_id,
+                    role=role,
+                    tier=tier,
+                    virtual_model=requested_model,
+                    failure_kind="stream_error",
+                    attempt=attempt_number,
+                )
+
+        return StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Ctswarm-Backend": backend_name,
+                "X-Ctswarm-Model": model_ref,
+            },
+        )
+
+    state.ledger.record_event(
+        "stream_route_exhausted",
+        {"requested": requested_model, "role": role},
+        build_id=build_id,
+    )
+    return JSONResponse(
+        {"error": {"message": "no candidate could start a stream", "type": "route_exhausted"}},
+        status_code=503,
+    )

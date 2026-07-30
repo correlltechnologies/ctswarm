@@ -134,6 +134,52 @@ class OpenAICompatBackend(Backend):
             cost_usd=self.cost_for(model_ref, prompt_tokens, output_tokens),
         )
 
+    async def stream(self, request: ChatRequest, model_ref: str):
+        """Yield raw SSE lines from an upstream streaming completion.
+
+        Returns an async iterator. The first item is a sentinel: either
+        ``("ok", None)`` once the upstream has accepted the request and returned
+        200, or ``("error", ChatResponse)`` if it failed before any bytes.
+
+        That split is what makes failover safe. The router may retry another
+        model only while the sentinel is still pending, because once a single
+        token has reached the client it cannot be unsent, and silently
+        continuing a different model's answer mid-sentence would corrupt the
+        response rather than repair it.
+        """
+        payload = request.for_backend(model_ref)
+        payload["stream"] = True
+        started = time.perf_counter()
+
+        try:
+            context = self._client.stream("POST", "/chat/completions", json=payload)
+            response = await context.__aenter__()
+        except httpx.TimeoutException:
+            yield ("error", self._failure(model_ref, FailureKind.TIMEOUT, "timeout", 0))
+            return
+        except (httpx.HTTPError, OSError) as exc:
+            yield (
+                "error",
+                self._failure(model_ref, FailureKind.CONNECTION_ERROR, str(exc), 0),
+            )
+            return
+
+        try:
+            if response.status_code != 200:
+                body = (await response.aread()).decode(errors="replace")
+                kind = classify_http_failure(response.status_code, body[:2000])
+                yield ("error", self._failure(model_ref, kind, body[:400], 0))
+                return
+
+            yield ("ok", None)
+
+            async for line in response.aiter_lines():
+                yield ("chunk", line)
+        finally:
+            await context.__aexit__(None, None, None)
+
+        yield ("done", int((time.perf_counter() - started) * 1000))
+
     def _failure(
         self, model_ref: str, kind: str, detail: str, latency_ms: int
     ) -> ChatResponse:
@@ -158,3 +204,4 @@ def connect_probe_timeout() -> httpx.Timeout:
     backend take minutes to detect, which defeats failover.
     """
     return httpx.Timeout(10.0, connect=3.0)
+
