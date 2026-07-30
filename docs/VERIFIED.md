@@ -91,6 +91,29 @@ Notes that matter more than the numbers:
 | `ollama 0.31.1` cannot pull `laguna-xs-2.1` | Pull fails with a download prompt rather than a version error | The best local high-tier candidate is unavailable until Ollama is upgraded. `qwen3.6` covers the tier meanwhile. |
 | Ollama loaded `ornith:9b` with a 4096 context | `/api/ps` reported `context_length: 4096` despite the model advertising 262144 | Advertised context is not effective context. The bench measures real retrieval rather than trusting metadata. |
 
+## First full build (2026-07-30)
+
+`build-5506756dae`, goal: add `/healthz` with tests and an OpenAPI update.
+
+| Fact | Result |
+|---|---|
+| Stack runs, both SWE-AF nodes register | verified |
+| Full chain: agent -> opencode -> router -> ollama/openrouter | verified |
+| Build ran to completion | 23 min, 112 model calls, **100% success** |
+| Live multi-backend routing | high -> deepseek-v4-pro (OpenRouter), med/low -> qwen3.5:9b (local), failover to minimax-m2.5 inside the high tier |
+| **Code actually written** | **NO.** All worktrees clean at the initial commit; no `healthz`, no branches, no commits |
+| Build outcome | `success: False` — 4/4 issues reported complete, Verifier failed, no PR opened |
+
+The gates worked. A build claiming four completed issues with zero code written is exactly
+what the evidence layer exists to catch, and it caught it: the verifier refused and no pull
+request was created. Agent self-report carried no authority.
+
+**This is the current blocker**: infrastructure is proven, output is not. 112 successful
+router calls mean valid completions, not correct work. The discriminating experiment is to
+rerun the same goal under `SWE_DEFAULT_RUNTIME=claude_code`; if Claude writes files and the
+local models do not, the cause is model capability under agent load rather than ctswarm's
+plumbing.
+
 ## Assumptions not yet verified
 
 | Assumption | Why it is not yet verified | What breaks if wrong |
