@@ -105,6 +105,39 @@ CONTROL_RESUME = "build_control_resume"
 CONTROL_STOP = "build_control_stop"
 
 
+def runtime_model_overrides(runtime: Runtime) -> dict[str, str]:
+    """Return model names that are valid for the selected CLI harness.
+
+    The agent containers expose ``SWE_MODEL_*`` aliases for the OpenCode/router
+    path. SWE-AF treats those environment variables as global defaults, so an
+    explicit per-build override is required when capacity selection chooses a
+    different runtime. Otherwise ``claude`` or ``codex`` receives an OpenCode
+    model id such as ``ctswarm/med`` and can hang or fail before doing any work.
+    """
+    if runtime is Runtime.OPEN_CODE:
+        return {
+            "default": "ctswarm/med",
+            "pm": "ctswarm/high",
+            "architect": "ctswarm/high",
+            "tech_lead": "ctswarm/high",
+            "replan": "ctswarm/high",
+            "qa_synthesizer": "ctswarm/low",
+            "git": "ctswarm/low",
+        }
+    if runtime is Runtime.CLAUDE_CODE:
+        return {
+            "default": "sonnet",
+            "qa_synthesizer": "haiku",
+        }
+    auth_mode = os.environ.get("SWE_CODEX_AUTH_MODE", "auto").strip().lower()
+    uses_api_key = auth_mode == "api_key" or (
+        auth_mode == "auto" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    )
+    # The `-codex` model is API-key-only; ChatGPT-account login needs the base
+    # model. This mirrors SWE-AF's own auth-aware default selection.
+    return {"default": "gpt-5.3-codex" if uses_api_key else "gpt-5.5"}
+
+
 class Orchestrator:
     """Drives one build from goal to gated result."""
 
@@ -194,20 +227,8 @@ class Orchestrator:
             "runtime": runtime.value,
             "check_ci": True,
             "max_ci_fix_cycles": max_ci_fix_cycles,
+            "models": runtime_model_overrides(runtime),
         }
-        # Only the open runtime routes through ctswarm's virtual models. The CLI
-        # harnesses use their own model selection, so sending ctswarm/* to them
-        # would be meaningless at best.
-        if runtime is Runtime.OPEN_CODE:
-            config["models"] = {
-                "default": "ctswarm/med",
-                "pm": "ctswarm/high",
-                "architect": "ctswarm/high",
-                "tech_lead": "ctswarm/high",
-                "replan": "ctswarm/high",
-                "qa_synthesizer": "ctswarm/low",
-                "git": "ctswarm/low",
-            }
 
         payload = {
             "goal": goal,

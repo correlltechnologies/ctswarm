@@ -1,0 +1,24 @@
+diff --git a/swe_af/issue/build.py b/swe_af/issue/build.py
+--- a/swe_af/issue/build.py
++++ b/swe_af/issue/build.py
+@@ -208,6 +208,11 @@ async def _implement_issue_impl(
+ 
+     planned["worktree_path"] = worktree_path
+     planned["branch_name"] = branch
++    # The coding loop validates repository changes against the integration
++    # branch. Issue-level builds do not go through DAG worktree enrichment, so
++    # carry the resolved base explicitly instead of leaving committed coder
++    # work indistinguishable from an unchanged clean worktree.
++    planned["integration_branch"] = base_ref
+ 
+     exec_config = ExecutionConfig(
+         runtime=cfg.runtime,
+@@ -221,6 +226,8 @@ async def _implement_issue_impl(
+         artifacts_dir=abs_artifacts,
+         build_id=build_id,
+         all_issues=[planned],
++        git_integration_branch=base_ref,
++        git_initial_commit=base_sha,
+     )
+ 
+     # --- Execute (failures after branch creation return a structured result) -

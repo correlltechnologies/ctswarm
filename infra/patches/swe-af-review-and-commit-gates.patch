@@ -1,0 +1,141 @@
+diff --git a/swe_af/execution/coding_loop.py b/swe_af/execution/coding_loop.py
+--- a/swe_af/execution/coding_loop.py
++++ b/swe_af/execution/coding_loop.py
+@@ -384,7 +384,11 @@ async def _run_default_path(
+                 f"Reviewer failed: {issue_name}: {e}",
+                 tags=["coding_loop", "review_error", issue_name],
+             )
+-        review_result = {"approved": True, "blocking": False, "summary": f"Review unavailable: {e}"}
++        review_result = {
++            "approved": False,
++            "blocking": True,
++            "summary": f"Review unavailable: {e}",
++        }
+ 
+     if note_fn:
+         note_fn(
+@@ -489,7 +493,11 @@ async def _run_flagged_path(
+                     f"Review agent failed: {issue_name}: {review_result}",
+                     tags=["coding_loop", "review_error", issue_name],
+                 )
+-            review_result = {"approved": True, "blocking": False, "summary": f"Review unavailable: {review_result}"}
++            review_result = {
++                "approved": False,
++                "blocking": True,
++                "summary": f"Review unavailable: {review_result}",
++            }
+     except FatalHarnessError:
+         raise
+     except Exception as e:
+@@ -499,7 +507,11 @@ async def _run_flagged_path(
+                 tags=["coding_loop", "qa_review_error", issue_name],
+             )
+         qa_result = {"passed": False, "summary": f"QA unavailable: {e}"}
+-        review_result = {"approved": True, "blocking": False, "summary": "Review unavailable"}
++        review_result = {
++            "approved": False,
++            "blocking": True,
++            "summary": "Review unavailable",
++        }
+ 
+     if note_fn:
+         note_fn(
+@@ -704,7 +716,7 @@ async def run_coding_loop(
+         # Track files changed across iterations
+         observed_files = _repository_changed_files(
+             worktree_path,
+-            issue.get("integration_branch", ""),
++            issue.get("integration_branch") or dag_state.git_integration_branch,
+         )
+         reported_files = coder_result.get("files_changed", [])
+         current_files = observed_files if observed_files is not None else reported_files
+diff --git a/tests/test_coding_loop_regressions.py b/tests/test_coding_loop_regressions.py
+--- a/tests/test_coding_loop_regressions.py
++++ b/tests/test_coding_loop_regressions.py
+@@ -102,6 +102,86 @@ def test_git_observed_change_overrides_empty_coder_file_list(tmp_path: Path) -> N
+     assert result.files_changed == ["observed.txt"]
+ 
+ 
++def test_committed_change_uses_dag_integration_branch_fallback(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    subprocess.run(
++        ["git", "checkout", "-q", "-b", "issue/committed-change"],
++        cwd=tmp_path,
++        check=True,
++    )
++    dag_state = _make_dag_state(tmp_path, build_id="committed1")
++    dag_state.git_integration_branch = "integration"
++    config = ExecutionConfig(max_coding_iterations=1)
++    issue = {
++        "name": "create-committed",
++        "files_to_create": ["committed.txt"],
++    }
++    reviewer_called = False
++
++    async def call_fn(target: str, **kwargs):
++        nonlocal reviewer_called
++        if target.endswith(".run_coder"):
++            (tmp_path / "committed.txt").write_text("written\n")
++            subprocess.run(["git", "add", "committed.txt"], cwd=tmp_path, check=True)
++            subprocess.run(
++                ["git", "commit", "-q", "-m", "add committed file"],
++                cwd=tmp_path,
++                check=True,
++            )
++            return {"complete": True, "files_changed": [], "summary": "done"}
++        if target.endswith(".run_code_reviewer"):
++            reviewer_called = True
++            return {
++                "approved": True,
++                "blocking": False,
++                "summary": "verified",
++                "debt_items": [],
++            }
++        raise AssertionError(f"Unexpected target: {target}")
++
++    result = asyncio.run(
++        run_coding_loop(
++            issue=issue,
++            dag_state=dag_state,
++            call_fn=call_fn,
++            node_id="swe-planner",
++            config=config,
++        )
++    )
++
++    assert result.outcome == IssueOutcome.COMPLETED
++    assert result.files_changed == ["committed.txt"]
++    assert reviewer_called is True
++
++
++def test_reviewer_exception_blocks_default_path(tmp_path: Path) -> None:
++    dag_state = _make_dag_state(tmp_path, build_id="reviewfail1")
++    config = ExecutionConfig(max_coding_iterations=1)
++    issue = {"name": "review-must-run"}
++
++    async def call_fn(target: str, **kwargs):
++        if target.endswith(".run_coder"):
++            return {"complete": True, "files_changed": [], "summary": "done"}
++        if target.endswith(".run_code_reviewer"):
++            raise RuntimeError("review service unavailable")
++        raise AssertionError(f"Unexpected target: {target}")
++
++    result = asyncio.run(
++        run_coding_loop(
++            issue=issue,
++            dag_state=dag_state,
++            call_fn=call_fn,
++            node_id="swe-planner",
++            config=config,
++        )
++    )
++
++    assert result.outcome == IssueOutcome.FAILED_UNRECOVERABLE
++    assert "Review unavailable" in result.error_message
++    assert result.iteration_history[0]["review_approved"] is False
++    assert result.iteration_history[0]["review_blocking"] is True
++
++
+ def test_run_coding_loop_ignores_legacy_iteration_state_when_build_id_present(tmp_path: Path) -> None:
+     artifacts_dir = tmp_path / ".artifacts"
+     legacy_state = artifacts_dir / "execution" / "iterations" / "create-hello-script.json"

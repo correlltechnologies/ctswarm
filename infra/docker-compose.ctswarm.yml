@@ -119,9 +119,10 @@ services:
       # opencode reads provider config from XDG config; mounting it here is what
       # makes `ctswarm/*` resolve to the router inside the agent container.
       - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
-      # Claude subscription credentials. Read-only: an agent must never be able
-      # to rewrite the credentials it runs under.
-      - ${HOME}/.claude:/root/.claude:ro
+      # Mount only the Claude credential, not the entire host profile. The full
+      # profile can contain thousands of skills and hundreds of MB of caches;
+      # exposing it made every CLI invocation scan unrelated host state.
+      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
     depends_on:
       ctswarm-router:
         condition: service_healthy
@@ -139,7 +140,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
-      - ${HOME}/.claude:/root/.claude:ro
+      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
     depends_on:
       ctswarm-router:
         condition: service_healthy

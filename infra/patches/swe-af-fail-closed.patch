@@ -1,0 +1,666 @@
+diff --git a/swe_af/execution/coding_loop.py b/swe_af/execution/coding_loop.py
+index 9790e9e..5339433 100644
+--- a/swe_af/execution/coding_loop.py
++++ b/swe_af/execution/coding_loop.py
+@@ -17,6 +17,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import os
++import subprocess
+ import traceback
+ import uuid
+ from typing import Callable
+@@ -85,6 +86,55 @@ def _save_artifact(artifacts_dir: str, iteration_id: str, name: str, data: dict)
+     return path
+ 
+ 
++def _repository_changed_files(
++    worktree_path: str,
++    integration_branch: str,
++) -> list[str] | None:
++    """Return git-observed changes, or None when the path is not a git repo."""
++    probe = subprocess.run(
++        ["git", "-C", worktree_path, "rev-parse", "--git-dir"],
++        capture_output=True,
++        text=True,
++    )
++    if probe.returncode != 0:
++        return None
++
++    changed: set[str] = set()
++    status = subprocess.run(
++        ["git", "-C", worktree_path, "status", "--porcelain"],
++        capture_output=True,
++        text=True,
++        check=True,
++    )
++    for line in status.stdout.splitlines():
++        path = line[3:].strip()
++        if " -> " in path:
++            path = path.split(" -> ", 1)[1]
++        if path and not path.startswith(".artifacts/"):
++            changed.add(path)
++
++    if integration_branch:
++        diff = subprocess.run(
++            [
++                "git", "-C", worktree_path, "diff", "--name-only",
++                f"{integration_branch}...HEAD",
++            ],
++            capture_output=True,
++            text=True,
++        )
++        if diff.returncode == 0:
++            changed.update(
++                path.strip()
++                for path in diff.stdout.splitlines()
++                if path.strip() and not path.startswith(".artifacts/")
++            )
++    return sorted(changed)
++
++
++def _issue_requires_repository_changes(issue: dict) -> bool:
++    return bool(issue.get("files_to_create") or issue.get("files_to_modify"))
++
++
+ # ---------------------------------------------------------------------------
+ # Memory helpers
+ # ---------------------------------------------------------------------------
+@@ -652,12 +702,48 @@ async def run_coding_loop(
+             )
+ 
+         # Track files changed across iterations
+-        for f in coder_result.get("files_changed", []):
++        observed_files = _repository_changed_files(
++            worktree_path,
++            issue.get("integration_branch", ""),
++        )
++        reported_files = coder_result.get("files_changed", [])
++        current_files = observed_files if observed_files is not None else reported_files
++        coder_result["files_changed"] = current_files
++        for f in current_files:
+             if f not in files_changed:
+                 files_changed.append(f)
+ 
+         _save_artifact(dag_state.artifacts_dir, iteration_id, "coder", coder_result)
+ 
++        if _issue_requires_repository_changes(issue) and not current_files:
++            summary = (
++                "Coder produced no repository changes. Use editing tools to "
++                "implement the issue; a completion claim without a git-observed "
++                "change cannot be approved."
++            )
++            iteration_history.append({
++                "iteration": iteration,
++                "action": "fix",
++                "summary": summary,
++                "qa_passed": None,
++                "review_approved": False,
++                "review_blocking": False,
++                "path": "pre-review-change-gate",
++            })
++            feedback = summary
++            _save_iteration_state(dag_state.artifacts_dir, issue_name, {
++                "iteration": iteration,
++                "feedback": feedback,
++                "files_changed": files_changed,
++                "iteration_history": iteration_history,
++            }, build_id=dag_state.build_id)
++            if note_fn:
++                note_fn(
++                    f"Coder change gate rejected empty output: {issue_name}",
++                    tags=["coding_loop", "change_gate", "rejected", issue_name],
++                )
++            continue
++
+         # --- 2. PATH BRANCH ---
+         if needs_deeper_qa:
+             # FLAGGED PATH: QA + reviewer parallel → synthesizer
+diff --git a/swe_af/execution/dag_executor.py b/swe_af/execution/dag_executor.py
+index 212000b..a949709 100644
+--- a/swe_af/execution/dag_executor.py
++++ b/swe_af/execution/dag_executor.py
+@@ -144,11 +144,18 @@ async def _setup_worktrees(
+             note_fn=note_fn,
+         )
+ 
+-        if not setup.get("success"):
+-            if note_fn:
+-                note_fn("Worktree setup failed — issues will run without isolation",
+-                         tags=["execution", "worktree_setup", "error"])
+-            return active_issues
++        expected = {issue.get("name", "") for issue in active_issues}
++        actual = {
++            workspace.get("issue_name", "")
++            for workspace in setup.get("workspaces", [])
++        }
++        if not setup.get("success") or actual != expected:
++            raise RuntimeError(
++                "Worktree isolation failed: "
++                f"success={setup.get('success')}, "
++                f"missing={sorted(expected - actual)}, "
++                f"unexpected={sorted(actual - expected)}"
++            )
+ 
+         return _enrich_issues_from_setup(
+             active_issues, setup, dag_state.git_integration_branch,
+@@ -172,26 +179,18 @@ async def _setup_worktrees(
+         ws_repo = next((r for r in manifest.repos if r.repo_name == repo_name), None)
+         if ws_repo is None:
+             issue_names = [i.get("name", "?") for i in repo_issues]
+-            if note_fn:
+-                note_fn(
+-                    f"WARNING: target_repo '{repo_name}' not found in workspace manifest. "
+-                    f"Issues {issue_names} will run without worktree isolation.",
+-                    tags=["execution", "worktree_setup", "warning"],
+-                )
+-            all_enriched.extend(repo_issues)
+-            continue
++            raise RuntimeError(
++                f"Worktree isolation failed: target_repo {repo_name!r} "
++                f"not found for issues {issue_names}"
++            )
+         git_init = ws_repo.git_init_result or {}
+         integration_branch = git_init.get("integration_branch", "")
+         if not integration_branch:
+             issue_names = [i.get("name", "?") for i in repo_issues]
+-            if note_fn:
+-                note_fn(
+-                    f"WARNING: repo '{repo_name}' has no integration branch (git_init incomplete). "
+-                    f"Issues {issue_names} will run without worktree isolation.",
+-                    tags=["execution", "worktree_setup", "warning"],
+-                )
+-            all_enriched.extend(repo_issues)
+-            continue
++            raise RuntimeError(
++                f"Worktree isolation failed: repo {repo_name!r} has no "
++                f"integration branch for issues {issue_names}"
++            )
+ 
+         repo_worktrees_dir = os.path.join(ws_repo.absolute_path, ".worktrees")
+         setup = await _dispatch_workspace_setup(
+@@ -206,9 +205,18 @@ async def _setup_worktrees(
+             note_fn=note_fn,
+         )
+ 
+-        if not setup.get("success"):
+-            all_enriched.extend(repo_issues)
+-            continue
++        expected = {issue.get("name", "") for issue in repo_issues}
++        actual = {
++            workspace.get("issue_name", "")
++            for workspace in setup.get("workspaces", [])
++        }
++        if not setup.get("success") or actual != expected:
++            raise RuntimeError(
++                f"Worktree isolation failed for repo {repo_name!r}: "
++                f"success={setup.get('success')}, "
++                f"missing={sorted(expected - actual)}, "
++                f"unexpected={sorted(actual - expected)}"
++            )
+ 
+         all_enriched.extend(
+             _enrich_issues_from_setup(repo_issues, setup, integration_branch)
+diff --git a/swe_af/execution/git_fast_path.py b/swe_af/execution/git_fast_path.py
+index fb8be8f..c3825aa 100644
+--- a/swe_af/execution/git_fast_path.py
++++ b/swe_af/execution/git_fast_path.py
+@@ -22,6 +22,7 @@ All functions are synchronous; the executor wraps them in asyncio.to_thread.
+ from __future__ import annotations
+ 
+ import os
++import re
+ import shutil
+ import subprocess
+ import time
+@@ -51,6 +52,130 @@ def _identity_args(repo_path: str) -> list[str]:
+     return ["-c", "user.name=SWE-AF", "-c", "user.email=swe-af@agentfield.local"]
+ 
+ 
++def _goal_slug(goal: str) -> str:
++    slug = re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")
++    return (slug[:40].rstrip("-") or "build")
++
++
++def _exclude_runtime_paths(repo_path: str) -> None:
++    """Keep pipeline state out of git without editing a tracked .gitignore."""
++    exclude_path = os.path.join(repo_path, ".git", "info", "exclude")
++    os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
++    existing = ""
++    if os.path.exists(exclude_path):
++        with open(exclude_path, encoding="utf-8") as f:
++            existing = f.read()
++    additions = [
++        pattern
++        for pattern in (".artifacts/", ".worktrees/", ".agentfield_output.json")
++        if pattern not in existing.splitlines()
++    ]
++    if additions:
++        with open(exclude_path, "a", encoding="utf-8") as f:
++            if existing and not existing.endswith("\n"):
++                f.write("\n")
++            f.write("\n".join(additions) + "\n")
++
++
++def _remote_default_branch(repo_path: str) -> str:
++    symbolic = _git(
++        repo_path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD",
++        check=False,
++    )
++    if symbolic.returncode != 0:
++        return ""
++    value = symbolic.stdout.strip()
++    return value.removeprefix("origin/")
++
++
++def validate_git_init(repo_path: str, result: dict) -> dict:
++    """Reject plausible-looking GitInitResult objects that do not match git."""
++    if not result.get("success"):
++        return result
++    if result.get("mode") not in {"fresh", "existing"}:
++        raise GitFastPathError(f"invalid git init mode: {result.get('mode')!r}")
++
++    required = ("integration_branch", "initial_commit_sha")
++    missing = [key for key in required if not str(result.get(key) or "").strip()]
++    if missing:
++        raise GitFastPathError(
++            f"git init reported success with empty fields: {', '.join(missing)}"
++        )
++
++    head = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
++    branch = _git(repo_path, "branch", "--show-current").stdout.strip()
++    if head != result["initial_commit_sha"]:
++        raise GitFastPathError(
++            "git init initial_commit_sha does not match repository HEAD"
++        )
++    if branch != result["integration_branch"]:
++        raise GitFastPathError(
++            f"git init integration branch {result['integration_branch']!r} "
++            f"is not checked out (actual {branch!r})"
++        )
++    return result
++
++
++def initialize_repository(repo_path: str, goal: str, build_id: str = "") -> dict:
++    """Initialize the integration branch using plain git, without an LLM."""
++    os.makedirs(repo_path, exist_ok=True)
++    git_dir = _git(repo_path, "rev-parse", "--git-dir", check=False)
++    mode = "existing" if git_dir.returncode == 0 else "fresh"
++
++    if mode == "fresh":
++        _git(repo_path, "init")
++        _git(repo_path, "checkout", "-B", "main")
++        _exclude_runtime_paths(repo_path)
++        _git(repo_path, "add", "-A")
++        _git(
++            repo_path, *_identity_args(repo_path), "commit",
++            "--allow-empty", "-m", "chore: initial commit",
++        )
++        original_branch = ""
++        integration_branch = "main"
++    else:
++        _exclude_runtime_paths(repo_path)
++        tracked_status = _git(
++            repo_path, "status", "--porcelain", "--untracked-files=no",
++        ).stdout.strip()
++        if tracked_status:
++            raise GitFastPathError(
++                "tracked working tree changes exist before git initialization"
++            )
++        original_branch = _git(repo_path, "branch", "--show-current").stdout.strip()
++        initial_commit = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
++        core = f"{build_id}-{_goal_slug(goal)}" if build_id else _goal_slug(goal)
++        integration_branch = f"feature/{core}"
++        exists = _git(
++            repo_path, "rev-parse", "--verify", integration_branch, check=False,
++        ).returncode == 0
++        if exists:
++            _git(repo_path, "checkout", integration_branch)
++        else:
++            _git(repo_path, "checkout", "-b", integration_branch, initial_commit)
++
++    os.makedirs(os.path.join(repo_path, ".worktrees"), exist_ok=True)
++    initial_commit = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
++    remote = _git(repo_path, "remote", "get-url", "origin", check=False)
++    remote_url = remote.stdout.strip() if remote.returncode == 0 else ""
++    repo_name = ""
++    if remote_url:
++        repo_name = remote_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
++
++    result = {
++        "mode": mode,
++        "original_branch": original_branch,
++        "integration_branch": integration_branch,
++        "initial_commit_sha": initial_commit,
++        "success": True,
++        "error_message": "",
++        "remote_url": remote_url,
++        "remote_default_branch": _remote_default_branch(repo_path),
++        "repo_name": repo_name,
++    }
++    return validate_git_init(repo_path, result)
++
++
+ def branch_core(issue: dict, build_id: str = "") -> str:
+     """The shared naming core: ``[<build_id>-]<NN>-<name>``."""
+     name = issue.get("name") or "issue"
+diff --git a/swe_af/execution/schemas.py b/swe_af/execution/schemas.py
+index d8ea04b..bcde3cf 100644
+--- a/swe_af/execution/schemas.py
++++ b/swe_af/execution/schemas.py
+@@ -476,7 +476,7 @@ class CoderResult(BaseModel):
+ 
+     files_changed: list[str] = []
+     summary: str = ""
+-    complete: bool = True
++    complete: bool = False
+     iteration_id: str = ""
+     tests_passed: bool | None = None  # Self-reported: did tests pass?
+     test_summary: str = ""  # Brief test run output
+diff --git a/swe_af/reasoners/execution_agents.py b/swe_af/reasoners/execution_agents.py
+index ed0fc42..a773946 100644
+--- a/swe_af/reasoners/execution_agents.py
++++ b/swe_af/reasoners/execution_agents.py
+@@ -6,10 +6,12 @@ visible in the AgentField call graph when invoked via ``app.call()``.
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import os
+ 
+ from pydantic import BaseModel
+ 
++from swe_af.execution import git_fast_path
+ from swe_af.execution.fatal_error import FatalHarnessError, check_fatal_harness_error
+ from swe_af.execution.ci_gate import watch_pr_checks
+ from swe_af.execution.dag_utils import normalize_issue_dict
+@@ -50,8 +52,6 @@ from swe_af.prompts.code_reviewer import SYSTEM_PROMPT as CODE_REVIEWER_SYSTEM_P
+ from swe_af.prompts.code_reviewer import code_reviewer_task_prompt
+ from swe_af.prompts.coder import SYSTEM_PROMPT as CODER_SYSTEM_PROMPT
+ from swe_af.prompts.coder import coder_task_prompt
+-from swe_af.prompts.git_init import SYSTEM_PROMPT as GIT_INIT_SYSTEM_PROMPT
+-from swe_af.prompts.git_init import git_init_task_prompt
+ from swe_af.prompts.github_pr import SYSTEM_PROMPT as GITHUB_PR_SYSTEM_PROMPT
+ from swe_af.prompts.github_pr import github_pr_task_prompt
+ from swe_af.prompts.repo_finalize import SYSTEM_PROMPT as REPO_FINALIZE_SYSTEM_PROMPT
+@@ -607,75 +607,38 @@ async def run_git_init(
+     previous_error: str | None = None,
+     build_id: str = "",
+ ) -> dict:
+-    """Initialize git repo and create integration branch for feature work.
+-
+-    Returns a GitInitResult dict.
+-
+-    Args:
+-        previous_error: If provided, this is a retry attempt and the error context
+-            will be injected into the system prompt to help the agent learn from
+-            the previous failure.
+-    """
++    """Initialize git and create the integration branch with deterministic git."""
+     router.note(
+         f"Git init starting for: {goal[:80]}",
+         tags=["git_init", "start"],
+     )
+ 
+-    task_prompt = git_init_task_prompt(
+-        repo_path=repo_path, goal=goal, build_id=build_id
+-    )
+-
+-    # Build system prompt with error context if retrying
+-    system_prompt = GIT_INIT_SYSTEM_PROMPT
+-    if previous_error:
+-        system_prompt += (
+-            "\n\n## IMPORTANT: Retry Context\n\n"
+-            f"The previous attempt failed with error: '{previous_error}'\n\n"
+-            "Please carefully review what went wrong and adjust your approach:\n"
+-            "- Ensure you provide ALL required fields in the correct format\n"
+-            "- Double-check your git commands are valid\n"
+-            "- Verify the GitInitResult JSON structure is complete\n"
+-            "- If the error indicates a parsing issue, ensure your output is valid JSON\n"
+-        )
+-
+-    provider = runtime_to_harness_adapter(ai_provider)
+-
+     try:
+-        result = await router.harness(
+-            task_prompt,
+-            system_prompt=system_prompt,
+-            schema=GitInitResult,
+-            model=model,
+-            provider=provider,
+-            tools=["Bash", "Write"],
+-            cwd=repo_path,
+-            max_turns=DEFAULT_AGENT_MAX_TURNS,
+-            permission_mode=permission_mode or None,
++        result = await asyncio.to_thread(
++            git_fast_path.initialize_repository,
++            repo_path,
++            goal,
++            build_id,
+         )
+-        check_fatal_harness_error(result)
+-        if result.parsed is not None:
+-            router.note(
+-                f"Git init complete: mode={result.parsed.mode}, "
+-                f"integration_branch={result.parsed.integration_branch}",
+-                tags=["git_init", "complete"],
+-            )
+-            return result.parsed.model_dump()
+-    except FatalHarnessError:
+-        raise  # Non-retryable — propagate immediately
+-    except Exception as e:
+         router.note(
+-            f"Git init agent failed: {e}",
++            f"Git init complete: mode={result['mode']}, "
++            f"integration_branch={result['integration_branch']}",
++            tags=["git_init", "complete", "deterministic"],
++        )
++        return result
++    except git_fast_path.GitFastPathError as exc:
++        router.note(
++            f"Deterministic git init failed: {exc}",
+             tags=["git_init", "error"],
+         )
+ 
+-    # Fallback: report failure
+     return GitInitResult(
+         mode="unknown",
+         original_branch="",
+         integration_branch="",
+         initial_commit_sha="",
+         success=False,
+-        error_message="Git init agent failed to produce a valid result.",
++        error_message=str(exc),
+     ).model_dump()
+ 
+ 
+@@ -1207,9 +1170,9 @@ async def run_code_reviewer(
+         )
+ 
+     return CodeReviewResult(
+-        approved=True,  # don't block on reviewer failure
+-        summary=f"Code reviewer agent failed for {issue_name} — not blocking",
+-        blocking=False,
++        approved=False,
++        summary=f"Code reviewer agent failed for {issue_name} — blocking",
++        blocking=True,
+         iteration_id=iteration_id,
+     ).model_dump()
+ 
+diff --git a/tests/test_coding_loop_regressions.py b/tests/test_coding_loop_regressions.py
+index b9af44d..b990c00 100644
+--- a/tests/test_coding_loop_regressions.py
++++ b/tests/test_coding_loop_regressions.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import json
++import subprocess
+ from pathlib import Path
+ 
+ from swe_af.execution.coding_loop import run_coding_loop
+@@ -14,6 +15,93 @@ def _make_dag_state(tmp_path: Path, build_id: str) -> DAGState:
+     )
+ 
+ 
++def _init_git_repo(path: Path) -> None:
++    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
++    subprocess.run(["git", "checkout", "-q", "-b", "integration"], cwd=path, check=True)
++    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
++    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
++    (path / "base.txt").write_text("base\n")
++    subprocess.run(["git", "add", "base.txt"], cwd=path, check=True)
++    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=path, check=True)
++
++
++def test_empty_coder_claim_is_rejected_before_review(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    dag_state = _make_dag_state(tmp_path, build_id="emptygate1")
++    config = ExecutionConfig(max_coding_iterations=1)
++    issue = {
++        "name": "change-base",
++        "files_to_modify": ["base.txt"],
++        "integration_branch": "integration",
++    }
++    reviewer_called = False
++
++    async def call_fn(target: str, **kwargs):
++        nonlocal reviewer_called
++        if target.endswith(".run_coder"):
++            return {
++                "complete": True,
++                "files_changed": ["base.txt"],
++                "summary": "done",
++            }
++        if target.endswith(".run_code_reviewer"):
++            reviewer_called = True
++            return {"approved": True, "blocking": False, "summary": "ok"}
++        raise AssertionError(f"Unexpected target: {target}")
++
++    result = asyncio.run(
++        run_coding_loop(
++            issue=issue,
++            dag_state=dag_state,
++            call_fn=call_fn,
++            node_id="swe-planner",
++            config=config,
++        )
++    )
++
++    assert result.outcome == IssueOutcome.FAILED_UNRECOVERABLE
++    assert result.files_changed == []
++    assert reviewer_called is False
++    assert result.iteration_history[0]["path"] == "pre-review-change-gate"
++
++
++def test_git_observed_change_overrides_empty_coder_file_list(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    dag_state = _make_dag_state(tmp_path, build_id="observed1")
++    config = ExecutionConfig(max_coding_iterations=1)
++    issue = {
++        "name": "create-observed",
++        "files_to_create": ["observed.txt"],
++        "integration_branch": "integration",
++    }
++
++    async def call_fn(target: str, **kwargs):
++        if target.endswith(".run_coder"):
++            (tmp_path / "observed.txt").write_text("written\n")
++            return {"complete": True, "files_changed": [], "summary": "done"}
++        if target.endswith(".run_code_reviewer"):
++            return {
++                "approved": True,
++                "blocking": False,
++                "summary": "verified",
++                "debt_items": [],
++            }
++        raise AssertionError(f"Unexpected target: {target}")
++
++    result = asyncio.run(
++        run_coding_loop(
++            issue=issue,
++            dag_state=dag_state,
++            call_fn=call_fn,
++            node_id="swe-planner",
++            config=config,
++        )
++    )
++
++    assert result.outcome == IssueOutcome.COMPLETED
++    assert result.files_changed == ["observed.txt"]
++
++
+ def test_run_coding_loop_ignores_legacy_iteration_state_when_build_id_present(tmp_path: Path) -> None:
+     artifacts_dir = tmp_path / ".artifacts"
+     legacy_state = artifacts_dir / "execution" / "iterations" / "create-hello-script.json"
+diff --git a/tests/test_git_fast_path.py b/tests/test_git_fast_path.py
+index 63688e5..4bba7f7 100644
+--- a/tests/test_git_fast_path.py
++++ b/tests/test_git_fast_path.py
+@@ -24,8 +24,9 @@ from swe_af.execution.dag_executor import (
+     _cleanup_single_repo,
+     _dispatch_merge,
+     _dispatch_workspace_setup,
++    _setup_worktrees,
+ )
+-from swe_af.execution.schemas import ExecutionConfig
++from swe_af.execution.schemas import DAGState, ExecutionConfig
+ 
+ 
+ def run_git(cwd: str, *args: str) -> str:
+@@ -99,6 +100,56 @@ class TestSetupWorktrees:
+                 repo, "", [{"name": "x"}], os.path.join(repo, ".worktrees"),
+             )
+ 
++    def test_failed_setup_is_not_allowed_to_share_repo(self, repo: str) -> None:
++        async def call_fn(target: str, **kwargs):
++            return {"success": False, "workspaces": []}
++
++        state = DAGState(
++            repo_path=repo,
++            git_integration_branch="integration",
++            worktrees_dir=os.path.join(repo, ".worktrees"),
++        )
++        with pytest.raises(RuntimeError, match="Worktree isolation failed"):
++            asyncio.run(
++                _setup_worktrees(
++                    state,
++                    [{"name": "x", "sequence_number": 1}],
++                    call_fn,
++                    "swe-planner",
++                    ExecutionConfig(deterministic_git=False),
++                )
++            )
++
++
++class TestInitializeRepository:
++    def test_existing_repo_is_initialized_without_an_agent(self, repo: str) -> None:
++        starting_sha = run_git(repo, "rev-parse", "HEAD")
++        result = git_fast_path.initialize_repository(
++            repo, "Add a health endpoint", "build123",
++        )
++        assert result["success"] is True
++        assert result["mode"] == "existing"
++        assert result["initial_commit_sha"] == starting_sha
++        assert result["integration_branch"] == \
++            "feature/build123-add-a-health-endpoint"
++        assert run_git(repo, "branch", "--show-current") == \
++            result["integration_branch"]
++
++    def test_rejects_success_with_empty_sha(self, repo: str) -> None:
++        with pytest.raises(
++            git_fast_path.GitFastPathError,
++            match="empty fields",
++        ):
++            git_fast_path.validate_git_init(
++                repo,
++                {
++                    "success": True,
++                    "mode": "existing",
++                    "integration_branch": "integration",
++                    "initial_commit_sha": "",
++                },
++            )
++
+ 
+ class TestMergeBranches:
+     def test_clean_merges_no_conflicts(self, repo: str) -> None:

@@ -23,6 +23,10 @@ if [[ ! -d vendor/SWE-AF ]]; then
   exit 1
 fi
 
+# The pinned upstream is patched with ctswarm's fail-closed execution
+# invariants. Apply idempotently before Compose can build an agent image.
+bash ./infra/apply-swe-af-patches.sh
+
 # SWE-AF's compose reads its own .env. Keep it in sync rather than maintaining
 # two credential files that will drift.
 if [[ -f .env ]]; then

@@ -1,7 +1,7 @@
 # ctswarm handoff
 
-**As of 2026-07-30, 02:10.** Everything is committed and pushed to
-`correlltechnologies/ctswarm` (private). The stack is running in Docker.
+**As of 2026-07-30, 12:29 EDT.** The stack is running in Docker. The safety
+fixes described below are tested and committed locally but have not been pushed.
 
 Read this top to bottom once; it is ordered by what you most need to know.
 
@@ -9,32 +9,57 @@ Read this top to bottom once; it is ordered by what you most need to know.
 
 ## 1. Where things actually stand
 
-**The infrastructure works. The factory does not yet produce working code.**
-
-Those are two different claims and the distinction matters.
+**The infrastructure works, fail-closed execution is now enforced, and the
+Claude runtime has produced reviewed code. The local OpenCode runtime still
+cannot write code under the real harness.**
 
 What is verified working, by execution and not by assumption:
 
 - All six containers run; both SWE-AF nodes register with the AgentField control plane
 - The full inference chain: SWE-AF agent → opencode → ctswarm router → Ollama / OpenRouter
-- A complete 22-agent build ran for **23 minutes**, made **112 model calls at 100% success**,
-  routing live across three models and two backends
+- A complete 22-agent OpenCode build ran for **23 minutes**, made **112 model
+  calls at 100% transport/schema success**, routing live across three models and
+  two backends
 - Planning ran on `deepseek-v4-pro` (OpenRouter), coding on `qwen3.5:9b` (local), with
   automatic failover to `minimax-m2.5` inside the high tier
+- A live Claude issue build completed coder → commit → reviewer in 134 seconds:
+  execution `exec_20260730_162640_n8dhesy5`, branch
+  `issue/0690a662-prove-claude-end-to-end`, commit `9849f03`, two files changed,
+  19 sandbox tests passed, review approved
+- The same one-file proof under OpenCode made no repository changes twice and
+  now correctly ended `failed_unrecoverable`
 
-What did **not** work:
+What was wrong in the first build:
 
-- The build reported `4/4 issues completed` but **wrote no code**. All four worktrees are
-  clean at the initial commit. No `healthz` anywhere, no branches, no commits, no PR.
-- The Verifier agent failed to produce a valid result, so the build correctly ended as
-  `success: False`.
+- LLM-driven git init returned a false success with an empty SHA; workspace
+  setup then returned zero worktrees; the DAG silently fell back to the shared
+  repository.
+- Coders returned `complete: true` with no files, and reviewer failures defaulted
+  to approval. Four empty issues were therefore labeled complete.
+- The final verifier still prevented a PR, but the inner execution gates were
+  not safe enough.
 
-**The gates behaved exactly as designed.** A system claiming four completed issues with
-zero code written is precisely the failure the evidence layer exists to catch, and it
-caught it: the verifier refused, and no pull request was opened. "The agent says it is
-done" carried no authority, which is the whole thesis.
+What is fixed:
 
-So the honest summary: **plumbing proven, output not yet proven.**
+- Git init is deterministic and validated against the real branch/SHA.
+- Worktree setup must succeed with an exact issue/worktree match; shared-root
+  fallback is gone.
+- Coder claims are replaced by git-observed changes. Empty output is rejected
+  before review, including after the coder commits.
+- Reviewer failures are blocking, never approvals; `CoderResult.complete`
+  defaults false.
+- Runtime switching now supplies native Claude/Codex model names rather than
+  leaking `ctswarm/*` OpenCode aliases into those CLIs.
+- Claude containers mount only the 942-byte credential file, not the 653 MB /
+  7,631-file host profile that made each invocation scan unrelated skills.
+- Three reproducible patches under `infra/patches/` are applied by bootstrap and
+  every `stack.sh` operation. The patcher refuses to overwrite a divergent
+  vendor tree.
+
+Honest boundary: **Claude coding output is proven; the current local/OpenCode
+coder is proven inadequate for real coding work and should remain a fail-safe
+fallback, not the production coding runtime. A new full multi-issue build has
+not yet been run under Claude.**
 
 ---
 
@@ -109,32 +134,27 @@ locally, and expiry always resolves to **pause**, never approve.
 
 ---
 
-## 5. The next thing to debug
+## 5. The next build
 
-**Why the coders wrote no files.** This is the single blocker between "infrastructure
-works" and "system works".
+Run a bounded full build with the Claude runtime and inspect the resulting
+integration branch/PR. The discriminating experiment is complete: Claude wrote,
+tested, committed, and passed review; OpenCode/local did not write.
 
-The 112 successful router calls only mean the models returned *valid completions*. It does
-not mean they invoked write tools correctly. Most likely causes, in order:
+Do not switch by only changing `SWE_DEFAULT_RUNTIME` and assuming the container
+tier variables are harmless. Submit through `ctswarm build`; the orchestrator
+now sends runtime-native model overrides (`sonnet`/`haiku` for Claude,
+auth-aware `gpt-5.5` or `gpt-5.3-codex` for Codex, and `ctswarm/*` for
+OpenCode).
 
-1. The coder agents produced plausible prose instead of tool calls under real agent
-   pressure. Bench measures tool fidelity on short tasks; a 150-turn coding loop is a much
-   harsher test.
-2. Worktree writes happened but the merge step failed silently, and Workspace Cleanup
-   removed the evidence.
-3. opencode's tool-execution path needs configuration ctswarm is not supplying.
+Useful live proof:
 
-Where to look:
-
-```bash
-docker logs ctswarm-swe-agent-1 --tail 400 2>&1 | grep -iE "coder|merge|worktree|tool"
-docker exec ctswarm-swe-agent-1 ls -la /workspaces/
+```text
+execution  exec_20260730_162640_n8dhesy5
+outcome    completed / success=true
+branch     issue/0690a662-prove-claude-end-to-end
+commit     9849f034c2210aad9f1f4c64ccec6262600d3937
+review     approved=true, blocking=false
 ```
-
-A useful experiment: rerun the same goal with `SWE_DEFAULT_RUNTIME=claude_code` in `.env`.
-If Claude writes files and local models do not, the problem is model capability under
-agent load, not ctswarm's plumbing. That single test cleanly separates the two hypotheses
-and is worth doing before anything else.
 
 ---
 
@@ -151,8 +171,9 @@ overwrite).
 | low (mechanical) | `qwen3.5:9b` | `deepseek-v4-flash`, `granite4.1:8b` |
 
 **`ornith:9b` is quarantined and must stay that way.** It wedged the entire Ollama queue
-three times, each requiring `sudo systemctl restart ollama`. It also passed one clean bench
-run in between, so a good score does not clear it. It harms the host, not just itself.
+repeatedly. Earlier events required `sudo systemctl restart ollama`; the latest
+was cleared with `ollama stop ornith:9b`. It also passed one clean bench run in
+between, so a good score does not clear it. It harms the host, not just itself.
 
 `qwen2.5-coder:7b` fails the tool-call gate at 25%, answering in prose. The nominal "coder"
 model is the least fit for agent work in the set.
@@ -190,7 +211,9 @@ by a bug in ctswarm.
 
 In the order I would do them:
 
-1. **Fix the no-code-written problem** (section 5). Nothing else matters until this works.
+1. **Run a bounded full Claude build** and verify integration/PR behavior. The
+   issue-level coding path is proven; the multi-issue path still needs this
+   post-fix proof.
 2. **Evidence bundle** mapping test results to PRD acceptance criteria. Scanners and
    committees exist; the artifact tying them to each must-have does not.
 3. **Apply branch protection** once section 2 is decided (`ctswarm.policy.protection` is
@@ -240,12 +263,14 @@ assumptions, with the blast radius of each.
 ## Current state at a glance
 
 ```
-repo        correlltechnologies/ctswarm (private, 18 commits)
+repo        correlltechnologies/ctswarm (private; current fix commit not pushed)
 sandbox     correlltechnologies/ctswarm-sandbox (private, no branch protection)
 stack       6 containers up
-tests       43 passing, ruff clean, sandbox 18/18
+tests       48 root tests, ruff clean; 71 focused SWE-AF tests; sandbox 19/19 in live proof
 verify      5 passed, 0 failed, 1 skipped (isolation needs a live build target)
 models      14 measured, 9 eligible, 5 families
 last build  build-5506756dae — ran 23 min, 112 calls, 100% success,
             4/4 issues "completed", NO code written, verifier failed, no PR
+live proof  exec_20260730_162640_n8dhesy5 — Claude coder + reviewer,
+            1 commit, 2 files, 19 tests, approved, success=true
 ```

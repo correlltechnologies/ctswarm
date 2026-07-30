@@ -227,6 +227,12 @@ else
   fi
 fi
 
+# Keep local safety fixes reproducible across fresh clones and --revendor.
+if [[ $CHECK_ONLY -eq 0 && -d vendor/SWE-AF/.git ]]; then
+  bash ./infra/apply-swe-af-patches.sh
+  ok "applied ctswarm SWE-AF safety patches"
+fi
+
 # ---------------------------------------------------------------------------
 say "Configuration"
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ on this machine, with the method recorded) or **assumed** (plausible but not yet
 confirmed). Assumptions are not load-bearing without a note saying what breaks if
 they are wrong.
 
-Research date: **2026-07-29**. Provider behavior changes; re-check before relying
+Research date: **2026-07-30**. Provider behavior changes; re-check before relying
 on any of this in a new environment.
 
 ---
@@ -47,6 +47,12 @@ on any of this in a new environment.
 | **The contract trap fires** | added a route without updating `openapi.yaml` | Contract test failed with an actionable message; restored cleanly to 18/18 |
 | Anti-slop gates fire | `scan_text` against crafted samples | All 8 checks fire; **zero false positives** on the clean sandbox |
 | Approval rule invariants | `pytest tests/` | 24/24 passing |
+| Empty coder claims fail closed | Live OpenCode issue build plus regression tests | Two iterations produced no git changes; outcome was `failed_unrecoverable`, reviewer was never called |
+| Claude can write under the real harness | Live `swe-fast.implement_issue` with `runtime=claude_code`, native `sonnet` model | Wrote two files, passed 19 sandbox tests, committed `9849f03`, independent reviewer approved |
+| Runtime model isolation | Live failed/successful A/B plus root tests | `ctswarm/med` caused the Claude CLI to hang; explicit native model overrides fixed it. All runtimes now receive model ids valid for their harness. |
+| Narrow Claude credential mount | Docker mount inspection | Container sees one 942-byte credential instead of the 653 MB / 7,631-file host Claude profile |
+| Patched SWE-AF regression suite | Ephemeral production image with local source mounted | 71 focused tests passed (git fast path, coding loop, issue build) |
+| ctswarm suite after fixes | `pytest -q`; `ruff check ctswarm tests` | 48/48 passing; lint clean |
 
 ## Bench results (2026-07-29, RTX 5070 / 11.9GB VRAM)
 
@@ -87,7 +93,7 @@ Notes that matter more than the numbers:
 
 | Finding | Evidence | Consequence |
 |---|---|---|
-| **`ornith:9b` wedges the entire inference queue** | Three separate events on 2026-07-29: a tool-calling request, a trivial "Say OK", and once mid-bench. Each entered a runaway generation that never terminated, pinned the GPU at ~92%, and required `sudo systemctl restart ollama`. `ollama stop` does not clear it. | **Quarantined in the catalog**, excluded from routing regardless of score. Note it passed one complete bench run cleanly *in between* wedges, so a single green result does not clear it. The third wedge also blocked `granite4.1:3b` from being measured at all. This is the one failure class that damages the host rather than just the model, which is why quarantine overrides measurement. |
+| **`ornith:9b` wedges the entire inference queue** | Repeated live events: runaway generation, stale loaded process, and all other models queued behind it. Earlier events required `sudo systemctl restart ollama`; on 2026-07-30 `ollama stop ornith:9b` cleared it. | **Quarantined in the catalog**, excluded from routing regardless of score. It passed one complete bench run cleanly between wedges, so a green result does not clear it. This failure class damages the shared host queue rather than only its own request. |
 | `ollama 0.31.1` cannot pull `laguna-xs-2.1` | Pull fails with a download prompt rather than a version error | The best local high-tier candidate is unavailable until Ollama is upgraded. `qwen3.6` covers the tier meanwhile. |
 | Ollama loaded `ornith:9b` with a 4096 context | `/api/ps` reported `context_length: 4096` despite the model advertising 262144 | Advertised context is not effective context. The bench measures real retrieval rather than trusting metadata. |
 
@@ -104,26 +110,48 @@ Notes that matter more than the numbers:
 | **Code actually written** | **NO.** All worktrees clean at the initial commit; no `healthz`, no branches, no commits |
 | Build outcome | `success: False` — 4/4 issues reported complete, Verifier failed, no PR opened |
 
-The gates worked. A build claiming four completed issues with zero code written is exactly
-what the evidence layer exists to catch, and it caught it: the verifier refused and no pull
-request was created. Agent self-report carried no authority.
+The final verifier prevented a false PR, but deeper inspection found unsafe inner
+gates: git init returned a false success with an empty SHA, workspace setup
+returned no worktrees and silently fell back to the shared root, empty coder
+claims were accepted, and reviewer failures defaulted to approval.
 
-**This is the current blocker**: infrastructure is proven, output is not. 112 successful
-router calls mean valid completions, not correct work. The discriminating experiment is to
-rerun the same goal under `SWE_DEFAULT_RUNTIME=claude_code`; if Claude writes files and the
-local models do not, the cause is model capability under agent load rather than ctswarm's
-plumbing.
+The local patch set now makes each boundary fail closed:
+
+- deterministic, validated git init;
+- exact worktree coverage with no shared-root fallback;
+- git-derived change evidence, including committed changes;
+- empty-output rejection before review;
+- blocking reviewer-error fallbacks;
+- `CoderResult.complete=False` by default.
+
+The patches are stored under `infra/patches/` and applied idempotently by
+`bootstrap.sh` and `stack.sh`. The patcher compares the vendor tree to a complete
+expected worktree and refuses to overwrite divergent local changes.
+
+## Runtime A/B after the first build (2026-07-30)
+
+| Runtime / execution | Result |
+|---|---|
+| OpenCode `ctswarm/med`, `exec_20260730_160932_9cpa1bep` | Two coder attempts, zero git changes; correctly rejected before review and ended `failed_unrecoverable` |
+| Claude with leaked `ctswarm/med` alias | CLI hung. Root cause: global container tier variables applied to every runtime. |
+| Claude `sonnet` with full host profile mounted | Correct model, but startup scanned 653 MB / 7,631 host-profile files. |
+| Claude `sonnet`, credential-only mount, before committed-change fix | Wrote, tested, and committed two files; exposed that issue-level builds did not propagate their base branch to the change gate. |
+| Claude `sonnet`, final patched image, `exec_20260730_162640_n8dhesy5` | **SUCCESS** in 134 s: branch `issue/0690a662-prove-claude-end-to-end`, commit `9849f03`, two files, 19 tests passed, reviewer approved |
+
+This separates the concerns cleanly: the harness and Claude coding path work;
+the current local/OpenCode coder does not reliably use editing tools under real
+agent pressure. Local OpenCode remains useful for routing/bench/planning
+experiments, but should not be trusted as the production coding runtime merely
+because its short tool benchmark passes.
 
 ## Assumptions not yet verified
 
 | Assumption | Why it is not yet verified | What breaks if wrong |
 |---|---|---|
 | MLX model references in `catalog.py` resolve | No Apple Silicon machine in this session | `ctswarm doctor` on the Mac reports them as unresolvable. They are marked `verified_ref=False` and are **not** trusted by the router. Low blast radius by design. |
-| SWE-AF's `open_code` runtime drives the ctswarm router correctly end to end | Requires a full stack run, blocked on credentials and a healthy backend | The core integration. This is the single biggest untested assumption in the repo. |
-| SWE-AF honors `SWE_MODEL_HIGH/MED/LOW` as documented | Read from `.env.example`, not executed | Falls back to `models.default`; per-tier routing would silently collapse to one model |
-| The docker overlay composes cleanly with upstream's compose file | Not yet run | Service names or volume mounts may need adjustment |
-| OpenRouter quota and pricing endpoints have the assumed shape | No API key available | Cost estimates read zero and the budget guard treats spend as unknown rather than free |
-| Claude subscription quota is observable | No token available | The capacity manager cannot measure Claude headroom and must fall back to failure-driven switching |
+| A full multi-issue Claude build merges and opens a valid PR | Only the issue-level coder→reviewer path has been rerun after the fixes | Integration merge, final verification, and PR creation remain unproven on the patched image |
+| OpenRouter provider-side quota is observable accurately | Live calls and routing work, but the account's authoritative quota semantics were not fully exercised | Capacity can still fall back to failure-driven switching |
+| Claude subscription quota is observable before exhaustion | Authentication and calls work, but the CLI does not expose a reliable remaining-credit endpoint here | Capacity must use configured rolling budgets plus failure-driven switching |
 
 ## Things deliberately NOT assumed
 
