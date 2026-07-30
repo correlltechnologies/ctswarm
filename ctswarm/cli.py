@@ -16,6 +16,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -563,49 +564,97 @@ def build(
         None, "--gate-repo", help="Local checkout to run scanners and the committee on."
     ),
 ) -> None:
-    """Hand the factory a goal and let it run.
+    """Queue a build on the always-on scheduler and optionally watch it.
 
-    Picks a runtime from remaining capacity, submits to SWE-AF, posts periodic
-    status to Slack (or records it locally when Slack is unconfigured), and
-    honours pause and stop requests at phase boundaries.
+    The scheduler owns runtime selection, concurrency, durable state, Slack
+    status, and restart recovery. Refusing to bypass it is deliberate: a direct
+    AgentField submission would evade the queue and shared-resource limit.
     """
-    from .approvals.status import StatusNotifier
-    from .orchestrator import Orchestrator
-
-    orchestrator = Orchestrator(status_interval_s=float(status_interval))
-    notifier = StatusNotifier(ledger=orchestrator.ledger)
-
-    async def on_status(record) -> None:
-        delivered = await notifier.post(record)
-        where = "slack" if delivered else "local"
-        console.print(
-            f"  [dim]{time.strftime('%H:%M:%S')}[/dim] "
-            f"[bold]{record.state.value:<10}[/bold] "
-            f"{record.phase_detail[:70] or record.goal[:70]} [dim]({where})[/dim]"
-        )
+    from .capacity import Runtime
+    from .orchestrator import BuildRecord, BuildState, Orchestrator
 
     async def run() -> None:
-        record = await orchestrator.submit(goal=goal, repo_url=repo)
+        scheduler_url = _scheduler_url()
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{scheduler_url}/builds",
+                    json={
+                        "goal": goal,
+                        "repo_url": repo,
+                        "require_strong_planning": True,
+                        "max_ci_fix_cycles": 2,
+                        "max_hours": max_hours,
+                    },
+                )
+            response.raise_for_status()
+            snapshot = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            console.print(
+                f"[red]scheduler unavailable at {scheduler_url}: {exc}[/red]\n"
+                "[dim]Start it with ./stack.sh up; builds do not bypass the "
+                "durable concurrency queue.[/dim]"
+            )
+            raise typer.Exit(1) from exc
+
+        build_id = snapshot["build_id"]
         console.print(
-            f"\n[bold]{record.build_id}[/bold] submitted"
-            f"\n  runtime  {record.runtime.value}"
+            f"\n[bold]{build_id}[/bold] queued"
             f"\n  repo     {repo}"
-            f"\n  control  ctswarm pause/resume/stop {record.build_id}\n"
+            f"\n  control  ctswarm pause/resume/stop {build_id}\n"
         )
-        if record.state.terminal:
-            console.print(f"[red]{record.error}[/red]")
-            raise typer.Exit(1)
         if not watch:
             return
 
-        await orchestrator.run_until_done(
-            record, max_hours=max_hours, on_status=on_status
-        )
+        terminal = {state.value for state in BuildState if state.terminal}
+        deadline = time.time() + max_hours * 3600 + 60
+        last_state = ""
+        last_detail = ""
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(
+                        f"{scheduler_url}/builds/{build_id}"
+                    )
+                response.raise_for_status()
+                snapshot = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                console.print(f"[yellow]status unavailable; retrying: {exc}[/yellow]")
+                await asyncio.sleep(10)
+                continue
 
-        if record.state.value == "verifying" or record.state.value == "complete":
+            state = str(snapshot.get("state") or "queued")
+            detail = str(snapshot.get("phase_detail") or "")
+            if state != last_state or detail != last_detail:
+                console.print(
+                    f"  [dim]{time.strftime('%H:%M:%S')}[/dim] "
+                    f"[bold]{state:<10}[/bold] "
+                    f"{detail[:70] or goal[:70]}"
+                )
+                last_state, last_detail = state, detail
+            if state in terminal:
+                break
+            if time.time() > deadline:
+                console.print("[red]local watch deadline exceeded[/red]")
+                raise typer.Exit(1)
+            await asyncio.sleep(min(30, max(2, status_interval)))
+
+        state = str(snapshot.get("state") or "")
+        if state == BuildState.COMPLETE.value:
             target = gate_repo
             if target:
                 console.print("\n[bold]Running gates on the integrated branch[/bold]")
+                record = BuildRecord(
+                    build_id=build_id,
+                    goal=goal,
+                    repo_url=repo,
+                    runtime=Runtime(snapshot.get("runtime", "open_code")),
+                    state=BuildState.COMPLETE,
+                    execution_id=str(snapshot.get("execution_id") or ""),
+                    phase_detail=str(snapshot.get("phase_detail") or ""),
+                    pr_url=str(snapshot.get("pr_url") or ""),
+                )
+                orchestrator = Orchestrator()
                 gates = await orchestrator.run_gates(record, target)
                 scanners = gates.get("scanners", {})
                 console.print(
@@ -622,94 +671,99 @@ def build(
                     console.print(
                         f"  committee: {'approved' if committee.get('approved') else 'BLOCKED'}"
                     )
-                await notifier.post(record)
+                state = record.state.value
+                snapshot["error"] = record.error
             else:
                 console.print(
                     "\n[yellow]--gate-repo not given, so scanners and the committee "
                     "did not run. The build is NOT verified.[/yellow]"
                 )
 
-        console.print(f"\n[bold]final state: {record.state.value}[/bold]")
-        if record.pr_url:
-            console.print(f"  {record.pr_url}")
+        console.print(f"\n[bold]final state: {state}[/bold]")
+        if snapshot.get("pr_url"):
+            console.print(f"  {snapshot['pr_url']}")
+        if snapshot.get("error"):
+            console.print(f"  [red]{snapshot['error']}[/red]")
+        if state != BuildState.COMPLETE.value:
+            raise typer.Exit(1)
 
     asyncio.run(run())
+
+
+def _scheduler_url() -> str:
+    return os.environ.get("CTSWARM_SCHEDULER_URL", "http://localhost:8092").rstrip("/")
+
+
+def _build_control(build_id: str, action: str) -> None:
+    try:
+        response = httpx.post(
+            f"{_scheduler_url()}/builds/{build_id}/{action}",
+            timeout=15.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        console.print(f"[red]could not {action} {build_id}: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 @app.command()
 def pause(build_id: str) -> None:
     """Pause a build. No new work starts; in-flight calls finish."""
-    from .orchestrator import Orchestrator
-
-    Orchestrator().request_pause(build_id, who="cli")
+    _build_control(build_id, "pause")
     console.print(f"pause requested for {build_id}")
 
 
 @app.command()
 def resume(build_id: str) -> None:
     """Resume a paused build."""
-    from .orchestrator import Orchestrator
-
-    Orchestrator().request_resume(build_id, who="cli")
+    _build_control(build_id, "resume")
     console.print(f"resume requested for {build_id}")
 
 
 @app.command()
 def stop(build_id: str) -> None:
     """Stop a build. Work so far stays on its branch."""
-    from .orchestrator import Orchestrator
-
-    Orchestrator().request_stop(build_id, who="cli")
+    _build_control(build_id, "stop")
     console.print(f"stop requested for {build_id}")
 
 
 @app.command()
 def status(build_id: str | None = typer.Argument(None)) -> None:
     """Show build status and what the team is working on."""
-    from .orchestrator import Orchestrator, load_build
-
-    orchestrator = Orchestrator()
-    ledger = orchestrator.ledger
+    try:
+        if build_id is None:
+            response = httpx.get(f"{_scheduler_url()}/builds", timeout=15.0)
+        else:
+            response = httpx.get(
+                f"{_scheduler_url()}/builds/{build_id}", timeout=15.0
+            )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        console.print(f"[red]scheduler status unavailable: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
     if build_id is None:
-        submitted = ledger.events(kind="build_submitted")
-        if not submitted:
+        builds = payload.get("builds") or []
+        if not builds:
             console.print("no builds recorded yet")
             return
         table = Table("build", "state", "goal", box=None)
-        for event in submitted[-15:]:
-            bid = event["build_id"]
-            record = load_build(ledger, bid)
-            detail = json.loads(event["detail"]) if event["detail"] else {}
+        for snapshot in builds[:15]:
             table.add_row(
-                bid,
-                orchestrator.control_state(bid)
-                if record is None
-                else record.state.value,
-                (detail.get("goal") or "")[:60],
+                snapshot.get("build_id", ""),
+                snapshot.get("state", ""),
+                (snapshot.get("goal") or "")[:60],
             )
         console.print(table)
         return
 
-    record = load_build(ledger, build_id)
-    if record is None:
-        console.print(f"[red]unknown build {build_id}[/red]")
-        raise typer.Exit(1)
-
-    usage = ledger.usage_summary(build_id)
     console.print(
-        f"\n[bold]{build_id}[/bold]  {record.state.value}"
-        f"\n  goal        {record.goal[:100]}"
-        f"\n  runtime     {record.runtime.value}"
-        f"\n  control     {orchestrator.control_state(build_id)}"
-        f"\n  model calls {usage['total_calls']} ({usage['local_fraction']:.0%} local)"
-        f"\n  spend       ${usage['total_cost_usd']:.2f}\n"
+        f"\n[bold]{build_id}[/bold]  {payload.get('state', '')}"
+        f"\n  goal        {str(payload.get('goal') or '')[:100]}"
+        f"\n  runtime     {payload.get('runtime', 'pending selection')}"
+        f"\n  execution   {payload.get('execution_id', '')}"
+        f"\n  detail      {str(payload.get('phase_detail') or '')[:100]}"
+        f"\n  PR          {payload.get('pr_url', '')}"
+        f"\n  error       {payload.get('error', '')}\n"
     )
-    history = ledger.events(kind="build_status", build_id=build_id)
-    for event in history[-8:]:
-        detail = json.loads(event["detail"]) if event["detail"] else {}
-        console.print(
-            f"  [dim]{time.strftime('%H:%M:%S', time.localtime(event['ts']))}[/dim] "
-            f"{detail.get('state','')}  {(detail.get('detail') or '')[:60]}"
-        )
-    console.print()

@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from ctswarm.capacity import Runtime
-from ctswarm.orchestrator import runtime_model_overrides
+from ctswarm.orchestrator import (
+    BuildRecord,
+    BuildState,
+    runtime_model_overrides,
+    update_record_from_execution,
+)
 
 
 def test_open_code_uses_router_virtual_models() -> None:
@@ -46,3 +51,75 @@ def test_codex_auto_auth_tracks_api_key_presence(monkeypatch) -> None:
     assert (
         runtime_model_overrides(Runtime.CODEX)["default"] == "gpt-5.3-codex"
     )
+
+
+def test_succeeded_execution_completes_polling() -> None:
+    record = BuildRecord(
+        build_id="build-test",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+    )
+
+    update_record_from_execution(
+        record,
+        {
+            "status": "succeeded",
+            "result": {
+                "success": True,
+                "summary": "all work complete",
+                "pr_url": "https://example.invalid/pr/1",
+            },
+        },
+    )
+
+    assert record.state is BuildState.COMPLETE
+    assert record.phase_detail == "all work complete"
+    assert record.pr_url.endswith("/pr/1")
+
+
+def test_succeeded_execution_with_failed_result_fails_closed() -> None:
+    record = BuildRecord(
+        build_id="build-test",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+    )
+
+    update_record_from_execution(
+        record,
+        {
+            "status": "succeeded",
+            "result": {
+                "success": False,
+                "summary": "verification failed",
+                "error_message": "no verified integration branch",
+            },
+        },
+    )
+
+    assert record.state is BuildState.FAILED
+    assert record.error == "no verified integration branch"
+
+
+def test_succeeded_execution_without_explicit_success_fails_closed() -> None:
+    record = BuildRecord(
+        build_id="build-test",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+    )
+
+    update_record_from_execution(
+        record,
+        {
+            "status": "succeeded",
+            "result": {"summary": "reasoner exited without a build verdict"},
+        },
+    )
+
+    assert record.state is BuildState.FAILED
+    assert record.error == "reasoner exited without a build verdict"

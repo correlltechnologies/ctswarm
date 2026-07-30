@@ -16,7 +16,7 @@ human only when continuing would cross a real authority boundary.
                           │  only genuine authority boundaries
                           ▼
       ┌───────────────────────────────────────────┐
-      │  ctswarm  approvals · policy · evidence   │
+      │ ctswarm scheduler · approvals · policy    │
       └───────────────────────────────────────────┘
                           │
                           ▼
@@ -50,15 +50,17 @@ unavailable and the one command needed to enable each.
 Then:
 
 ```bash
-ctswarm doctor      # what is wired up, what is missing
-ctswarm bench       # qualify local models, write the routing table
-ctswarm capacity    # remaining headroom per runtime, and which one gets picked
-ctswarm route       # explain what the router would choose for a role, and why
-ctswarm serve       # start the router
-ctswarm committee   # put a judgement call to an independent multi-model vote
-ctswarm usage       # model usage, cost, and the local-inference fraction
-ctswarm verify      # run the self-verification probe suite
+./stack.sh up
+./.venv/bin/ctswarm doctor
+./.venv/bin/ctswarm bench
+./.venv/bin/ctswarm build "your goal" --repo https://github.com/OWNER/REPOSITORY
+./.venv/bin/ctswarm status
 ```
+
+Builds enter the durable scheduler on `127.0.0.1:8092`. It enforces the
+shared-resource concurrency limit and resumes monitoring the same AgentField
+execution after a restart. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for
+service endpoints, build controls, recovery, and log rotation.
 
 ## Verification committees
 
@@ -169,12 +171,12 @@ rules are version-controlled rather than clicked into a settings page.
 
 ## Definition of Done
 
-"The agent says it is done" carries no authority. A build is complete only when
-`ctswarm evidence check` passes, which requires linked machine-readable evidence for every
-must-have acceptance criterion, passing tests with no test weakened/skipped/deleted without
-justification, browser evidence for UI work, security and dependency scans, and the
-anti-slop gates (no placeholder copy, dead controls, fabricated metrics, or "coming soon"
-behavior outside declared scope).
+"The agent says it is done" carries no authority. SWE-AF's final verifier and
+test result are required, and `ctswarm build --gate-repo <integrated-checkout>`
+adds deterministic secret, dependency, test, and anti-slop gates plus an
+independent-model committee. A missing scanner is a failure, not a pass. Browser
+evidence remains an additional requirement for builds that change a user
+interface.
 
 ## Self-verification
 

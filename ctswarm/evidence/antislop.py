@@ -83,20 +83,20 @@ CHECKS: tuple[Check, ...] = (
     Check(
         name="placeholder_copy",
         severity="blocker",
-        why="Placeholder text shipped as if it were real content.",
+        why="Placeholder text shipped as if it were real content.",  # ctswarm:allow detector
         pattern=re.compile(
-            r"\b(lorem ipsum|dolor sit amet|TODO:? *fill|your (name|company|text) here"
-            r"|placeholder text|replace this|sample text|foo ?bar ?baz)\b",
+            r"\b(lorem ipsum|dolor sit amet|TODO:? *fill|your (name|company|text) here"  # ctswarm:allow detector
+            r"|placeholder text|replace this|sample text|foo ?bar ?baz)\b",  # ctswarm:allow detector
             re.IGNORECASE,
         ),
     ),
     Check(
         name="coming_soon",
         severity="blocker",
-        why="A control that announces future functionality instead of working.",
+        why="A control that announces future functionality instead of working.",  # ctswarm:allow detector
         pattern=re.compile(
-            r"\b(coming soon|not implemented yet|under construction|todo: implement"
-            r"|feature coming|stay tuned)\b",
+            r"\b(coming soon|not implemented yet|under construction|todo: implement"  # ctswarm:allow detector
+            r"|feature coming|stay tuned)\b",  # ctswarm:allow detector
             re.IGNORECASE,
         ),
     ),

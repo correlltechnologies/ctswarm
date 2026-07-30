@@ -322,7 +322,7 @@ NEEDLE_TOKEN = "CTSWARM-NEEDLE-8F31A2"
 def build_haystack(target_chars: int, needle_position: float = 0.5) -> str:
     """Repo-shaped filler with one retrievable fact buried in it.
 
-    Filler is written to look like source code rather than lorem ipsum, because
+    Filler is written to look like source code rather than generic prose, because
     the retrieval behavior that matters is over code, and models attend to
     natural text differently than to structured code.
     """

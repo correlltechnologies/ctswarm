@@ -54,7 +54,12 @@ on any of this in a new environment.
 | Runtime model isolation | Live failed/successful A/B plus root tests | `ctswarm/med` caused the Claude CLI to hang; explicit native model overrides fixed it. All runtimes now receive model ids valid for their harness. |
 | Narrow Claude credential mount | Docker mount inspection | Container sees one 942-byte credential instead of the 653 MB / 7,631-file host Claude profile |
 | Patched SWE-AF regression suite | Ephemeral production image with local source mounted | 71 focused tests passed (git fast path, coding loop, issue build) |
-| ctswarm suite after fixes | `pytest -q`; `ruff check ctswarm tests` | 52/52 passing; lint clean |
+| ctswarm suite after production-readiness fixes | `pytest -q`; `ruff check ctswarm tests` | 61/61 passing; lint clean |
+| Root CI-equivalent suite | Python lint/tests/platform/anti-slop plus sandbox typecheck/tests/coverage | All pass; anti-slop has 0 blockers; sandbox 18/18; 90.15% statement coverage |
+| Always-on scheduler | Live queue submission, service recreation, and control API | Recovered the same in-flight execution after two recreations; no duplicate submission |
+| Scheduler concurrency | One active full build plus a queued sentinel | `active=1`, `queued=1`, `max_concurrent=1`; stopped sentinel reached terminal `stopped` with no execution ID |
+| Docker resilience settings | Live `docker inspect` of all seven services | Every service uses `unless-stopped` and `json-file` rotation at 10 MB × 5 |
+| Current local structured-tool path | Live streaming call through `ctswarm/med` | Router selected Ollama `qwen3.5:9b`; emitted `record_value({"value":7})` with `finish_reason=tool_calls`; no wedged models |
 
 ## Bench results (2026-07-29, RTX 5070 / 11.9GB VRAM)
 
@@ -150,12 +155,47 @@ same local model completed the real coder→commit→reviewer path. It remains
 slower and less schema-reliable than Claude, so benchmark eligibility alone is
 still not a reason to make it the default for complex work.
 
+## Full post-fix multi-issue build (2026-07-30)
+
+`build-910573b23f`, AgentField run `run_20260730_193009_cjmupetz`, root
+execution `exec_20260730_193009_fmvuzw2d`.
+
+| Fact | Result |
+|---|---|
+| Runtime | `claude_code` |
+| Wall time | 2,627 seconds |
+| Planned DAG | Five issues across three dependency levels |
+| Isolation | Separate worktrees and branches for each active issue |
+| Parallelism | Independent route/README issues and handler/OpenAPI issues ran concurrently |
+| Reviews | Five issue reviews approved |
+| Merges | Deterministic no-conflict merges at all three levels |
+| Intermediate integration | Correctly found missing handler/OpenAPI before their dependency level |
+| Post-level-1 integration | 71/71 tests passed |
+| Final verifier | 13/13 acceptance criteria passed |
+| AgentField result | `success: true`; all 35 recorded executions succeeded |
+| Scheduler result | `complete`, same root execution ID after scheduler restarts |
+| Pull request | `correlltechnologies/ctswarm-sandbox#1`, draft, feature branch → `main` |
+
+Repository finalization initially committed five temporary integration-test
+artifacts (969 lines) and changed the PR to ready-for-review. Those generated
+artifacts were removed in commit `635b975` and the PR was restored to draft.
+A fresh checkout of the resulting six-file, 141-addition PR passed:
+
+- `npm run typecheck`;
+- 24/24 committed tests;
+- coverage thresholds (90.84% statements);
+- deterministic secret, anti-slop, dependency, and test scanners.
+
+This closes the previously unverified integration/PR boundary. The proof also
+exposed and corrected two orchestration-adjacent presentation problems—the
+finalizer's artifact sweep and draft-state flip—rather than accepting the top
+level success label without inspecting the PR.
+
 ## Assumptions not yet verified
 
 | Assumption | Why it is not yet verified | What breaks if wrong |
 |---|---|---|
 | MLX model references in `catalog.py` resolve | No Apple Silicon machine in this session | `ctswarm doctor` on the Mac reports them as unresolvable. They are marked `verified_ref=False` and are **not** trusted by the router. Low blast radius by design. |
-| A full multi-issue Claude build merges and opens a valid PR | Only the issue-level coder→reviewer path has been rerun after the fixes | Integration merge, final verification, and PR creation remain unproven on the patched image |
 | OpenRouter provider-side quota is observable accurately | Live calls and routing work, but the account's authoritative quota semantics were not fully exercised | Capacity can still fall back to failure-driven switching |
 | Claude subscription quota is observable before exhaustion | Authentication and calls work, but the CLI does not expose a reliable remaining-credit endpoint here | Capacity must use configured rolling budgets plus failure-driven switching |
 

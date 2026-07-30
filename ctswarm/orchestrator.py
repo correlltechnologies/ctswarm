@@ -89,6 +89,7 @@ class BuildRecord:
             "repo_url": self.repo_url,
             "runtime": self.runtime.value,
             "state": self.state.value,
+            "execution_id": self.execution_id,
             "phase_detail": self.phase_detail,
             "elapsed_s": int(self.elapsed_s),
             "pr_url": self.pr_url,
@@ -285,35 +286,7 @@ class Orchestrator:
         except (httpx.HTTPError, ValueError):
             return record
 
-        status = str(body.get("status") or "").lower()
-        mapping = {
-            "pending": BuildState.QUEUED,
-            "queued": BuildState.QUEUED,
-            "running": BuildState.EXECUTING,
-            "in_progress": BuildState.EXECUTING,
-            "completed": BuildState.VERIFYING,
-            "success": BuildState.VERIFYING,
-            "failed": BuildState.FAILED,
-            "error": BuildState.FAILED,
-        }
-        new_state = mapping.get(status)
-        if new_state and new_state is not record.state:
-            record.state = new_state
-            record.updated_at = time.time()
-
-        result = body.get("result") or body.get("output") or {}
-        if isinstance(result, dict):
-            record.pr_url = result.get("pr_url") or record.pr_url
-            summary = result.get("summary")
-            if summary:
-                record.phase_detail = str(summary)[:300]
-        if body.get("error"):
-            reason = body.get("status_reason") or ""
-            detail = (body.get("result") or {}).get("detail") if isinstance(body.get("result"), dict) else ""
-            record.error = " | ".join(
-                str(x) for x in (body["error"], reason, detail) if x
-            )[:400]
-        return record
+        return update_record_from_execution(record, body)
 
     # -- gating ------------------------------------------------------------
 
@@ -341,6 +314,8 @@ class Orchestrator:
         if not scan_summary["passed"]:
             gates["committee"] = {"skipped": "deterministic gates already failed"}
             record.gate_results = gates
+            record.state = BuildState.BLOCKED
+            record.error = "deterministic completion gates failed or could not run"
             return gates
 
         members = eligible_members(RoutingTable.load())
@@ -353,6 +328,8 @@ class Orchestrator:
                 "needs_human": True,
             }
             record.gate_results = gates
+            record.state = BuildState.BLOCKED
+            record.error = "completion committee quorum is unavailable"
             return gates
 
         backends = build_backends()
@@ -378,6 +355,12 @@ class Orchestrator:
                 await backend_obj.close()
 
         record.gate_results = gates
+        if result.approved and not result.needs_human:
+            record.state = BuildState.COMPLETE
+            record.error = ""
+        else:
+            record.state = BuildState.BLOCKED
+            record.error = "completion committee did not approve the integrated change"
         return gates
 
     # -- the loop ----------------------------------------------------------
@@ -475,6 +458,57 @@ def _read_diff(repo_path: str | Path, base_ref: str = "main", limit: int = 60_00
     return diff or "(no changes)"
 
 
+def update_record_from_execution(record: BuildRecord, body: dict) -> BuildRecord:
+    """Apply one AgentField execution response to a build record.
+
+    AgentField reports a successfully *executed reasoner* as ``succeeded`` even
+    when the reasoner's structured result says ``success: false``. Both layers
+    matter: terminal transport status ends polling, while the result decides
+    whether the build completed or failed.
+    """
+    result = body.get("result") or body.get("output") or {}
+    if isinstance(result, dict):
+        record.pr_url = result.get("pr_url") or record.pr_url
+        summary = result.get("summary")
+        if summary:
+            record.phase_detail = str(summary)[:300]
+
+    status = str(body.get("status") or "").lower()
+    if status in {"pending", "queued"}:
+        new_state = BuildState.QUEUED
+    elif status in {"running", "in_progress"}:
+        new_state = BuildState.EXECUTING
+    elif status in {"completed", "success", "succeeded"}:
+        if not isinstance(result, dict) or result.get("success") is not True:
+            new_state = BuildState.FAILED
+            record.error = str(
+                (result.get("error_message") if isinstance(result, dict) else "")
+                or (result.get("error") if isinstance(result, dict) else "")
+                or (result.get("summary") if isinstance(result, dict) else "")
+                or "build reasoner returned success=false"
+            )[:400]
+        else:
+            new_state = BuildState.COMPLETE
+    elif status in {"cancelled", "canceled"}:
+        new_state = BuildState.STOPPED
+    elif status in {"failed", "error"}:
+        new_state = BuildState.FAILED
+    else:
+        new_state = None
+
+    if new_state and new_state is not record.state:
+        record.state = new_state
+        record.updated_at = time.time()
+
+    if body.get("error"):
+        reason = body.get("status_reason") or ""
+        detail = result.get("detail") if isinstance(result, dict) else ""
+        record.error = " | ".join(
+            str(value) for value in (body["error"], reason, detail) if value
+        )[:400]
+    return record
+
+
 def load_build(ledger: Ledger, build_id: str) -> BuildRecord | None:
     """Reconstruct a build from the event log, for status after a restart."""
     events = ledger.events(build_id=build_id)
@@ -505,4 +539,24 @@ def load_build(ledger: Ledger, build_id: str) -> BuildRecord | None:
             record.state = BuildState.PAUSED
         elif event["kind"] == "build_resumed":
             record.state = BuildState.EXECUTING
+        elif event["kind"] == "build_status":
+            try:
+                status = json.loads(event["detail"])
+                record.state = BuildState(status.get("state", record.state.value))
+                record.phase_detail = status.get("detail") or record.phase_detail
+                record.pr_url = status.get("pr_url") or record.pr_url
+            except (ValueError, TypeError):
+                pass
+        elif event["kind"] == "build_terminal":
+            try:
+                terminal = json.loads(event["detail"])
+                record.state = BuildState(terminal["state"])
+                record.phase_detail = terminal.get("phase_detail", "")
+                record.pr_url = terminal.get("pr_url", "")
+                record.error = terminal.get("error", "")
+                record.execution_id = (
+                    terminal.get("execution_id") or record.execution_id
+                )
+            except (KeyError, ValueError, TypeError):
+                pass
     return record
