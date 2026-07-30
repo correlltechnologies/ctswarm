@@ -147,7 +147,7 @@ def _detect_system_memory_gb() -> float:
             try:
                 return int(raw) / (1024**3)
             except ValueError:
-                pass
+                return 0.0
         return 0.0
     # Linux: read MemTotal directly rather than shelling out to free(1), which
     # varies in output format across distributions.

@@ -1,295 +1,248 @@
 # ctswarm handoff
 
-**As of 2026-07-30, 16:58 EDT.** The stack is running in Docker. The fail-closed
-SWE-AF fixes are pushed on `agent/fix-local-model-coding`; the final local-model
-adapter fix is validated and ready for its follow-up commit.
+**As of 2026-07-30, 16:16 EDT.** The seven-service stack is running, the
+always-on scheduler is healthy, both Claude and the local OpenCode/Qwen path are
+proven under the real harness, and a post-fix multi-issue build completed with a
+clean draft pull request.
 
-Read this top to bottom once; it is ordered by what you most need to know.
-
----
-
-## 1. Where things actually stand
-
-**The infrastructure works, fail-closed execution is enforced, and both Claude
-and local OpenCode have produced committed, tested, independently reviewed code
-under the real harness.**
-
-What is verified working, by execution and not by assumption:
-
-- All six containers run; both SWE-AF nodes register with the AgentField control plane
-- The full inference chain: SWE-AF agent → opencode → ctswarm router → Ollama / OpenRouter
-- A complete 22-agent OpenCode build ran for **23 minutes**, made **112 model
-  calls at 100% transport/schema success**, routing live across three models and
-  two backends
-- Planning ran on `deepseek-v4-pro` (OpenRouter), coding on `qwen3.5:9b` (local), with
-  automatic failover to `minimax-m2.5` inside the high tier
-- A live Claude issue build completed coder → commit → reviewer in 134 seconds:
-  execution `exec_20260730_162640_n8dhesy5`, branch
-  `issue/0690a662-prove-claude-end-to-end`, commit `9849f03`, two files changed,
-  19 sandbox tests passed, review approved
-- A live local Qwen/OpenCode issue build completed coder → commit → reviewer:
-  execution `exec_20260730_165029_oipllfbe`, branch
-  `issue/4ca4a0aa-prove-local-native-end-to-end`, commit `8798956`, two files
-  changed, 21 sandbox tests passed, review approved
-- The local coder caught and repaired its own bad newline assertion. The
-  reviewer initially wrote the schema definition instead of an instance, then
-  corrected it on the harness's schema retry. Both failures remained fail closed.
-
-What was wrong in the first build:
-
-- LLM-driven git init returned a false success with an empty SHA; workspace
-  setup then returned zero worktrees; the DAG silently fell back to the shared
-  repository.
-- Coders returned `complete: true` with no files, and reviewer failures defaulted
-  to approval. Four empty issues were therefore labeled complete.
-- The final verifier still prevented a PR, but the inner execution gates were
-  not safe enough.
-
-What is fixed:
-
-- Git init is deterministic and validated against the real branch/SHA.
-- Worktree setup must succeed with an exact issue/worktree match; shared-root
-  fallback is gone.
-- Coder claims are replaced by git-observed changes. Empty output is rejected
-  before review, including after the coder commits.
-- Reviewer failures are blocking, never approvals; `CoderResult.complete`
-  defaults false.
-- Runtime switching now supplies native Claude/Codex model names rather than
-  leaking `ctswarm/*` OpenCode aliases into those CLIs.
-- OpenCode streaming now stays on Ollama's native `/api/chat` path, preserving
-  structured tools, explicit context sizing, separated reasoning, and reasoning
-  allowance. OpenAI-style string tool arguments are decoded back to the object
-  shape Ollama requires on subsequent turns.
-- Claude containers mount only the 942-byte credential file, not the 653 MB /
-  7,631-file host profile that made each invocation scan unrelated skills.
-- Three reproducible patches under `infra/patches/` are applied by bootstrap and
-  every `stack.sh` operation. The patcher refuses to overwrite a divergent
-  vendor tree.
-
-Honest boundary: **Claude and local/OpenCode issue-level coding output are
-proven. Local Qwen is materially slower and needed schema self-correction, so
-Claude remains the safer production default for complex work. A new full
-multi-issue build has not yet been run on the patched stack.**
+This document is the operational handoff. `docs/VERIFIED.md` contains the
+evidence history and `docs/OPERATIONS.md` contains the runbook.
 
 ---
 
-## 2. The one decision waiting on you
+## 1. Current state
 
-Branch protection needs **GitHub Pro** for private repos, so `ctswarm-sandbox` has none.
+The core branch-and-PR factory works end to end:
 
-- **Make `ctswarm-sandbox` public** — protection is free on public repos, and it is a
-  throwaway test service with no secrets. Recommended.
-- **Upgrade to Pro** — protects private repos too.
-- **Accept no backstop on the sandbox** — workable for now, since SWE-AF opens PRs rather
-  than pushing to main by design, but you lose the deterministic guarantee.
+- Seven Docker services are up: control plane, build database, router,
+  approvals, scheduler, `swe-agent`, and `swe-fast`.
+- Every service uses `restart: unless-stopped` and rotated Docker logs
+  (`10m`, five files by default).
+- The scheduler owns all submissions. Its SQLite-backed queue, controls,
+  execution IDs, and terminal results survive container restarts.
+- Default concurrency is one build, matching the shared AgentField database and
+  local GPU. A queued build cannot bypass that limit.
+- Claude and local OpenCode both produced committed, tested, independently
+  reviewed code under the fail-closed SWE-AF harness.
+- A full five-issue Claude build completed planning, isolated worktrees,
+  dependency-ordered parallel execution, deterministic merges, integration
+  testing, final verification, and draft-PR creation.
+- Root CI failures that predated the local-model work are fixed locally:
+  Python lint/tests, platform detection, anti-slop self-scan, sandbox typecheck,
+  sandbox tests, and coverage all pass.
 
-I did not make it public unilaterally because that is outward-facing and hard to fully
-reverse.
+There is no required engineering gap left for the current autonomous
+branch-and-draft-PR scope. Production deployment remains deliberately outside
+that scope.
 
-Your GitHub token scopes are appropriately narrow (`repo`, `read:org`, `gist`,
-`admin:public_key`) with no `workflow` or `admin:org`, which is the more important half.
-Verify any time with:
+## 2. Full post-fix proof build
 
-```bash
-./.venv/bin/python -c "from ctswarm.policy.protection import token_scope_report; print(token_scope_report())"
+Target: private disposable repository
+`correlltechnologies/ctswarm-sandbox`.
+
+```text
+ctswarm build       build-910573b23f
+AgentField run      run_20260730_193009_cjmupetz
+root execution      exec_20260730_193009_fmvuzw2d
+runtime             claude_code
+elapsed             2,627 seconds
+result              success=true; scheduler state=complete
+pull request        https://github.com/correlltechnologies/ctswarm-sandbox/pull/1
 ```
 
----
+The planner produced five real issues:
 
-## 3. Picking this back up
+1. route definition;
+2. README documentation;
+3. handler implementation;
+4. OpenAPI documentation;
+5. focused endpoint tests.
+
+The DAG ran three dependency levels. Independent issues used separate worktrees
+and ran in parallel; dependent issues started from the merged prior-level
+commit. All issue coders committed changes and all five code reviews approved.
+Merges used the deterministic no-conflict path.
+
+The first intermediate integration run intentionally found the handler and
+OpenAPI work still absent. After those dependencies merged, the next integration
+run passed 71/71 tests. Final verification passed all 13 acceptance criteria,
+including typecheck, the complete test suite, documentation, schema constraints,
+and PR existence.
+
+Repository finalization briefly swept five generated integration-test artifacts
+into the PR, adding 969 lines and changing it to ready-for-review. Those
+temporary artifacts were removed in follow-up commit `635b975`, leaving the
+focused six-test endpoint suite. A fresh checkout then passed:
+
+- TypeScript typecheck;
+- 24/24 committed tests;
+- coverage thresholds (90.84% statements);
+- secret scan;
+- anti-slop scan;
+- production dependency audit.
+
+The PR is draft, targets `main`, is limited to six files and 141 additions, and
+remains unmerged as the disposable proof artifact.
+
+## 3. Local-model path
+
+The local path is not a configuration-only claim.
+
+Issue-level proof:
+
+```text
+execution  exec_20260730_165029_oipllfbe
+runtime    OpenCode -> ctswarm/med -> Ollama qwen3.5:9b
+commit     87989566018e3d2187c5cc4d1c0fc6950a308bc6
+result     21 tests passed; independent reviewer approved
+```
+
+The current running stack was also rechecked after the production-readiness
+changes. Routing selected local `qwen3.5:9b`; a streaming completion emitted the
+required structured `record_value({"value": 7})` tool call with
+`finish_reason=tool_calls`; router health reported no wedged models.
+
+The critical adapter fixes are:
+
+- OpenCode streaming stays on Ollama's native `/api/chat` path.
+- Native context sizing and reasoning controls are preserved.
+- OpenAI stringified tool arguments are translated back to native Ollama
+  objects on subsequent turns.
+- Runtime-specific model names prevent OpenCode aliases from leaking into
+  Claude or Codex.
+
+Local Qwen remains slower and less schema-reliable than Claude, so Claude is the
+safer default for complex builds. Local Qwen is nevertheless a working coder,
+reviewer, and structured-tool runtime.
+
+`ornith:9b` remains quarantined. It has repeatedly wedged the shared Ollama
+queue, even after one clean benchmark run.
+
+## 4. Operating the stack
 
 ```bash
 cd ~/Desktop/Projects/ctswarm
 
-./stack.sh ps                      # is everything up
-./stack.sh up                      # start / restart
-./.venv/bin/ctswarm doctor         # full inventory
-./.venv/bin/ctswarm capacity       # runtime headroom and spend
-./.venv/bin/ctswarm status         # recent builds
+./stack.sh up
+./stack.sh ps
+./.venv/bin/ctswarm doctor
+./.venv/bin/ctswarm capacity
+./.venv/bin/ctswarm status
 ```
 
-**Never run `docker compose` by hand.** Use `./stack.sh`. Compose resolves relative paths
-against the first `-f` file's directory, so without `--project-directory .` the build
-context and opencode config silently point at the wrong places. `stack.sh` exists to make
-that unrepresentable.
-
-Ports: router `8090`, approvals + local approval UI `8091`, control plane **`18080`**
-(moved off 8080, which your `correll-voice-crm` Supabase stack owns).
-
----
-
-## 4. Running a build
+Submit and control a build:
 
 ```bash
-./.venv/bin/ctswarm build "your goal here" \
-  --repo https://github.com/correlltechnologies/ctswarm-sandbox
-```
+./.venv/bin/ctswarm build "your goal" \
+  --repo https://github.com/OWNER/REPOSITORY
 
-Controls, from the CLI or from Slack buttons once Slack is configured:
-
-```bash
-./.venv/bin/ctswarm pause  <build-id>
-./.venv/bin/ctswarm resume <build-id>
-./.venv/bin/ctswarm stop   <build-id>
 ./.venv/bin/ctswarm status <build-id>
+./.venv/bin/ctswarm pause <build-id>
+./.venv/bin/ctswarm resume <build-id>
+./.venv/bin/ctswarm stop <build-id>
 ```
 
-**Pause is honoured at the next phase boundary, not instantly.** There is no way to
-interrupt SWE-AF mid-reasoner. What is guaranteed is that no *new* work starts. Control
-signals live in the ledger, so a pause survives a restart.
+The CLI refuses to bypass the scheduler. `--no-watch` enqueues and detaches.
+Pause and stop take effect at a phase boundary; queued work can be stopped
+before dispatch.
 
-Approvals: `http://localhost:8091` works with zero setup. Slack needs
-`docs/SLACK.md` (~10 min). Until then, approval cards still exist and are still actionable
-locally, and expiry always resolves to **pause**, never approve.
+Always use `stack.sh`, never a hand-written Compose command. It supplies the
+required project directory and applies the pinned SWE-AF patches before build or
+startup.
 
----
+For one changed service:
 
-## 5. The next build
+```bash
+./stack.sh build ctswarm-scheduler
+./stack.sh recreate ctswarm-scheduler
+```
 
-Run a bounded full build with the Claude runtime and inspect the resulting
-integration branch/PR. The issue-level discriminating experiments are complete:
-both Claude and local OpenCode wrote, tested, committed, and passed review.
+Endpoints:
 
-Do not switch by only changing `SWE_DEFAULT_RUNTIME` and assuming the container
-tier variables are harmless. Submit through `ctswarm build`; the orchestrator
-now sends runtime-native model overrides (`sonnet`/`haiku` for Claude,
-auth-aware `gpt-5.5` or `gpt-5.3-codex` for Codex, and `ctswarm/*` for
-OpenCode).
+| Port | Service |
+|---|---|
+| `8090` | Model router |
+| `8091` | Approvals and local approval UI |
+| `8092` | Durable scheduler |
+| `18080` | AgentField control plane |
 
-Useful live proof:
+All published ports bind to loopback.
+
+## 5. Scheduler recovery proof
+
+During the full build, the scheduler container was recreated twice. After each
+restart it recovered:
 
 ```text
-runtime    Claude
-execution  exec_20260730_162640_n8dhesy5
-commit     9849f034c2210aad9f1f4c64ccec6262600d3937
-tests      19 passed; reviewer approved
-
-runtime    OpenCode → ctswarm/med → Ollama qwen3.5:9b
-execution  exec_20260730_165029_oipllfbe
-commit     87989566018e3d2187c5cc4d1c0fc6950a308bc6
-tests      21 passed; reviewer approved
+build       build-910573b23f
+execution   exec_20260730_193009_fmvuzw2d
+state       executing
 ```
 
----
+It did not submit a duplicate execution.
 
-## 6. Models
+A second request (`build-f1f27e712a`) remained queued while the real build held
+the only slot. Stopping it produced terminal state `stopped` with no execution
+ID, proving it never reached AgentField. The regression suite covers both
+restart recovery and stopped-while-queued behavior.
 
-Routing table: 14 measured, 9 eligible, 5 independent families. Regenerate any time with
-`ctswarm bench` (add `--backend openrouter` for hosted; results now merge rather than
-overwrite).
+## 6. Validation snapshot
 
-| Tier | Primary | Fallbacks |
-|---|---|---|
-| high (planning) | `deepseek/deepseek-v4-pro` | `qwen3.6`, `minimax-m2.5` |
-| med (coding) | `qwen3.5:9b` (local, free) | `gpt-oss-120b`, `deepseek-v4-flash` |
-| low (mechanical) | `qwen3.5:9b` | `deepseek-v4-flash`, `granite4.1:8b` |
+Current root validation:
 
-**`ornith:9b` is quarantined and must stay that way.** It wedged the entire Ollama queue
-repeatedly. Earlier events required `sudo systemctl restart ollama`; the latest
-was cleared with `ollama stop ornith:9b`. It also passed one clean bench run in
-between, so a good score does not clear it. It harms the host, not just itself.
-
-`qwen2.5-coder:7b` fails the tool-call gate at 25%, answering in prose. The nominal "coder"
-model is the least fit for agent work in the set.
-
-If Ollama ever seems to hang everything at once, that is the wedge signature:
-
-```bash
-curl -s localhost:8090/health | python3 -m json.tool   # shows degraded + wedged_models
-sudo systemctl restart ollama
+```text
+ruff                         clean
+pytest                       61 passed
+platform detection           RTX 5070 / CUDA / Ollama detected
+anti-slop self-check         0 blockers
+sandbox typecheck            passed
+sandbox tests                18 passed
+sandbox coverage             90.15% statements
+stack                        7 services healthy/running
 ```
 
----
+The sandbox draft PR's fresh-checkout validation is recorded in section 2.
 
-## 7. Cost
+## 7. Governance boundary
 
-Roughly **$0.20 to $0.50** of OpenRouter credit was used across benching and the build, out
-of your $5.
+`ctswarm-sandbox` is private and its current GitHub plan does not support the
+required branch-protection rules. The owner explicitly authorized direct-main
+administration for this project and accepted the sandbox exception. The factory
+still opens feature branches and draft PRs; it does not deploy.
 
-The number that matters: a trivial Claude call measured **$0.345**, almost entirely fixed
-system-prompt overhead rather than prompt size. Multiply by 400+ invocations per build.
-That is why routing is local-first and why subscriptions are treated as scarce.
+Do not generalize that exception to production repositories. Apply
+`ctswarm policy apply` where the repository plan supports protection, and keep
+agents unable to edit workflows, secrets, rules, or audit history.
 
-```bash
-./.venv/bin/ctswarm usage       # calls, tokens, spend, local share
-```
+Slack is optional. The local approval UI on port 8091 implements the same
+decision path with no external setup. UI-changing builds additionally require
+browser evidence; the API-only sandbox proof does not.
 
-Budget cap is `CTSWARM_BUDGET_USD_PER_BUILD=2.00` in `.env`; exceeding it raises an approval
-rather than silently continuing. Worth also setting a spend limit on the OpenRouter key
-itself, since your key is currently uncapped and a provider-side limit cannot be bypassed
-by a bug in ctswarm.
+## 8. Known operational cautions
 
----
+- Editing source does not update a running container. Build and recreate the
+  affected service.
+- `.env` and copied credential files must remain untracked.
+- A router HTTP 200 is not enough; inspect `wedged_models` if all local requests
+  stall.
+- Do not clear `ornith:9b` from quarantine based on one green run.
+- A skipped scanner or committee is not a pass.
+- The scheduler ledger is in the `ctswarm-state` volume. `./stack.sh nuke`
+  destroys it.
+- Dev-only dependency advisories in the sandbox are reported but do not block;
+  production dependency advisories do.
 
-## 8. Still to build
+## 9. Documentation map
 
-In the order I would do them:
-
-1. **Run a bounded full Claude build** and verify integration/PR behavior. The
-   issue-level coding path is proven; the multi-issue path still needs this
-   post-fix proof.
-2. **Evidence bundle** mapping test results to PRD acceptance criteria. Scanners and
-   committees exist; the artifact tying them to each must-have does not.
-3. **Apply branch protection** once section 2 is decided (`ctswarm.policy.protection` is
-   written and tested, just not applied).
-4. **Scheduler** for genuine 24/7 operation: queue, concurrency limits, restart policies,
-   log rotation.
-5. **Browser/Playwright evidence** for UI work. Not needed for the sandbox, but the plan
-   requires it before any UI project.
-
----
-
-## 9. Things that will bite you
-
-- **`docker compose` by hand** breaks paths. Use `./stack.sh`.
-- **Editing code does not update containers.** Run `./stack.sh build <service>` then
-  `./stack.sh up`. `up` alone reuses the old image, which cost me an hour.
-- **`.env` is gitignored via `.env*`**, deliberately broad. A copied template once landed as
-  `.env copy.example` and sat one `git add -A` away from committing a live token.
-- **Token budgets must clear reasoning overhead.** Thinking models spend their allowance
-  before emitting content: `qwen3.5:4b` used 181 reasoning tokens for a 2-token answer. The
-  Ollama backend compensates automatically; remember it if you add a backend.
-- **OpenCode always requests streaming.** An Ollama streaming implementation
-  must preserve native `/api/chat` semantics. Falling back to `/v1/chat/completions`
-  silently turns structured tool calls into prose and bypasses context sizing.
-- **OpenAI and native Ollama tool histories differ.** OpenAI sends function
-  arguments as a JSON string; native Ollama requires an object on the next turn.
-- **Ollama silently truncates to a 4096 context** unless `num_ctx` is set on the native
-  endpoint. `/v1` ignores the field. This is handled, but it is invisible when wrong: the
-  model answers confidently from a truncated prompt.
-- **A skipped verification probe is not a pass.** `ctswarm verify` exits non-zero on skips
-  unless you pass `--allow-skips`.
-
----
-
-## 10. Documentation map
-
-| File | What it holds |
+| File | Purpose |
 |---|---|
-| `README.md` | Architecture, the two-tier switching model, committees |
-| `docs/VERIFIED.md` | **Read this one.** What is verified vs assumed, with methods and known-bad findings |
-| `docs/OPENROUTER.md` | OpenRouter setup and cost reasoning |
-| `docs/SLACK.md` | Slack app setup, ~10 minutes |
-| `sandbox/README.md` | The test project and why the contract test is the trap |
-| `.claude-memory/` | Project memory notes for future sessions |
+| `README.md` | Architecture and design principles |
+| `docs/OPERATIONS.md` | Always-on runbook, recovery, controls, logs |
+| `docs/VERIFIED.md` | Verified facts, live evidence, assumptions |
+| `docs/SLACK.md` | Optional Slack approval setup |
+| `docs/OPENROUTER.md` | Hosted overflow setup and cost reasoning |
+| `sandbox/README.md` | Local verification target and contract trap |
 
-`docs/VERIFIED.md` is the one that will save you the most time. It records exactly which
-claims were checked against live sources, which were executed here, and which remain
-assumptions, with the blast radius of each.
-
----
-
-## Current state at a glance
-
-```
-repo        correlltechnologies/ctswarm (private; current fix commit not pushed)
-sandbox     correlltechnologies/ctswarm-sandbox (private, no branch protection)
-stack       6 containers up
-tests       48 root tests, ruff clean; 71 focused SWE-AF tests; sandbox 19/19 in live proof
-verify      5 passed, 0 failed, 1 skipped (isolation needs a live build target)
-models      14 measured, 9 eligible, 5 families
-last build  build-5506756dae — ran 23 min, 112 calls, 100% success,
-            4/4 issues "completed", NO code written, verifier failed, no PR
-live proof  exec_20260730_162640_n8dhesy5 — Claude coder + reviewer,
-            1 commit, 2 files, 19 tests, approved, success=true
-```
+Future expansion items—not blockers for the current scope—are branch protection
+on plans that support it, Slack delivery if desired, and browser evidence when a
+target includes a user interface.

@@ -25,6 +25,12 @@
 # host.docker.internal, which is a docker-internal route, so port 11434 stays
 # bound to loopback on the host as the plan requires.
 
+x-ctswarm-logging: &ctswarm-logging
+  driver: json-file
+  options:
+    max-size: "${CTSWARM_LOG_MAX_SIZE:-10m}"
+    max-file: "${CTSWARM_LOG_MAX_FILES:-5}"
+
 services:
   # SWE-AF publishes the control plane on host 8080, which collides with almost
   # anything else a developer runs (here: an existing Supabase stack). Remapped
@@ -37,6 +43,12 @@ services:
   control-plane:
     ports: !override
       - "127.0.0.1:${CTSWARM_CONTROL_PLANE_PORT:-18080}:8080"
+    restart: unless-stopped
+    logging: *ctswarm-logging
+
+  build-db:
+    restart: unless-stopped
+    logging: *ctswarm-logging
 
   ctswarm-router:
     build:
@@ -70,6 +82,7 @@ services:
       retries: 12
       start_period: 20s
     restart: unless-stopped
+    logging: *ctswarm-logging
 
   ctswarm-approvals:
     build:
@@ -94,6 +107,55 @@ services:
     volumes:
       - ctswarm-state:/state
     restart: unless-stopped
+    logging: *ctswarm-logging
+
+  ctswarm-scheduler:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.router
+    command:
+      - uvicorn
+      - ctswarm.scheduler:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8092"
+    environment:
+      - CTSWARM_DB=/state/ctswarm.db
+      - CTSWARM_AGENTFIELD_URL=http://control-plane:8080
+      - CTSWARM_APPROVALS_URL=http://ctswarm-approvals:8091
+      - CTSWARM_ROUTING=/bench-results/routing.json
+      - CTSWARM_MAX_CONCURRENT_BUILDS=${CTSWARM_MAX_CONCURRENT_BUILDS:-1}
+      - CTSWARM_SCHEDULER_POLL_SECONDS=${CTSWARM_SCHEDULER_POLL_SECONDS:-10}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - SWE_CODEX_AUTH_MODE=${SWE_CODEX_AUTH_MODE:-auto}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_STATUS_CHANNEL=${SLACK_STATUS_CHANNEL:-}
+      - SLACK_APPROVAL_CHANNEL=${SLACK_APPROVAL_CHANNEL:-}
+    ports:
+      - "127.0.0.1:8092:8092"
+    volumes:
+      - ctswarm-state:/state
+      - ./bench/results:/bench-results:ro
+      - ${HOME}/.codex:/home/ctswarm/.codex:ro
+    depends_on:
+      swe-agent:
+        condition: service_healthy
+      ctswarm-router:
+        condition: service_healthy
+      ctswarm-approvals:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8092/health',timeout=5).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    logging: *ctswarm-logging
 
   # SWE-AF's own agent services, extended rather than redefined.
   swe-agent:
@@ -126,6 +188,8 @@ services:
     depends_on:
       ctswarm-router:
         condition: service_healthy
+    restart: unless-stopped
+    logging: *ctswarm-logging
 
   swe-fast:
     build:
@@ -144,6 +208,8 @@ services:
     depends_on:
       ctswarm-router:
         condition: service_healthy
+    restart: unless-stopped
+    logging: *ctswarm-logging
 
 volumes:
   ctswarm-state:

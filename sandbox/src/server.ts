@@ -30,7 +30,7 @@ export function createApp(): Express {
     }
   });
 
-  app.get("/items/:id", (req: Request, res: Response) => {
+  app.get("/items/:id", (req: Request<{ id: string }>, res: Response) => {
     const item = store.get(req.params.id);
     if (!item) {
       res.status(404).json({ success: false, data: null, error: "item not found" });
@@ -39,7 +39,7 @@ export function createApp(): Express {
     res.json({ success: true, data: item, error: null });
   });
 
-  app.delete("/items/:id", (req: Request, res: Response) => {
+  app.delete("/items/:id", (req: Request<{ id: string }>, res: Response) => {
     const deleted = store.delete(req.params.id);
     if (!deleted) {
       res.status(404).json({ success: false, data: null, error: "item not found" });
