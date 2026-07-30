@@ -109,7 +109,7 @@ def doctor() -> None:
 
     console.print("\n[bold]Model catalog[/bold]")
     catalog_table = Table("model", "placement", "tiers", "installed", "note", box=None)
-    for entry in build_catalog(host):
+    for entry in build_catalog(host, set(probed)):
         note = entry.spec.notes.split(".")[0] if entry.spec.notes else ""
         catalog_table.add_row(
             entry.spec.ref,
@@ -227,9 +227,12 @@ def bench(
         if models:
             refs = [m.strip() for m in models.split(",") if m.strip()]
         else:
+            # Build the catalog for the backend being benched, not for whatever
+            # this host has installed locally. Same bug as the router had:
+            # host detection cannot see a hosted backend at all.
             catalog_refs = [
                 entry.spec.ref
-                for entry in build_catalog(host)
+                for entry in build_catalog(host, {backend})
                 if entry.usable and entry.spec.backend == backend
             ]
             refs = [ref for ref in catalog_refs if ref in installed]

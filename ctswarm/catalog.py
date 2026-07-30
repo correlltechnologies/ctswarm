@@ -100,6 +100,10 @@ class ModelSpec:
 
     def placement(self, host: HostProfile) -> str:
         """How this model will physically run on the given host."""
+        # A hosted model occupies none of this machine's memory, so local
+        # placement reasoning does not apply to it at all.
+        if self.backend == "openrouter":
+            return "hosted"
         if self.fits(host.accel_memory_gb):
             return "resident"
         # MoE models with a small active set still produce usable throughput when
@@ -118,6 +122,9 @@ class ModelSpec:
         router prefers measured throughput over these values.
         """
         placement = self.placement(host)
+        if placement == "hosted":
+            # Network latency, but no VRAM contention and no offload penalty.
+            return 0.85
         if placement == "resident":
             return 1.0
         if placement == "partial_offload_moe":
@@ -179,8 +186,8 @@ OLLAMA_CANDIDATES: tuple[ModelSpec, ...] = (
         tiers=(Tier.HIGH, Tier.MED),
         notes="33B MoE, 3B active, agentic-coding focused. Spills past 12GB VRAM "
         "but the small active set keeps offload viable. Local high-tier candidate. "
-        "REQUIRES a newer ollama than 0.31.1; pull fails with a download prompt on "
-        "older versions. Upgrade with: curl -fsSL https://ollama.com/install.sh | sh",
+        "Requires ollama > 0.31.1 (installed and pulled on 2026-07-29 under "
+        "0.32.5).",
         verified_ref=True,
         requires_ollama=">0.31.1",
     ),
@@ -291,6 +298,92 @@ MLX_CANDIDATES: tuple[ModelSpec, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# OpenRouter candidates
+# ---------------------------------------------------------------------------
+# Chosen from the live model list on 2026-07-29 with prices read from
+# OpenRouter's own endpoint (never hardcoded here; the router fetches them).
+#
+# Selection criteria, in order:
+#   1. Tool-calling support. Non-negotiable for SWE-AF agent roles.
+#   2. FAMILY DIVERSITY from the local models. Local eligibility is qwen and
+#      granite, so every entry here is a different family. That is what makes a
+#      committee vote mean something rather than being one opinion resampled.
+#   3. Cost, weighted toward output tokens, because a build emits far more than
+#      it consumes per call.
+#   4. Context >= 128k, since agents read repo-scale context.
+#
+# Weight and placement are irrelevant for a hosted model, so weight_gb is 0 and
+# placement is always "resident".
+
+OPENROUTER_CANDIDATES: tuple[ModelSpec, ...] = (
+    ModelSpec(
+        ref="deepseek/deepseek-v4-pro",
+        backend="openrouter",
+        weight_gb=0.0,
+        context=1048576,
+        tools=True,
+        tiers=(Tier.HIGH, Tier.MED),
+        notes="Strong planner, 1M context. Primary high-tier candidate now that "
+        "no local model qualifies. Family: deepseek.",
+        verified_ref=True,
+    ),
+    ModelSpec(
+        ref="deepseek/deepseek-v4-flash",
+        backend="openrouter",
+        weight_gb=0.0,
+        context=1048576,
+        tools=True,
+        tiers=(Tier.MED, Tier.LOW),
+        notes="Cheap, fast, 1M context. Overflow for coding when local is busy. "
+        "Family: deepseek.",
+        verified_ref=True,
+    ),
+    ModelSpec(
+        ref="minimax/minimax-m2.5",
+        backend="openrouter",
+        weight_gb=0.0,
+        context=204800,
+        tools=True,
+        tiers=(Tier.HIGH, Tier.MED),
+        notes="SWE-AF's own documented default for the open runtime, so it is "
+        "the best-exercised model against this harness. Family: minimax.",
+        verified_ref=True,
+    ),
+    ModelSpec(
+        ref="openai/gpt-oss-120b",
+        backend="openrouter",
+        weight_gb=0.0,
+        context=131072,
+        tools=True,
+        tiers=(Tier.MED,),
+        notes="Independent reviewer that shares no failure modes with the "
+        "Qwen-family coder. Family: openai.",
+        verified_ref=True,
+    ),
+    ModelSpec(
+        ref="mistralai/ministral-8b-2512",
+        backend="openrouter",
+        weight_gb=0.0,
+        context=262144,
+        tools=True,
+        tiers=(Tier.MED, Tier.LOW),
+        notes="Fourth independent family for committee quorum. Family: mistral.",
+        verified_ref=True,
+    ),
+    ModelSpec(
+        ref="openai/gpt-oss-20b",
+        backend="openrouter",
+        weight_gb=0.0,
+        context=131072,
+        tools=True,
+        tiers=(Tier.LOW,),
+        notes="Cheap mechanical-tier overflow. Family: openai.",
+        verified_ref=True,
+    ),
+)
+
+
 @dataclass(frozen=True)
 class CatalogEntry:
     """A candidate paired with how it would run on a specific host."""
@@ -337,6 +430,8 @@ def candidates_for(
             specs.extend(MLX_CANDIDATES)
         if backends & {"ollama", "lmstudio"}:
             specs.extend(OLLAMA_CANDIDATES)
+        if "openrouter" in backends:
+            specs.extend(OPENROUTER_CANDIDATES)
         if specs:
             return tuple(specs)
 

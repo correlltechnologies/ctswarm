@@ -380,9 +380,19 @@ def write_results(
     identical to having measured it and found it terrible, which permanently
     gates it out of every agent role on evidence that was never collected.
     Absent from the table means "unmeasured", which is the truth.
+
+    Results are **merged** into the existing table, not substituted for it.
+    Benching one backend must not erase another's measurements: running
+    `ctswarm bench --backend openrouter` previously wiped every local Ollama
+    result, silently emptying the local tier and making the router fall back to
+    hosted models for everything. Only the models actually measured in this run
+    are overwritten.
     """
     measured = [r for r in results if r.error is None]
-    table = RoutingTable({r.model_ref: r.to_score() for r in measured})
+    existing = RoutingTable.load(routing_path)
+    merged = {score.model_ref: score for score in existing.all()}
+    merged.update({r.model_ref: r.to_score() for r in measured})
+    table = RoutingTable(merged)
     table.save(routing_path)
 
     detail_path = Path(detail_path)
