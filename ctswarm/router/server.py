@@ -135,9 +135,21 @@ def _parse_virtual(model: str) -> tuple[Tier | None, tuple[str, str] | None]:
     """Split a requested model into (tier, explicit pin).
 
     ``ctswarm/med``                 -> (MED, None)
+    ``med``                         -> (MED, None)
     ``ctswarm/ollama:qwen3.5:9b``   -> (None, ("ollama", "qwen3.5:9b"))
-    ``qwen3.5:9b``                  -> (None, (None, "qwen3.5:9b")) treated as a pin
+    ``qwen3.5:9b``                  -> (None, ("", "qwen3.5:9b")) treated as a pin
+
+    The bare tier form is not a convenience, it is required. An
+    OpenAI-compatible client resolves ``provider/model`` by routing to the
+    provider's baseURL and sending only the **model** part, so opencode
+    configured with ``ctswarm/med`` puts ``"model": "med"`` on the wire.
+    Recognising only the prefixed form made every agent call fail with
+    "pinned model not available: med", which is precisely how the first real
+    build died.
     """
+    if model in ("high", "med", "low"):
+        return Tier(model), None
+
     if not model.startswith(VIRTUAL_PREFIX):
         return None, ("", model)
 

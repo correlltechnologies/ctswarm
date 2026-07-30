@@ -218,11 +218,15 @@ class Orchestrator:
 
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
+                # Both details verified against the live control plane:
+                # the target is dot-separated (`node.reasoner`; a slash 404s),
+                # and the body must be wrapped in `input` (a bare payload is
+                # rejected with "Missing required field: goal").
                 response = await client.post(
-                    f"{self.agentfield_url}/api/v1/execute/swe-planner/build",
-                    json={"input": payload, "async": True},
+                    f"{self.agentfield_url}/api/v1/execute/async/swe-planner.build",
+                    json={"input": payload},
                 )
-            if response.status_code >= 400:
+            if response.status_code >= 400:  # 202 Accepted is the success case
                 record.state = BuildState.FAILED
                 record.error = f"submit failed HTTP {response.status_code}: {response.text[:300]}"
                 return record
@@ -235,6 +239,10 @@ class Orchestrator:
         record.execution_id = str(
             body.get("execution_id") or body.get("id") or body.get("request_id") or ""
         )
+        if not record.execution_id:
+            record.state = BuildState.FAILED
+            record.error = f"control plane returned no execution id: {str(body)[:200]}"
+            return record
         record.state = BuildState.PLANNING
         self.ledger.record_event(
             "build_started",
@@ -279,7 +287,11 @@ class Orchestrator:
             if summary:
                 record.phase_detail = str(summary)[:300]
         if body.get("error"):
-            record.error = str(body["error"])[:400]
+            reason = body.get("status_reason") or ""
+            detail = (body.get("result") or {}).get("detail") if isinstance(body.get("result"), dict) else ""
+            record.error = " | ".join(
+                str(x) for x in (body["error"], reason, detail) if x
+            )[:400]
         return record
 
     # -- gating ------------------------------------------------------------
