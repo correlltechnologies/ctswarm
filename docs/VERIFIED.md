@@ -49,10 +49,12 @@ on any of this in a new environment.
 | Approval rule invariants | `pytest tests/` | 24/24 passing |
 | Empty coder claims fail closed | Live OpenCode issue build plus regression tests | Two iterations produced no git changes; outcome was `failed_unrecoverable`, reviewer was never called |
 | Claude can write under the real harness | Live `swe-fast.implement_issue` with `runtime=claude_code`, native `sonnet` model | Wrote two files, passed 19 sandbox tests, committed `9849f03`, independent reviewer approved |
+| Native Ollama tools survive OpenCode streaming | Direct three-turn OpenCode run through `ctswarm/med` | Qwen emitted structured `write`, then structured `read`, then a final answer; exact file bytes verified |
+| Local OpenCode can complete the fail-closed issue workflow | Live `swe-fast.implement_issue`, execution `exec_20260730_165029_oipllfbe` | Qwen wrote two files, self-corrected a test, committed `8798956`, passed 21 tests, and the independent local reviewer approved |
 | Runtime model isolation | Live failed/successful A/B plus root tests | `ctswarm/med` caused the Claude CLI to hang; explicit native model overrides fixed it. All runtimes now receive model ids valid for their harness. |
 | Narrow Claude credential mount | Docker mount inspection | Container sees one 942-byte credential instead of the 653 MB / 7,631-file host Claude profile |
 | Patched SWE-AF regression suite | Ephemeral production image with local source mounted | 71 focused tests passed (git fast path, coding loop, issue build) |
-| ctswarm suite after fixes | `pytest -q`; `ruff check ctswarm tests` | 48/48 passing; lint clean |
+| ctswarm suite after fixes | `pytest -q`; `ruff check ctswarm tests` | 52/52 passing; lint clean |
 
 ## Bench results (2026-07-29, RTX 5070 / 11.9GB VRAM)
 
@@ -137,12 +139,16 @@ expected worktree and refuses to overwrite divergent local changes.
 | Claude `sonnet` with full host profile mounted | Correct model, but startup scanned 653 MB / 7,631 host-profile files. |
 | Claude `sonnet`, credential-only mount, before committed-change fix | Wrote, tested, and committed two files; exposed that issue-level builds did not propagate their base branch to the change gate. |
 | Claude `sonnet`, final patched image, `exec_20260730_162640_n8dhesy5` | **SUCCESS** in 134 s: branch `issue/0690a662-prove-claude-end-to-end`, commit `9849f03`, two files, 19 tests passed, reviewer approved |
+| OpenCode after native streaming + tool-history translation, `exec_20260730_165029_oipllfbe` | **SUCCESS** in 434 s: branch `issue/4ca4a0aa-prove-local-native-end-to-end`, commit `8798956`, two files, 21 tests passed, reviewer approved |
 
-This separates the concerns cleanly: the harness and Claude coding path work;
-the current local/OpenCode coder does not reliably use editing tools under real
-agent pressure. Local OpenCode remains useful for routing/bench/planning
-experiments, but should not be trusted as the production coding runtime merely
-because its short tool benchmark passes.
+This separates the concerns cleanly. The original local failure was an adapter
+failure, not proof that Qwen could not code: OpenCode's streaming requests
+inherited the OpenAI-compatible Ollama path and bypassed native tool/context/
+reasoning handling. After routing streaming through native `/api/chat` and
+translating OpenAI string arguments back to native objects between turns, the
+same local model completed the real coder→commit→reviewer path. It remains
+slower and less schema-reliable than Claude, so benchmark eligibility alone is
+still not a reason to make it the default for complex work.
 
 ## Assumptions not yet verified
 

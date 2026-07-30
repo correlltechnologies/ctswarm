@@ -1,7 +1,8 @@
 # ctswarm handoff
 
-**As of 2026-07-30, 12:29 EDT.** The stack is running in Docker. The safety
-fixes described below are tested and committed locally but have not been pushed.
+**As of 2026-07-30, 16:58 EDT.** The stack is running in Docker. The fail-closed
+SWE-AF fixes are pushed on `agent/fix-local-model-coding`; the final local-model
+adapter fix is validated and ready for its follow-up commit.
 
 Read this top to bottom once; it is ordered by what you most need to know.
 
@@ -9,9 +10,9 @@ Read this top to bottom once; it is ordered by what you most need to know.
 
 ## 1. Where things actually stand
 
-**The infrastructure works, fail-closed execution is now enforced, and the
-Claude runtime has produced reviewed code. The local OpenCode runtime still
-cannot write code under the real harness.**
+**The infrastructure works, fail-closed execution is enforced, and both Claude
+and local OpenCode have produced committed, tested, independently reviewed code
+under the real harness.**
 
 What is verified working, by execution and not by assumption:
 
@@ -26,8 +27,13 @@ What is verified working, by execution and not by assumption:
   execution `exec_20260730_162640_n8dhesy5`, branch
   `issue/0690a662-prove-claude-end-to-end`, commit `9849f03`, two files changed,
   19 sandbox tests passed, review approved
-- The same one-file proof under OpenCode made no repository changes twice and
-  now correctly ended `failed_unrecoverable`
+- A live local Qwen/OpenCode issue build completed coder → commit → reviewer:
+  execution `exec_20260730_165029_oipllfbe`, branch
+  `issue/4ca4a0aa-prove-local-native-end-to-end`, commit `8798956`, two files
+  changed, 21 sandbox tests passed, review approved
+- The local coder caught and repaired its own bad newline assertion. The
+  reviewer initially wrote the schema definition instead of an instance, then
+  corrected it on the harness's schema retry. Both failures remained fail closed.
 
 What was wrong in the first build:
 
@@ -50,16 +56,20 @@ What is fixed:
   defaults false.
 - Runtime switching now supplies native Claude/Codex model names rather than
   leaking `ctswarm/*` OpenCode aliases into those CLIs.
+- OpenCode streaming now stays on Ollama's native `/api/chat` path, preserving
+  structured tools, explicit context sizing, separated reasoning, and reasoning
+  allowance. OpenAI-style string tool arguments are decoded back to the object
+  shape Ollama requires on subsequent turns.
 - Claude containers mount only the 942-byte credential file, not the 653 MB /
   7,631-file host profile that made each invocation scan unrelated skills.
 - Three reproducible patches under `infra/patches/` are applied by bootstrap and
   every `stack.sh` operation. The patcher refuses to overwrite a divergent
   vendor tree.
 
-Honest boundary: **Claude coding output is proven; the current local/OpenCode
-coder is proven inadequate for real coding work and should remain a fail-safe
-fallback, not the production coding runtime. A new full multi-issue build has
-not yet been run under Claude.**
+Honest boundary: **Claude and local/OpenCode issue-level coding output are
+proven. Local Qwen is materially slower and needed schema self-correction, so
+Claude remains the safer production default for complex work. A new full
+multi-issue build has not yet been run on the patched stack.**
 
 ---
 
@@ -137,8 +147,8 @@ locally, and expiry always resolves to **pause**, never approve.
 ## 5. The next build
 
 Run a bounded full build with the Claude runtime and inspect the resulting
-integration branch/PR. The discriminating experiment is complete: Claude wrote,
-tested, committed, and passed review; OpenCode/local did not write.
+integration branch/PR. The issue-level discriminating experiments are complete:
+both Claude and local OpenCode wrote, tested, committed, and passed review.
 
 Do not switch by only changing `SWE_DEFAULT_RUNTIME` and assuming the container
 tier variables are harmless. Submit through `ctswarm build`; the orchestrator
@@ -149,11 +159,15 @@ OpenCode).
 Useful live proof:
 
 ```text
+runtime    Claude
 execution  exec_20260730_162640_n8dhesy5
-outcome    completed / success=true
-branch     issue/0690a662-prove-claude-end-to-end
 commit     9849f034c2210aad9f1f4c64ccec6262600d3937
-review     approved=true, blocking=false
+tests      19 passed; reviewer approved
+
+runtime    OpenCode → ctswarm/med → Ollama qwen3.5:9b
+execution  exec_20260730_165029_oipllfbe
+commit     87989566018e3d2187c5cc4d1c0fc6950a308bc6
+tests      21 passed; reviewer approved
 ```
 
 ---
@@ -235,6 +249,11 @@ In the order I would do them:
 - **Token budgets must clear reasoning overhead.** Thinking models spend their allowance
   before emitting content: `qwen3.5:4b` used 181 reasoning tokens for a 2-token answer. The
   Ollama backend compensates automatically; remember it if you add a backend.
+- **OpenCode always requests streaming.** An Ollama streaming implementation
+  must preserve native `/api/chat` semantics. Falling back to `/v1/chat/completions`
+  silently turns structured tool calls into prose and bypasses context sizing.
+- **OpenAI and native Ollama tool histories differ.** OpenAI sends function
+  arguments as a JSON string; native Ollama requires an object on the next turn.
 - **Ollama silently truncates to a 4096 context** unless `num_ctx` is set on the native
   endpoint. `/v1` ignores the field. This is handled, but it is invisible when wrong: the
   model answers confidently from a truncated prompt.

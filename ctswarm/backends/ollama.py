@@ -27,6 +27,7 @@ the router uses to prefer an already-warm model when scores are close.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import httpx
@@ -83,6 +84,47 @@ def estimate_prompt_tokens(messages: list[dict]) -> int:
         elif content is not None:
             characters += len(str(content))
     return int(characters / 3.0) + 512
+
+
+def _to_native_messages(messages: list[dict]) -> list[dict]:
+    """Translate OpenAI tool history into Ollama's native message shape.
+
+    OpenAI encodes function arguments as a JSON string. Ollama's ``/api/chat``
+    endpoint requires an object and rejects a valid OpenAI tool history with
+    HTTP 400 otherwise. This only appears on the turn *after* a successful tool
+    call, which made first-turn tool probes pass while real agent loops failed.
+    """
+    native_messages: list[dict] = []
+    for message in messages:
+        native = dict(message)
+        tool_calls = []
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    # Preserve the malformed value so Ollama returns a
+                    # classified bad request instead of silently changing it.
+                    pass
+            tool_calls.append(
+                {
+                    "function": {
+                        "name": function.get("name"),
+                        "arguments": arguments,
+                    }
+                }
+            )
+        if tool_calls:
+            native["tool_calls"] = tool_calls
+
+        # Ollama correlates tool results by order. ``tool_call_id`` is an
+        # OpenAI-only field and is not part of Ollama's native Message shape.
+        if native.get("role") == "tool":
+            native.pop("tool_call_id", None)
+        native_messages.append(native)
+    return native_messages
 
 
 class OllamaBackend(OpenAICompatBackend):
@@ -172,7 +214,7 @@ class OllamaBackend(OpenAICompatBackend):
 
         payload: dict = {
             "model": model_ref,
-            "messages": request.messages,
+            "messages": _to_native_messages(request.messages),
             "stream": False,
             "options": options,
         }
@@ -247,6 +289,33 @@ class OllamaBackend(OpenAICompatBackend):
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
         )
+
+    async def stream(self, request: ChatRequest, model_ref: str):
+        """Serve native Ollama output as an OpenAI-compatible SSE stream.
+
+        OpenCode always requests streaming. Inheriting ``OpenAICompatBackend``'s
+        stream implementation sent those calls to Ollama's ``/v1`` endpoint,
+        bypassing this class's native tool-call translation, reasoning
+        separation, context sizing, and reasoning-token allowance. The observed
+        result was Qwen describing ``[use Bash tool]`` in prose while the same
+        prompt through ``chat()`` emitted a valid structured ``write`` call.
+
+        Ollama is evaluated to completion before the first SSE byte. This keeps
+        pre-response failover correct and then emits one standards-compatible
+        chunk. Local inference loses token-by-token display, but agent clients
+        receive the streaming protocol they require and the native semantics
+        needed for tools.
+        """
+        started = time.perf_counter()
+        response = await self.chat(request, model_ref)
+        if not response.ok:
+            yield ("error", response)
+            return
+
+        yield ("ok", None)
+        for line in _to_sse_lines(response.body, model_ref):
+            yield ("chunk", line)
+        yield ("done", int((time.perf_counter() - started) * 1000))
 
     async def health(self) -> bool:
         """Ollama's root path returns a plain-text banner when alive."""
@@ -357,6 +426,60 @@ class OllamaBackend(OpenAICompatBackend):
         await self._native.aclose()
         await self._native_chat.aclose()
         await super().close()
+
+
+def _to_sse_lines(body: dict, model_ref: str) -> list[str]:
+    """Convert one completed OpenAI-shaped response into SSE data lines."""
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    completion_id = body.get("id") or f"ollama-{int(time.time())}"
+
+    delta: dict = {"role": message.get("role", "assistant")}
+    content = message.get("content")
+    if content:
+        delta["content"] = content
+
+    tool_calls = []
+    for index, call in enumerate(message.get("tool_calls") or []):
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, separators=(",", ":"))
+        tool_calls.append(
+            {
+                "index": index,
+                "id": call.get("id") or f"call_{index}",
+                "type": "function",
+                "function": {
+                    "name": function.get("name"),
+                    "arguments": arguments,
+                },
+            }
+        )
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
+
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_ref,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": choice.get("finish_reason") or "stop",
+            }
+        ],
+    }
+    usage = body.get("usage")
+    if usage:
+        chunk["usage"] = usage
+
+    return [
+        f"data: {json.dumps(chunk, separators=(',', ':'))}\n",
+        "data: [DONE]\n",
+    ]
 
 
 def _to_openai_shape(native: dict, model_ref: str) -> dict:
