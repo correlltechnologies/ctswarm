@@ -24,10 +24,10 @@ human only when continuing would cross a real authority boundary.
       │  SWE-AF + AgentField  (22 agents)         │
       │  pinned, vendored, never forked           │
       └───────────────────────────────────────────┘
-             │ runtime choice          │ model choice
+             │ role-level planning     │ local implementation
              ▼                         ▼
       capacity manager          ctswarm router (OpenAI-compatible)
-      claude_code │ codex        ollama · mlx · openrouter · openai
+      claude_code │ codex        ollama · mlx · lm studio
              │                         │
              ▼                         ▼
       isolated worktrees ──▶ integration branch ──▶ protected PR ──▶ main
@@ -59,8 +59,12 @@ Then:
 
 Builds enter the durable scheduler on `127.0.0.1:8092`. It enforces the
 shared-resource concurrency limit and resumes monitoring the same AgentField
-execution after a restart. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for
-service endpoints, build controls, recovery, and log rotation.
+execution after a restart. The same endpoint serves Mission Control, combining
+build state, per-agent traces, exact model and harness assignments, timeline
+history, approvals, build controls, and a fleet-wide model usage graph in one
+shadcn operator dashboard. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for service endpoints, build
+controls, recovery, and log rotation.
 
 ## Verification committees
 
@@ -97,13 +101,15 @@ So switching happens at two levels, and conflating them produces a design that c
 
 | Level | What switches | Mechanism | Covers |
 |---|---|---|---|
-| **Runtime** | Which harness runs the build | `capacity manager` picks the `runtime` field in the SWE-AF build request | Claude subscription, ChatGPT/Codex subscription, open models |
+| **Runtime** | Which harness runs each role | `capacity manager` supplies a per-role provider policy | Claude/Codex for planning and review; OpenCode for implementation |
 | **Model** | Which model serves a request inside `open_code` | `ctswarm router`, an OpenAI-compatible gateway | Ollama, MLX, OpenRouter, OpenAI-compatible endpoints |
 
-The capacity manager tracks remaining subscription headroom for Claude and Codex and
-remaining quota/budget for OpenRouter, and picks the runtime per build. Inside an
-`open_code` build, the router picks the model per request. Both write to the same ledger,
-so routing decisions improve from real build outcomes rather than guesses.
+The build's base runtime is OpenCode. The capacity manager reserves Claude or Codex for
+product planning, architecture, plan review, and independent code/acceptance review;
+coding, QA, integration, repair, and git work stay local. If hosted capacity is exhausted
+before submission, planning/review also use local models. If a hosted call reports quota
+exhaustion mid-build, that call is retried through local OpenCode. The OpenCode router is
+local-only by default (`CTSWARM_ROUTER_LOCAL_ONLY=1`).
 
 ### Virtual models
 

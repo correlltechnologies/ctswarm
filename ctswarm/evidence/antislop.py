@@ -171,6 +171,10 @@ CHECKS: tuple[Check, ...] = (
 
 
 def _should_scan(path: Path) -> bool:
+    # The dashboard's hashed JS/CSS is generated from dashboard-ui source and
+    # contains minified third-party libraries. Scan the source, not the bundle.
+    if "static" in path.parts and "dashboard" in path.parts:
+        return False
     if any(part in SKIP_DIR_PARTS for part in path.parts):
         return False
     return path.suffix.lower() in SOURCE_SUFFIXES

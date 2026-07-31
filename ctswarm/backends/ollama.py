@@ -306,7 +306,6 @@ class OllamaBackend(OpenAICompatBackend):
         receive the streaming protocol they require and the native semantics
         needed for tools.
         """
-        started = time.perf_counter()
         response = await self.chat(request, model_ref)
         if not response.ok:
             yield ("error", response)
@@ -315,7 +314,10 @@ class OllamaBackend(OpenAICompatBackend):
         yield ("ok", None)
         for line in _to_sse_lines(response.body, model_ref):
             yield ("chunk", line)
-        yield ("done", int((time.perf_counter() - started) * 1000))
+        # Native Ollama has already completed the request here, so preserve its
+        # exact usage accounting for the router's ledger. Previously the bridge
+        # discarded prompt tokens and estimated output from serialized SSE.
+        yield ("done", response)
 
     async def health(self) -> bool:
         """Ollama's root path returns a plain-text banner when alive."""

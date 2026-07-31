@@ -15,6 +15,7 @@ patches=(
   "$repo_root/infra/patches/swe-af-review-and-commit-gates.patch"
   "$repo_root/infra/patches/swe-af-issue-build-base.patch"
   "$repo_root/infra/patches/swe-af-autonomous-ui.patch"
+  "$repo_root/infra/patches/swe-af-hybrid-runtime.patch"
 )
 
 # Later patches can intentionally modify lines introduced by earlier patches.

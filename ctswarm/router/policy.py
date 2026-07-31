@@ -225,6 +225,7 @@ class Router:
         table: RoutingTable | None = None,
         budget_usd_remaining: float = 0.0,
         prefer_local: bool = True,
+        local_only: bool = False,
         backends: set[str] | None = None,
     ) -> None:
         self.host = host
@@ -232,6 +233,7 @@ class Router:
         self.table = table or RoutingTable()
         self.budget_usd_remaining = budget_usd_remaining
         self.prefer_local = prefer_local
+        self.local_only = local_only
         self._catalog: tuple[CatalogEntry, ...] = build_catalog(host, backends)
 
     # -- eligibility -------------------------------------------------------
@@ -250,6 +252,10 @@ class Router:
         """Why this candidate cannot serve the request, or None if it can."""
         spec = entry.spec
 
+        if spec.backend == "openrouter" and (
+            self.local_only or privacy == Privacy.LOCAL_ONLY
+        ):
+            return "hosted backend excluded by local-only execution policy"
         if spec.quarantined:
             return "quarantined: known to wedge the shared inference queue"
         if entry.placement == "unavailable":
@@ -276,8 +282,14 @@ class Router:
                 return f"schema rate {score.schema_rate:.0%} below {SCHEMA_FLOOR:.0%} floor"
             if not score.cancel_clean:
                 return "fails cancellation cleanly"
-            if min_context > score.max_context_ok > 0:
-                return f"measured context ceiling {score.max_context_ok} too low"
+            # ``max_context_ok`` is the largest context exercised by the bench,
+            # not a measured failure boundary. The default suite runs one
+            # 20k-token needle test, so treating that successful sample as a
+            # hard ceiling rejects every later tool turn once its transcript
+            # grows past 20k—even when the backend advertises 128k+ and the
+            # long-context probe passed. The catalog's context limit above is
+            # the actual hard capacity gate; this value remains useful evidence
+            # in telemetry without inventing a ceiling the bench never tested.
         elif not self.table.is_empty:
             # The table exists but this model is absent, meaning it was never
             # measured. Unmeasured models are not silently trusted once

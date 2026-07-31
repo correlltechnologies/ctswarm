@@ -1,0 +1,633 @@
+diff --git a/swe_af/app.py b/swe_af/app.py
+index acc0a4c..c83e00b 100644
+--- a/swe_af/app.py
++++ b/swe_af/app.py
+@@ -13,6 +13,7 @@ import os
+ import re
+ import subprocess
+ import uuid
++from itertools import count
+ from pathlib import Path
+ 
+ from dotenv import load_dotenv
+@@ -49,6 +50,7 @@ from swe_af.execution.schemas import (
+     _default_planning_model,
+     _default_runtime,
+     _derive_repo_name as _repo_name_from_url,
++    _runtime_to_provider,
+     _workspace_root,
+ )
+ 
+@@ -92,7 +94,25 @@ async def _harness_with_scoped_credentials(*args, env=None, **kwargs):
+     run_id = (getattr(ctx, "run_id", None) if ctx else None) or ""
+     base_env = dict(os.environ) if env is None else dict(env)
+     merged_env = inject_credentials_into_env(base_env, run_id)
+-    return await _original_harness(*args, env=merged_env, **kwargs)
++    result = await _original_harness(*args, env=merged_env, **kwargs)
++    provider = str(kwargs.get("provider") or "")
++    error_message = str(getattr(result, "error_message", "") or "")
++    hosted_exhausted = re.search(
++        r"(quota|rate.?limit|usage.?limit|credit balance|insufficient credits|"
++        r"billing.{0,20}(expired|inactive|suspended))",
++        error_message,
++        re.IGNORECASE,
++    )
++    if provider in {"claude", "claude-code", "codex"} and hosted_exhausted:
++        fallback_kwargs = dict(kwargs)
++        fallback_kwargs["provider"] = "opencode"
++        fallback_kwargs["model"] = os.environ.get("SWE_MODEL_HIGH", "ctswarm/high")
++        app.note(
++            f"{provider} capacity unavailable; retrying this role on local OpenCode",
++            tags=["runtime", "fallback", "local"],
++        )
++        return await _original_harness(*args, env=merged_env, **fallback_kwargs)
++    return result
+ 
+ 
+ app.harness = _harness_with_scoped_credentials
+@@ -333,7 +353,7 @@ async def _run_ci_gate(
+             previous_attempts=attempts,
+             model=resolved_models.get("ci_fixer_model", resolved_models.get("coder_model", "")),
+             permission_mode=cfg.permission_mode,
+-            ai_provider=cfg.ai_provider,
++            ai_provider=cfg.provider_for("ci_fixer"),
+         ), "run_ci_fixer")
+         attempts.append(fix)
+ 
+@@ -807,6 +827,7 @@ async def build(
+             issue_writer_model=resolved["issue_writer_model"],
+             permission_mode=cfg.permission_mode,
+             ai_provider=cfg.ai_provider,
++            providers=cfg.providers,
+             workspace_manifest=manifest.model_dump() if manifest else None,
+         )
+ 
+@@ -830,7 +851,7 @@ async def build(
+                 artifacts_dir=abs_artifacts_dir,
+                 model=resolved["git_model"],
+                 permission_mode=cfg.permission_mode,
+-                ai_provider=cfg.ai_provider,
++                ai_provider=cfg.provider_for("git"),
+                 previous_error=previous_error,
+                 build_id=build_id,
+             )
+@@ -1032,7 +1053,7 @@ async def build(
+                         feedback=approval_result.feedback,
+                         model=resolved["architect_model"],
+                         permission_mode=cfg.permission_mode,
+-                        ai_provider=cfg.ai_provider,
++                        ai_provider=cfg.provider_for("architect"),
+                         workspace_manifest=manifest.model_dump() if manifest else None,
+                     ), "run_architect (human revision)")
+ 
+@@ -1046,7 +1067,7 @@ async def build(
+                             revision_number=tl_iter,
+                             model=resolved["tech_lead_model"],
+                             permission_mode=cfg.permission_mode,
+-                            ai_provider=cfg.ai_provider,
++                            ai_provider=cfg.provider_for("tech_lead"),
+                             workspace_manifest=manifest.model_dump() if manifest else None,
+                         ), "run_tech_lead")
+                         if review["approved"]:
+@@ -1060,7 +1081,7 @@ async def build(
+                                 feedback=review["feedback"],
+                                 model=resolved["architect_model"],
+                                 permission_mode=cfg.permission_mode,
+-                                ai_provider=cfg.ai_provider,
++                                ai_provider=cfg.provider_for("architect"),
+                                 workspace_manifest=manifest.model_dump() if manifest else None,
+                             ), "run_architect (tech lead revision)")
+ 
+@@ -1081,7 +1102,7 @@ async def build(
+                         artifacts_dir=artifacts_dir,
+                         model=resolved["sprint_planner_model"],
+                         permission_mode=cfg.permission_mode,
+-                        ai_provider=cfg.ai_provider,
++                        ai_provider=cfg.provider_for("sprint_planner"),
+                         workspace_manifest=manifest.model_dump() if manifest else None,
+                     ), "run_sprint_planner (revision)")
+ 
+@@ -1139,7 +1160,8 @@ async def build(
+ 
+         # 3. VERIFY
+         verification = None
+-        for cycle in range(cfg.max_verify_fix_cycles + 1):
++        verify_cycles = count() if cfg.continuous_repair else range(cfg.max_verify_fix_cycles + 1)
++        for cycle in verify_cycles:
+             app.note(f"Verification cycle {cycle}", tags=["build", "verify"])
+             verification = _unwrap(await app.call(
+                 f"{NODE_ID}.run_verifier",
+@@ -1151,7 +1173,7 @@ async def build(
+                 skipped_issues=dag_result.get("skipped_issues", []),
+                 model=resolved["verifier_model"],
+                 permission_mode=cfg.permission_mode,
+-                ai_provider=cfg.ai_provider,
++                ai_provider=cfg.provider_for("verifier"),
+                 workspace_manifest=manifest.model_dump() if manifest else None,
+             ), "run_verifier")
+             verification = _apply_deterministic_acceptance_failures(
+@@ -1165,7 +1187,9 @@ async def build(
+                 ),
+             )
+ 
+-            if verification.get("passed", False) or cycle >= cfg.max_verify_fix_cycles:
++            if verification.get("passed", False) or (
++                not cfg.continuous_repair and cycle >= cfg.max_verify_fix_cycles
++            ):
+                 break
+ 
+             # Verification failed — generate targeted fix issues
+@@ -1175,12 +1199,22 @@ async def build(
+             ]
+ 
+             if not failed_criteria:
+-                app.note("Verification failed but no specific criteria failures found", tags=["build", "verify"])
+-                break
+-
++                if not cfg.continuous_repair:
++                    app.note("Verification failed but no specific criteria failures found", tags=["build", "verify"])
++                    break
++                failed_criteria = [{
++                    "criterion": verification.get("summary")
++                    or "Acceptance verifier returned a failing result without criterion details",
++                    "passed": False,
++                }]
++
++            remaining = (
++                "continuous repair enabled"
++                if cfg.continuous_repair
++                else f"{cfg.max_verify_fix_cycles - cycle} fix cycles remaining"
++            )
+             app.note(
+-                f"Verification failed ({len(failed_criteria)} criteria), "
+-                f"{cfg.max_verify_fix_cycles - cycle} fix cycles remaining",
++                f"Verification failed ({len(failed_criteria)} criteria), {remaining}",
+                 tags=["build", "verify", "retry"],
+             )
+ 
+@@ -1193,13 +1227,48 @@ async def build(
+                 artifacts_dir=plan_result.get("artifacts_dir", artifacts_dir),
+                 model=resolved["verifier_model"],
+                 permission_mode=cfg.permission_mode,
+-                ai_provider=cfg.ai_provider,
++                ai_provider=cfg.provider_for("verifier"),
+                 workspace_manifest=manifest.model_dump() if manifest else None,
+             ), "generate_fix_issues")
+ 
+             fix_issues = fix_result.get("fix_issues", [])
+             fix_debt = fix_result.get("debt_items", [])
+ 
++            # A model/schema failure in the fix generator must not strand a
++            # nearly-complete build. In continuous mode, turn the verifier's
++            # concrete evidence into a normal coding issue and keep the same
++            # integrated workspace alive for the next repair pass.
++            if not fix_issues and cfg.continuous_repair:
++                criteria_text = "\n".join(
++                    f"- {item.get('criterion', item.get('description', str(item)))}"
++                    for item in failed_criteria
++                )
++                fix_issues = [{
++                    "name": f"verification-repair-{cycle + 1}",
++                    "title": f"Repair failed acceptance verification (cycle {cycle + 1})",
++                    "description": (
++                        "Inspect the current integrated implementation and repair every "
++                        "failed acceptance criterion. Preserve working behavior and use "
++                        "the verifier evidence below as the authoritative defect report:\n"
++                        f"{criteria_text}"
++                    ),
++                    "acceptance_criteria": [
++                        str(item.get("criterion", item.get("description", item)))
++                        for item in failed_criteria
++                    ],
++                    "depends_on": [],
++                    "provides": [f"verified-repair-cycle-{cycle + 1}"],
++                    "estimated_complexity": "medium",
++                    "files_to_create": [],
++                    "files_to_modify": [],
++                    "testing_strategy": "Run the relevant deterministic and integration checks.",
++                }]
++                app.note(
++                    "Fix generator returned no work; synthesized a repair issue from "
++                    "the failed criteria",
++                    tags=["build", "verify", "repair", "fallback"],
++                )
++
+             # Record unfixable criteria as debt
+             for debt in fix_debt:
+                 dag_result.setdefault("accumulated_debt", []).append({
+@@ -1306,7 +1375,7 @@ async def build(
+                         artifacts_dir=plan_result.get("artifacts_dir", artifacts_dir),
+                         model=resolved["git_model"],
+                         permission_mode=cfg.permission_mode,
+-                        ai_provider=cfg.ai_provider,
++                        ai_provider=cfg.provider_for("git"),
+                     ), f"run_repo_finalize ({ws_repo.repo_name})")
+                     if finalize_result.get("success"):
+                         app.note(
+@@ -1338,7 +1407,7 @@ async def build(
+                     artifacts_dir=plan_result.get("artifacts_dir", artifacts_dir),
+                     model=resolved["git_model"],
+                     permission_mode=cfg.permission_mode,
+-                    ai_provider=cfg.ai_provider,
++                    ai_provider=cfg.provider_for("git"),
+                 ), "run_repo_finalize")
+                 if finalize_result.get("success"):
+                     app.note(
+@@ -1420,7 +1489,7 @@ async def build(
+                         artifacts_dir=plan_result.get("artifacts_dir", artifacts_dir),
+                         model=resolved["git_model"],
+                         permission_mode=cfg.permission_mode,
+-                        ai_provider=cfg.ai_provider,
++                        ai_provider=cfg.provider_for("git"),
+                     ), "run_github_pr")
+                     pr_results.append(RepoPRResult(
+                         repo_name=ws_repo.repo_name,
+@@ -1489,7 +1558,7 @@ async def build(
+                         artifacts_dir=plan_result.get("artifacts_dir", artifacts_dir),
+                         model=resolved["git_model"],
+                         permission_mode=cfg.permission_mode,
+-                        ai_provider=cfg.ai_provider,
++                        ai_provider=cfg.provider_for("git"),
+                     ), "run_github_pr")
+                     pr_url = pr_result.get("pr_url", "")
+                     if pr_url:
+@@ -1628,6 +1697,7 @@ async def plan(
+     issue_writer_model: str | None = None,
+     permission_mode: str = "",
+     ai_provider: str | None = None,
++    providers: dict[str, str] | None = None,
+     workspace_manifest: dict | None = None,
+ ) -> dict:
+     """Run the full planning pipeline.
+@@ -1643,6 +1713,11 @@ async def plan(
+     """
+     # Resolve provider/model defaults from the environment (see docstring).
+     ai_provider = ai_provider or _default_runtime()
++    providers = providers or {}
++
++    def provider_for(role: str) -> str:
++        runtime = providers.get(role, providers.get("default", ""))
++        return _runtime_to_provider(runtime) if runtime else ai_provider
+     default_model = _default_planning_model()
+     pm_model = pm_model or default_model
+     architect_model = architect_model or default_model
+@@ -1662,7 +1737,7 @@ async def plan(
+         additional_context=additional_context,
+         model=pm_model,
+         permission_mode=permission_mode,
+-        ai_provider=ai_provider,
++        ai_provider=provider_for("pm"),
+         workspace_manifest=workspace_manifest,
+     ), "run_product_manager")
+ 
+@@ -1681,7 +1756,7 @@ async def plan(
+             artifacts_dir=artifacts_dir,
+             model=pm_model,
+             permission_mode=permission_mode,
+-            ai_provider=ai_provider,
++            ai_provider=provider_for("pm"),
+             workspace_manifest=workspace_manifest,
+         ), "run_environment_scout")
+ 
+@@ -1694,7 +1769,7 @@ async def plan(
+         artifacts_dir=artifacts_dir,
+         model=architect_model,
+         permission_mode=permission_mode,
+-        ai_provider=ai_provider,
++        ai_provider=provider_for("architect"),
+         workspace_manifest=workspace_manifest,
+     ), "run_architect")
+ 
+@@ -1710,7 +1785,7 @@ async def plan(
+             revision_number=i,
+             model=tech_lead_model,
+             permission_mode=permission_mode,
+-            ai_provider=ai_provider,
++            ai_provider=provider_for("tech_lead"),
+             workspace_manifest=workspace_manifest,
+         ), "run_tech_lead")
+         if review["approved"]:
+@@ -1725,7 +1800,7 @@ async def plan(
+                 feedback=review["feedback"],
+                 model=architect_model,
+                 permission_mode=permission_mode,
+-                ai_provider=ai_provider,
++                ai_provider=provider_for("architect"),
+                 workspace_manifest=workspace_manifest,
+             ), "run_architect (revision)")
+ 
+@@ -1750,7 +1825,7 @@ async def plan(
+         artifacts_dir=artifacts_dir,
+         model=sprint_planner_model,
+         permission_mode=permission_mode,
+-        ai_provider=ai_provider,
++        ai_provider=provider_for("sprint_planner"),
+         workspace_manifest=workspace_manifest,
+     ), "run_sprint_planner")
+     issues = sprint_result["issues"]
+@@ -1795,7 +1870,7 @@ async def plan(
+             sibling_issues=siblings,
+             model=issue_writer_model,
+             permission_mode=permission_mode,
+-            ai_provider=ai_provider,
++            ai_provider=provider_for("issue_writer"),
+             workspace_manifest=workspace_manifest,
+         ))
+     writer_results = await asyncio.gather(*writer_tasks, return_exceptions=True)
+@@ -2045,7 +2120,7 @@ async def resolve(
+         additional_context=additional_context,
+         model=resolver_model,
+         permission_mode=cfg.permission_mode,
+-        ai_provider=cfg.ai_provider,
++        ai_provider=cfg.provider_for("code_reviewer"),
+     ), "run_pr_resolver")
+ 
+     # ---- 5. Ensure push happened (agent may have skipped on failure) -------
+diff --git a/swe_af/execution/coding_loop.py b/swe_af/execution/coding_loop.py
+index cd67d1d..f29813d 100644
+--- a/swe_af/execution/coding_loop.py
++++ b/swe_af/execution/coding_loop.py
+@@ -369,7 +369,7 @@ async def _run_default_path(
+                 memory_context=memory_context,
+                 model=config.code_reviewer_model,
+                 permission_mode=permission_mode,
+-                ai_provider=config.ai_provider,
++                ai_provider=config.provider_for("code_reviewer"),
+                 workspace_manifest=workspace_manifest,
+                 target_repo=target_repo,
+             ),
+@@ -448,7 +448,7 @@ async def _run_flagged_path(
+                 project_context=project_context,
+                 model=config.qa_model,
+                 permission_mode=permission_mode,
+-                ai_provider=config.ai_provider,
++                ai_provider=config.provider_for("qa"),
+                 workspace_manifest=workspace_manifest,
+                 target_repo=target_repo,
+             ),
+@@ -468,7 +468,7 @@ async def _run_flagged_path(
+                 memory_context=memory_context,
+                 model=config.code_reviewer_model,
+                 permission_mode=permission_mode,
+-                ai_provider=config.ai_provider,
++                ai_provider=config.provider_for("code_reviewer"),
+                 workspace_manifest=workspace_manifest,
+                 target_repo=target_repo,
+             ),
+@@ -539,7 +539,7 @@ async def _run_flagged_path(
+                 artifacts_dir=project_context.get("artifacts_dir", ""),
+                 model=config.qa_synthesizer_model,
+                 permission_mode=permission_mode,
+-                ai_provider=config.ai_provider,
++                ai_provider=config.provider_for("qa_synthesizer"),
+                 workspace_manifest=workspace_manifest,
+                 target_repo=target_repo,
+             ),
+@@ -687,7 +687,7 @@ async def run_coding_loop(
+                     memory_context=memory_context,
+                     model=config.coder_model,
+                     permission_mode=permission_mode,
+-                    ai_provider=config.ai_provider,
++                    ai_provider=config.provider_for("coder"),
+                     workspace_manifest=ws_manifest_dict,
+                     target_repo=target_repo,
+                 ),
+diff --git a/swe_af/execution/dag_executor.py b/swe_af/execution/dag_executor.py
+index 8537e6a..04dff09 100644
+--- a/swe_af/execution/dag_executor.py
++++ b/swe_af/execution/dag_executor.py
+@@ -99,7 +99,7 @@ async def _dispatch_workspace_setup(
+         artifacts_dir=artifacts_dir,
+         level=level,
+         model=config.git_model,
+-        ai_provider=config.ai_provider,
++        ai_provider=config.provider_for("git"),
+         build_id=build_id,
+     )
+ 
+@@ -380,7 +380,7 @@ async def _merge_level_branches(
+             artifacts_dir=dag_state.artifacts_dir,
+             level=level_result.level_index,
+             model=config.merger_model,
+-            ai_provider=config.ai_provider,
++            ai_provider=config.provider_for("merger"),
+         )
+ 
+         merge_result = await _dispatch_merge(
+@@ -468,7 +468,7 @@ async def _merge_level_branches(
+             artifacts_dir=dag_state.artifacts_dir,
+             level=level_result.level_index,
+             model=config.merger_model,
+-            ai_provider=config.ai_provider,
++            ai_provider=config.provider_for("merger"),
+         )
+         return await _dispatch_merge(
+             call_fn, node_id, config,
+@@ -589,7 +589,7 @@ async def _run_integration_tests(
+         artifacts_dir=dag_state.artifacts_dir,
+         level=level_result.level_index,
+         model=config.integration_tester_model,
+-        ai_provider=config.ai_provider,
++        ai_provider=config.provider_for("integration_tester"),
+         workspace_manifest=dag_state.workspace_manifest,
+     )
+ 
+@@ -1014,7 +1014,7 @@ async def _execute_single_issue(
+                     previous_adaptations=[a.model_dump() for a in adaptations],
+                     worktree_path=current_issue.get("worktree_path", dag_state.repo_path),
+                     model=config.issue_advisor_model,
+-                    ai_provider=config.ai_provider,
++                    ai_provider=config.provider_for("issue_advisor"),
+                     workspace_manifest=dag_state.workspace_manifest,
+                 ),
+                 timeout=config.agent_timeout_seconds,
+@@ -1241,7 +1241,7 @@ async def _run_execute_fn(
+                         architecture_path=dag_state.architecture_path,
+                         artifacts_dir=dag_state.artifacts_dir,
+                         model=config.retry_advisor_model,
+-                        ai_provider=config.ai_provider,
++                        ai_provider=config.provider_for("retry_advisor"),
+                         workspace_manifest=dag_state.workspace_manifest,
+                     )
+                     if not advice.get("should_retry", False):
+@@ -1422,7 +1422,7 @@ async def _invoke_replanner_via_call(
+         dag_state=dag_state.model_dump(),
+         failed_issues=[f.model_dump() for f in unrecoverable],
+         replan_model=config.replan_model,
+-        ai_provider=config.ai_provider,
++        ai_provider=config.provider_for("replan"),
+         escalation_notes=escalation_notes,
+     )
+     return ReplanDecision(**decision_dict)
+@@ -1483,7 +1483,7 @@ async def _write_issue_files_for_replan(
+             issues_dir=dag_state.issues_dir,
+             repo_path=dag_state.repo_path,
+             model=config.issue_writer_model,
+-            ai_provider=config.ai_provider,
++            ai_provider=config.provider_for("issue_writer"),
+         )
+         for new_issue in issues_to_write
+     ]
+@@ -1593,7 +1593,7 @@ async def run_dag(
+             call_fn=call_fn,
+             node_id=node_id,
+             git_model=config.git_model,
+-            ai_provider=config.ai_provider,
++            ai_provider=config.provider_for("git"),
+             build_id=build_id,
+             note_fn=note_fn,
+         )
+@@ -1741,7 +1741,7 @@ async def run_dag(
+                     dag_state, branches_to_clean, call_fn, node_id, note_fn,
+                     level=dag_state.current_level,
+                     model=config.git_model,
+-                    ai_provider=config.ai_provider,
++                    ai_provider=config.provider_for("git"),
+                     completed_results=level_result.completed,
+                     deterministic_git=config.deterministic_git,
+                 )
+@@ -1932,7 +1932,7 @@ async def run_dag(
+                 dag_state, all_branches, call_fn, node_id, note_fn,
+                 level=dag_state.current_level,
+                 model=config.git_model,
+-                ai_provider=config.ai_provider,
++                ai_provider=config.provider_for("git"),
+                 deterministic_git=config.deterministic_git,
+             )
+ 
+diff --git a/swe_af/execution/schemas.py b/swe_af/execution/schemas.py
+index dc16717..8c8cd1f 100644
+--- a/swe_af/execution/schemas.py
++++ b/swe_af/execution/schemas.py
+@@ -560,6 +560,7 @@ _MODEL_FIELD_TO_ROLE: dict[str, str] = {
+     model_field: role for role, model_field in ROLE_TO_MODEL_FIELD.items()
+ }
+ _ALLOWED_MODEL_KEYS: set[str] = set(MODEL_ROLE_KEYS) | {"default"}
++_ALLOWED_PROVIDER_KEYS: set[str] = _ALLOWED_MODEL_KEYS
+ 
+ MODEL_TIERS: tuple[str, ...] = ("low", "med", "high")
+ 
+@@ -834,6 +835,27 @@ def _validate_flat_models(models: dict[str, str] | None) -> dict[str, str]:
+     return models
+ 
+ 
++def _validate_flat_providers(providers: dict[str, str] | None) -> dict[str, str]:
++    """Validate per-role runtime overrides used by hybrid builds."""
++    if providers is None:
++        return {}
++    if not isinstance(providers, dict):
++        raise ValueError("providers must be an object mapping role keys to runtimes")
++    unknown = sorted(k for k in providers if k not in _ALLOWED_PROVIDER_KEYS)
++    if unknown:
++        raise ValueError(
++            f"Unknown provider keys: {', '.join(repr(k) for k in unknown)}. "
++            f"Valid keys: {', '.join(sorted(_ALLOWED_PROVIDER_KEYS))}"
++        )
++    invalid = sorted({value for value in providers.values() if value not in RUNTIME_VALUES})
++    if invalid:
++        raise ValueError(
++            f"Unsupported provider runtimes: {', '.join(repr(v) for v in invalid)}. "
++            f"Valid runtimes: {', '.join(RUNTIME_VALUES)}"
++        )
++    return providers
++
++
+ def resolve_runtime_models(
+     *,
+     runtime: str,
+@@ -908,6 +930,7 @@ class BuildConfig(BaseModel):
+ 
+     runtime: Literal["claude_code", "open_code", "codex"] = Field(default_factory=_default_runtime)
+     models: dict[str, str] | None = None
++    providers: dict[str, str] | None = None
+ 
+     max_review_iterations: int = 2
+     max_plan_revision_iterations: int = 2  # human reviewer "request changes" loops
+@@ -915,6 +938,7 @@ class BuildConfig(BaseModel):
+     max_replans: int = 2
+     enable_replanning: bool = True
+     max_verify_fix_cycles: int = 1
++    continuous_repair: bool = False
+     git_init_max_retries: int = 3  # Number of retry attempts for git_init
+     git_init_retry_delay: float = 1.0  # Seconds to wait between retries
+     max_integration_test_retries: int = 1
+@@ -1023,11 +1047,16 @@ class BuildConfig(BaseModel):
+ 
+     def model_post_init(self, __context: Any) -> None:
+         _validate_flat_models(self.models)
++        _validate_flat_providers(self.providers)
+ 
+     @property
+     def ai_provider(self) -> Literal["claude", "opencode", "codex"]:
+         return _runtime_to_provider(self.runtime)
+ 
++    def provider_for(self, role: str) -> Literal["claude", "opencode", "codex"]:
++        providers = _validate_flat_providers(self.providers)
++        return _runtime_to_provider(providers.get(role, providers.get("default", self.runtime)))
++
+     @property
+     def primary_repo(self) -> RepoSpec | None:
+         """Return the primary RepoSpec, or None if repos is empty."""
+@@ -1051,6 +1080,7 @@ class BuildConfig(BaseModel):
+         return {
+             "runtime": self.runtime,
+             "models": self.models,
++            "providers": self.providers,
+             "permission_mode": self.permission_mode,
+             "max_retries_per_issue": self.max_retries_per_issue,
+             "max_replans": self.max_replans,
+@@ -1217,6 +1247,7 @@ class ExecutionConfig(BaseModel):
+ 
+     runtime: Literal["claude_code", "open_code", "codex"] = Field(default_factory=_default_runtime)
+     models: dict[str, str] | None = None
++    providers: dict[str, str] | None = None
+     _resolved_models: dict[str, str] = PrivateAttr(default_factory=dict)
+ 
+     max_retries_per_issue: int = 1
+@@ -1258,6 +1289,7 @@ class ExecutionConfig(BaseModel):
+ 
+     def model_post_init(self, __context: Any) -> None:
+         """Resolve runtime model selection once at construction time."""
++        _validate_flat_providers(self.providers)
+         self._resolved_models = resolve_runtime_models(
+             runtime=self.runtime,
+             models=self.models,
+@@ -1270,6 +1302,10 @@ class ExecutionConfig(BaseModel):
+     def ai_provider(self) -> Literal["claude", "opencode", "codex"]:
+         return _runtime_to_provider(self.runtime)
+ 
++    def provider_for(self, role: str) -> Literal["claude", "opencode", "codex"]:
++        providers = _validate_flat_providers(self.providers)
++        return _runtime_to_provider(providers.get(role, providers.get("default", self.runtime)))
++
+     @property
+     def pm_model(self) -> str:
+         return self._model_for("pm_model")
+diff --git a/tests/test_model_config.py b/tests/test_model_config.py
+index 04495fc..e4909c1 100644
+--- a/tests/test_model_config.py
++++ b/tests/test_model_config.py
+@@ -127,6 +127,23 @@ class TestBuildConfig(unittest.TestCase):
+             resolved = cfg.resolved_models()
+         self.assertEqual(resolved["coder_model"], "openrouter/minimax/minimax-m2.5")
+ 
++    def test_role_provider_overrides_round_trip_to_execution(self) -> None:
++        cfg = BuildConfig(
++            runtime="open_code",
++            providers={"default": "open_code", "pm": "claude_code", "verifier": "codex"},
++        )
++        self.assertEqual(cfg.provider_for("coder"), "opencode")
++        self.assertEqual(cfg.provider_for("pm"), "claude")
++        self.assertEqual(cfg.provider_for("verifier"), "codex")
++
++        exec_cfg = ExecutionConfig(**cfg.to_execution_config_dict())
++        self.assertEqual(exec_cfg.provider_for("coder"), "opencode")
++        self.assertEqual(exec_cfg.provider_for("pm"), "claude")
++
++    def test_invalid_role_provider_is_rejected(self) -> None:
++        with self.assertRaises(ValueError):
++            BuildConfig(providers={"coder": "invalid"})
++
+ 
+ class TestOpenRouterAutoSelection(unittest.TestCase):
+     """When only an OpenRouter key is present (no explicit runtime), SWE-AF

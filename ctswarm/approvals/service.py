@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
@@ -184,9 +185,7 @@ async def approval_status(dedupe_key: str) -> JSONResponse:
             }
         )
 
-    import time as _time
-
-    if record["expires_at"] < _time.time():
+    if record["expires_at"] < time.time():
         return JSONResponse(
             {
                 "resolved": True,
@@ -227,6 +226,14 @@ async def decide(dedupe_key: str, request: Request) -> JSONResponse:
     if record.get("decision"):
         return JSONResponse(
             {"error": "already decided", "decision": record["decision"]},
+            status_code=409,
+        )
+    if record["expires_at"] < time.time():
+        return JSONResponse(
+            {
+                "error": "approval expired; the build remains paused",
+                "decision": Decision.EXPIRED.value,
+            },
             status_code=409,
         )
 

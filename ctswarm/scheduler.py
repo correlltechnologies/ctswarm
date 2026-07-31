@@ -13,21 +13,42 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Response, status
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .approvals.status import StatusNotifier
+from .approvals.store import ApprovalStore
 from .capacity import Runtime
 from .ledger import Ledger
+from .observability import AgentFieldTraceClient, harness_label, model_overview
 from .orchestrator import BuildRecord, BuildState, Orchestrator, load_build
 
 BUILD_ENQUEUED = "build_enqueued"
 BUILD_TERMINAL = "build_terminal"
+BUILD_INFRASTRUCTURE_RETRY = "build_infrastructure_retry"
+
+
+def _retryable_infrastructure_stop(record: BuildRecord) -> bool:
+    """True when AgentField stopped work because an agent node disappeared.
+
+    An owner stop remains terminal. A control-plane cancellation caused by a
+    node/container restart is infrastructure churn, not a verdict on the build,
+    and must be resubmitted under the same durable queue record.
+    """
+    return record.state is BuildState.STOPPED and any(
+        marker in record.error.lower()
+        for marker in ("cancelled_by_control_plane", "canceled_by_control_plane")
+    )
 
 
 class BuildRequest(BaseModel):
@@ -39,7 +60,8 @@ class BuildRequest(BaseModel):
     repo_url: str = Field(min_length=1)
     require_strong_planning: bool = True
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
-    max_hours: float = Field(default=12.0, gt=0, le=72)
+    # Zero means no scheduler deadline; the owner can still pause or stop.
+    max_hours: float = Field(default=0.0, ge=0, le=720)
 
 
 def _event_detail(event: dict) -> dict:
@@ -208,23 +230,43 @@ class BuildScheduler:
     async def _run_request(self, build_id: str, request: BuildRequest) -> None:
         try:
             record = load_build(self.ledger, build_id)
-            if record is None or not record.execution_id:
-                record = await self.orchestrator.submit(
-                    goal=request.goal,
-                    repo_url=request.repo_url,
-                    require_strong_planning=request.require_strong_planning,
-                    max_ci_fix_cycles=request.max_ci_fix_cycles,
-                    build_id=build_id,
-                )
-            if not record.state.terminal:
-                await self.notifier.post(record)
-                record = await self.orchestrator.run_until_done(
-                    record,
-                    poll_interval_s=self.poll_interval_s,
-                    max_hours=request.max_hours,
-                    on_status=self.notifier.post,
-                )
-            self._record_terminal(record)
+            while True:
+                if record is None or not record.execution_id:
+                    record = await self.orchestrator.submit(
+                        goal=request.goal,
+                        repo_url=request.repo_url,
+                        require_strong_planning=request.require_strong_planning,
+                        max_ci_fix_cycles=request.max_ci_fix_cycles,
+                        build_id=build_id,
+                    )
+                if not record.state.terminal:
+                    await self.notifier.post(record)
+                    record = await self.orchestrator.run_until_done(
+                        record,
+                        poll_interval_s=self.poll_interval_s,
+                        max_hours=request.max_hours,
+                        on_status=self.notifier.post,
+                    )
+                if (
+                    _retryable_infrastructure_stop(record)
+                    and self.orchestrator.control_state(build_id) != "stopped"
+                ):
+                    self.ledger.record_event(
+                        BUILD_INFRASTRUCTURE_RETRY,
+                        {
+                            "prior_execution_id": record.execution_id,
+                            "reason": record.error,
+                        },
+                        build_id=build_id,
+                    )
+                    record.execution_id = ""
+                    record.state = BuildState.QUEUED
+                    record.error = ""
+                    record.phase_detail = "agent node restarted; retrying automatically"
+                    await asyncio.sleep(min(self.poll_interval_s, 5.0))
+                    continue
+                self._record_terminal(record)
+                break
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - queue items must terminate visibly
@@ -272,6 +314,57 @@ class BuildScheduler:
 
 
 scheduler = BuildScheduler()
+trace_client = AgentFieldTraceClient(scheduler.orchestrator.agentfield_url)
+
+
+async def _live_routes() -> dict[str, dict[str, Any]]:
+    """Resolve virtual tiers to the concrete model the router would use now."""
+    base_url = os.environ.get("CTSWARM_ROUTER_URL", "http://ctswarm-router:8090")
+    routes: dict[str, dict[str, Any]] = {}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for tier in ("high", "med", "low"):
+            alias = f"ctswarm/{tier}"
+            try:
+                response = await client.get(
+                    f"{base_url}/routing/explain",
+                    params={"tier": tier, "tools": "true", "context": 8192},
+                )
+                response.raise_for_status()
+                decision = response.json()
+                primary = decision.get("primary") or {}
+                routes[alias] = {
+                    "alias": alias,
+                    "backend": primary.get("backend") or "",
+                    "model": primary.get("model_ref") or "",
+                    "degraded_to": decision.get("degraded"),
+                    "reason": primary.get("reason") or "",
+                }
+            except (httpx.HTTPError, ValueError):
+                routes[alias] = {
+                    "alias": alias,
+                    "backend": "",
+                    "model": "",
+                    "degraded_to": None,
+                    "reason": "router unavailable",
+                }
+    return routes
+
+
+def _enrich_trace_routes(trace: dict, routes: dict[str, dict[str, Any]]) -> dict:
+    for node in trace.get("timeline", []):
+        requested = str(node.get("model") or "")
+        node["requested_model"] = requested
+        route = routes.get(requested)
+        if route:
+            node["resolved_model"] = route.get("model") or "not dispatched"
+            node["resolved_backend"] = route.get("backend") or "pending"
+            node["resolution"] = "live router policy"
+        else:
+            node["resolved_model"] = requested
+            node["resolved_backend"] = node.get("provider") or node.get("runtime") or ""
+            node["resolution"] = "direct provider"
+    trace["routes"] = routes
+    return trace
 
 
 @asynccontextmanager
@@ -286,6 +379,26 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="ctswarm scheduler", version="1.0.0", lifespan=lifespan)
+DASHBOARD_DIST = Path(__file__).parent / "static" / "dashboard"
+if (DASHBOARD_DIST / "assets").is_dir():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=DASHBOARD_DIST / "assets"),
+        name="dashboard-assets",
+    )
+
+
+@app.get("/", response_class=FileResponse)
+@app.get("/dashboard", response_class=FileResponse)
+async def dashboard() -> FileResponse:
+    """Serve the compiled shadcn operator console."""
+    index = DASHBOARD_DIST / "index.html"
+    if not index.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="dashboard assets are not built; run npm run build in dashboard-ui",
+        )
+    return FileResponse(index)
 
 
 @app.get("/health")
@@ -314,6 +427,168 @@ async def get_build(build_id: str) -> dict:
     if snapshot is None:
         raise HTTPException(status_code=404, detail="unknown build")
     return snapshot
+
+
+@app.get("/builds/{build_id}/trace")
+async def get_build_trace(build_id: str) -> dict:
+    """Join one ctswarm build to its full AgentField execution trace."""
+    snapshot = scheduler.snapshot(build_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="unknown build")
+    execution_id = str(snapshot.get("execution_id") or "")
+    if not execution_id:
+        runtime = str(snapshot.get("runtime") or "")
+        return {
+            "execution_id": "",
+            "workflow_id": "",
+            "status": snapshot.get("state", "queued"),
+            "runtime": runtime,
+            "harness": harness_label(runtime),
+            "model_policy": {},
+            "total_nodes": 0,
+            "summary": {"statuses": {}, "roles": {}, "models": {}, "harnesses": {}},
+            "timeline": [],
+        }
+    try:
+        trace, routes = await asyncio.gather(
+            trace_client.build_trace(execution_id), _live_routes()
+        )
+        return _enrich_trace_routes(trace, routes)
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AgentField trace unavailable: {exc}",
+        ) from exc
+
+
+@app.get("/builds/{build_id}/approvals")
+async def get_build_approvals(build_id: str) -> dict:
+    if scheduler.snapshot(build_id) is None:
+        raise HTTPException(status_code=404, detail="unknown build")
+    store = ApprovalStore(os.environ.get("CTSWARM_DB", "var/ctswarm.db"))
+    approvals = store.all_for_build(build_id)
+    now = time.time()
+    for approval in approvals:
+        approval["expired"] = bool(
+            not approval.get("decision")
+            and float(approval.get("expires_at") or 0) < now
+        )
+    return {"approvals": approvals}
+
+
+@app.get("/api/dashboard/executions/{execution_id}")
+async def get_execution_detail(execution_id: str) -> dict:
+    try:
+        return await trace_client.execution_details(execution_id)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AgentField execution detail unavailable: {exc}",
+        ) from exc
+
+
+@app.get("/api/dashboard/models")
+async def get_model_overview(window_hours: float = 168.0) -> dict:
+    """Fleet-wide graph and statistics across builds and concrete routes."""
+    routes = await _live_routes()
+    return await model_overview(
+        builds=scheduler.list_snapshots(200),
+        trace_client=trace_client,
+        ledger=scheduler.ledger,
+        routing_path=os.environ.get("CTSWARM_ROUTING", "bench/results/routing.json"),
+        capacity=scheduler.orchestrator.capacity.report(),
+        routes=routes,
+        window_hours=max(1.0, min(window_hours, 24.0 * 90.0)),
+    )
+
+
+async def _dashboard_stream_snapshot(build_id: str | None) -> dict:
+    """Assemble one compact live dashboard frame.
+
+    AgentField remains the source of truth for coordination. The inference
+    ledger is included separately because external harness calls do not always
+    carry a build id, and hiding those calls would under-report local work.
+    """
+    builds = scheduler.list_snapshots(200)
+    payload: dict[str, Any] = {
+        "sequence": time.time_ns(),
+        "generated_at": time.time(),
+        "builds": builds,
+        "inference_calls": scheduler.ledger.recent_calls(limit=50),
+    }
+    if not build_id:
+        return payload
+    snapshot = scheduler.snapshot(build_id)
+    if snapshot is None:
+        payload["missing_build"] = build_id
+        return payload
+    payload["build"] = snapshot
+    try:
+        trace, approvals = await asyncio.gather(
+            get_build_trace(build_id),
+            get_build_approvals(build_id),
+        )
+        payload["trace"] = trace
+        payload["approvals"] = approvals.get("approvals", [])
+    except HTTPException as exc:
+        payload["stream_error"] = str(exc.detail)
+    return payload
+
+
+@app.get("/api/dashboard/stream")
+async def dashboard_stream(request: Request, build_id: str | None = None) -> StreamingResponse:
+    """Continuously stream build, agent, and concrete model activity over SSE."""
+
+    async def events():
+        while not await request.is_disconnected():
+            try:
+                payload = await _dashboard_stream_snapshot(build_id)
+                yield f"event: snapshot\ndata: {json.dumps(payload, default=str)}\n\n"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # keep telemetry failures from ending the stream
+                error = json.dumps({"message": str(exc), "generated_at": time.time()})
+                yield f"event: stream-error\ndata: {error}\n\n"
+            await asyncio.sleep(2.0)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/dashboard/approvals/{dedupe_key}/decide")
+async def decide_dashboard_approval(
+    dedupe_key: str,
+    request: Request,
+) -> JSONResponse:
+    """Same-origin approval action for the unified dashboard."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{scheduler.orchestrator.approvals_url}/approvals/"
+                f"{dedupe_key}/decide",
+                json=payload,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"approval service unavailable: {exc}",
+        ) from exc
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"error": response.text[:300]}
+    return JSONResponse(body, status_code=response.status_code)
 
 
 def _control(build_id: str, action: Callable[[str, str], Any]) -> dict:

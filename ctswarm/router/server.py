@@ -40,6 +40,12 @@ VIRTUAL_PREFIX = "ctswarm/"
 NON_RETRYABLE = FATAL_FAILURES | {FailureKind.BAD_REQUEST, FailureKind.CANCELLED}
 
 
+def _allowed_models(name: str, refs: set[str], ollama_allowlist: set[str]) -> set[str]:
+    if name == "ollama" and ollama_allowlist:
+        return refs & ollama_allowlist
+    return refs
+
+
 class RouterState:
     """Shared, mutable-by-design runtime state for the gateway."""
 
@@ -58,12 +64,18 @@ class RouterState:
             # ollama binary is absent but the server is one network hop away.
             backends=set(self.backends),
             prefer_local=os.environ.get("CTSWARM_PREFER_LOCAL", "1") != "0",
+            local_only=os.environ.get("CTSWARM_ROUTER_LOCAL_ONLY", "1") != "0",
         )
         # Cached so every request does not re-probe the backends. Refreshed on a
         # timer and, critically, immediately after a connection failure so a
         # backend that died mid-build is detected rather than retried blindly.
         self._installed: dict[str, set[str]] = {}
         self._warm: dict[str, set[str]] = {}
+        self._ollama_allowlist = {
+            ref.strip()
+            for ref in os.environ.get("CTSWARM_OLLAMA_MODEL_ALLOWLIST", "").split(",")
+            if ref.strip()
+        }
         self._discovered_at = 0.0
         self._discovery_lock = asyncio.Lock()
 
@@ -76,9 +88,14 @@ class RouterState:
             installed: dict[str, set[str]] = {}
             warm: dict[str, set[str]] = {}
             for name, backend in self.backends.items():
-                installed[name] = set(await backend.list_models())
+                installed[name] = _allowed_models(
+                    name, set(await backend.list_models()), self._ollama_allowlist
+                )
                 loaded = getattr(backend, "loaded_models", None)
-                warm[name] = set(await loaded()) if loaded else set()
+                discovered_warm = set(await loaded()) if loaded else set()
+                warm[name] = _allowed_models(
+                    name, discovered_warm, self._ollama_allowlist
+                )
             self._installed, self._warm = installed, warm
             self._discovered_at = time.time()
 
@@ -518,6 +535,10 @@ async def _stream_response(
                             output_chars += len(value)
                         yield f"{value}\n".encode()
                     elif chunk_kind == "done":
+                        # Native Ollama evaluates before bridging to SSE, so its
+                        # sentinel carries the exact ChatResponse accounting.
+                        # True streaming backends still provide elapsed millis.
+                        exact = value if hasattr(value, "prompt_tokens") else None
                         state.ledger.record_call(
                             backend=backend_name,
                             model_ref=model_ref,
@@ -526,13 +547,24 @@ async def _stream_response(
                             role=role,
                             tier=tier,
                             virtual_model=requested_model,
-                            # Streamed responses carry no usage block until the
-                            # final chunk, and not every provider sends one, so
-                            # this is a character-derived estimate rather than a
-                            # measured count. Marked as such instead of being
-                            # presented as exact.
-                            output_tokens=output_chars // 4,
-                            latency_ms=value or 0,
+                            prompt_tokens=(
+                                int(exact.prompt_tokens)
+                                if exact is not None
+                                else _estimate_context(chat_request.messages)
+                            ),
+                            output_tokens=(
+                                int(exact.output_tokens)
+                                if exact is not None
+                                else output_chars // 4
+                            ),
+                            latency_ms=(
+                                int(exact.latency_ms)
+                                if exact is not None
+                                else int(value or 0)
+                            ),
+                            cost_usd=(
+                                float(exact.cost_usd) if exact is not None else 0.0
+                            ),
                             attempt=attempt_number,
                         )
             except Exception as exc:  # noqa: BLE001

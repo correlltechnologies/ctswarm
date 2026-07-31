@@ -57,7 +57,8 @@ services:
     environment:
       # host-gateway resolves to the docker host from inside the network, so the
       # local inference server needs no public exposure.
-      - CTSWARM_OLLAMA_HOST=http://host.docker.internal:11434
+      - CTSWARM_OLLAMA_HOST=${CTSWARM_OLLAMA_HOST_DOCKER:-http://host.docker.internal:11434}
+      - CTSWARM_OLLAMA_MODEL_ALLOWLIST=${CTSWARM_OLLAMA_MODEL_ALLOWLIST:-}
       - CTSWARM_MLX_HOST=${CTSWARM_MLX_HOST:-http://host.docker.internal:8081}
       - CTSWARM_LMSTUDIO_HOST=${CTSWARM_LMSTUDIO_HOST:-http://host.docker.internal:1234}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
@@ -65,6 +66,9 @@ services:
       # Produced by `ctswarm bench` on the host and bind-mounted read-only.
       - CTSWARM_ROUTING=/bench-results/routing.json
       - CTSWARM_PREFER_LOCAL=${CTSWARM_PREFER_LOCAL:-1}
+      # OpenCode is the worker harness. Hosted models are invoked directly by
+      # Claude/Codex only for role-level planning and review overrides.
+      - CTSWARM_ROUTER_LOCAL_ONLY=${CTSWARM_ROUTER_LOCAL_ONLY:-1}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -124,6 +128,7 @@ services:
       - CTSWARM_DB=/state/ctswarm.db
       - CTSWARM_AGENTFIELD_URL=http://control-plane:8080
       - CTSWARM_APPROVALS_URL=http://ctswarm-approvals:8091
+      - CTSWARM_ROUTER_URL=http://ctswarm-router:8090
       - CTSWARM_ROUTING=/bench-results/routing.json
       - CTSWARM_MAX_CONCURRENT_BUILDS=${CTSWARM_MAX_CONCURRENT_BUILDS:-1}
       - CTSWARM_SCHEDULER_POLL_SECONDS=${CTSWARM_SCHEDULER_POLL_SECONDS:-10}
@@ -181,6 +186,13 @@ services:
       # default cannot kill a healthy build before the scheduler does.
       - AGENTFIELD_ASYNC_DEFAULT_EXECUTION_TIMEOUT=${CTSWARM_AGENTFIELD_REASONER_TIMEOUT_SECONDS:-259500}
       - AGENTFIELD_ASYNC_MAX_EXECUTION_TIMEOUT=${CTSWARM_AGENTFIELD_REASONER_TIMEOUT_SECONDS:-259500}
+      # Local reasoning models may spend more than five minutes between
+      # OpenCode JSON events even while Ollama is actively generating.
+      - AGENTFIELD_HARNESS_IDLE_SECONDS=${CTSWARM_OPENCODE_IDLE_SECONDS:-900}
+      # This host serves one Qwen generation at a time. Queue at the harness
+      # instead of launching workers that contend for the same inference slot.
+      - OPENCODE_MAX_CONCURRENT=${CTSWARM_OPENCODE_MAX_CONCURRENT:-1}
+      - AGENTFIELD_OPENCODE_REUSE_DATA_DIR=true
       - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
     extra_hosts:
       - "host.docker.internal:host-gateway"

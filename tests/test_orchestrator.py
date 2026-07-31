@@ -6,9 +6,11 @@ import time
 
 from ctswarm.capacity import Runtime
 from ctswarm.orchestrator import (
+    HOSTED_ROLES,
     BuildRecord,
     BuildState,
     Orchestrator,
+    hybrid_role_policy,
     runtime_model_overrides,
     update_record_from_execution,
 )
@@ -54,6 +56,26 @@ def test_codex_auto_auth_tracks_api_key_presence(monkeypatch) -> None:
     assert (
         runtime_model_overrides(Runtime.CODEX)["default"] == "gpt-5.3-codex"
     )
+
+
+def test_hybrid_policy_keeps_execution_local() -> None:
+    providers, models = hybrid_role_policy(Runtime.CLAUDE_CODE)
+
+    assert providers["default"] == "open_code"
+    assert providers["pm"] == "claude_code"
+    assert providers["verifier"] == "claude_code"
+    assert "coder" not in providers
+    assert models["default"] == "ctswarm/med"
+    assert models["pm"] == "sonnet"
+    assert set(providers) == {"default", *HOSTED_ROLES}
+
+
+def test_hybrid_policy_survives_hosted_quota_exhaustion() -> None:
+    providers, models = hybrid_role_policy(Runtime.OPEN_CODE)
+
+    assert providers == {"default": "open_code"}
+    assert models["pm"] == "ctswarm/high"
+    assert models["default"] == "ctswarm/med"
 
 
 def test_succeeded_execution_completes_polling() -> None:

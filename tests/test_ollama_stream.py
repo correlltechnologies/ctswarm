@@ -111,6 +111,8 @@ async def test_ollama_stream_uses_native_chat_result() -> None:
             backend="ollama",
             model_ref="qwen3.5:9b",
             latency_ms=1,
+            prompt_tokens=37,
+            output_tokens=11,
         )
     )
     request = ChatRequest(
@@ -126,6 +128,8 @@ async def test_ollama_stream_uses_native_chat_result() -> None:
     assert events[0] == ("ok", None)
     assert '"content":"done"' in events[1][1]
     assert events[-1][0] == "done"
+    assert events[-1][1].prompt_tokens == 37
+    assert events[-1][1].output_tokens == 11
 
 
 async def test_ollama_stream_fails_before_first_byte() -> None:

@@ -8,9 +8,9 @@ concurrency limit, restart recovery, and build controls.
 
 | Service | Host endpoint | Purpose |
 |---|---|---|
-| Router | `http://127.0.0.1:8090` | OpenAI-compatible model routing to local and hosted backends |
+| Router | `http://127.0.0.1:8090` | OpenAI-compatible local model routing for worker roles |
 | Approvals | `http://127.0.0.1:8091` | Local approval UI and optional Slack bridge |
-| Scheduler | `http://127.0.0.1:8092` | Durable queue and build-control API |
+| Scheduler | `http://127.0.0.1:8092` | Mission Control, durable queue, and build-control API |
 | Control plane | `http://127.0.0.1:18080` | AgentField execution API |
 | Build database | internal only | SWE-AF build state |
 | `swe-agent` | internal only | Planning and orchestration agents |
@@ -33,6 +33,19 @@ Compose project directory that the overlay requires.
 
 `./stack.sh up` fails nonzero unless the router, control plane, and scheduler
 become ready. Every service uses `restart: unless-stopped`.
+
+Open `http://127.0.0.1:8092/` for the shadcn Mission Control. Its Model fleet
+view keeps AgentField role executions separate from measured inference calls.
+The routing graph is call-weighted and displays virtual tiers, backends, and
+concrete model names; the role chart separately counts agent executions. Live
+tier cards show the exact physical model the router would select now, so
+`ctswarm/med` is never presented as though it were a real model. The view also
+reports throughput, latency, tokens, quality, failures, cost, and quota
+headroom. It joins scheduler builds
+with AgentField execution traces and shows the exact model, runtime harness,
+provider, task, status, and duration for each agent. The Model routing,
+Timeline, and Approvals views share the same build selection; approval and
+pause/resume/stop actions remain on the loopback-only scheduler surface.
 
 After changing one service:
 
@@ -70,6 +83,24 @@ before it is dispatched.
 
 ## Durability and capacity
 
+For a busy workstation, ctswarm can use a dedicated Ollama process so desktop
+chat traffic cannot strand build workers behind the same request queue. Install
+the included user unit, pull the selected model through its private endpoint,
+and point the Compose router at it:
+
+```bash
+systemctl --user link "$PWD/infra/ctswarm-ollama.service"
+systemctl --user enable --now ctswarm-ollama.service
+OLLAMA_HOST=http://172.17.0.1:11435 ollama pull qwen3.5:9b
+# .env
+CTSWARM_OLLAMA_HOST_DOCKER=http://host.docker.internal:11435
+CTSWARM_OLLAMA_MODEL_ALLOWLIST=qwen3.5:4b
+```
+
+The service binds only to Docker's host bridge (`172.17.0.1`), not to a public
+interface. Its model store is independent at
+`~/.cache/ctswarm-ollama/models`.
+
 Queue entries, control signals, execution IDs, and terminal results live in the
 shared SQLite ledger. When the scheduler restarts it reconstructs an in-flight
 build from the ledger and resumes polling the same AgentField execution; it does
@@ -90,6 +121,15 @@ current queue:
 curl -fsS http://127.0.0.1:8092/health
 # {"ok":true,"queued":0,"active":1,"max_concurrent":1}
 ```
+
+Builds use local OpenCode for implementation and reserve Claude/Codex for
+planning plus selected reviews. When both subscriptions are at their configured
+reserve or cooldown, planning falls back to local OpenCode. A hosted quota error
+during an active call is retried locally. Verification failures remain in the
+same integrated workspace and continuously generate repair work; builds have no
+wall-clock deadline by default and continue until they pass or the owner stops
+them. Authentication failures, missing repository authority, and explicit owner
+stops remain terminal because retrying cannot resolve them.
 
 ## Logs and disk use
 

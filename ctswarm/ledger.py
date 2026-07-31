@@ -350,3 +350,52 @@ class Ledger:
             "local_fraction": local / total,
             "total_cost_usd": sum(r["cost"] for r in rows),
         }
+
+    def model_usage(self, window_s: float = 604800.0) -> list[dict]:
+        """Concrete model usage grouped by route for the operator dashboard."""
+        since = time.time() - max(60.0, window_s)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT backend, model_ref, COALESCE(virtual_model, '') AS virtual_model,"
+                " COALESCE(role, '') AS role, COUNT(*) AS calls,"
+                " COALESCE(SUM(ok), 0) AS successes,"
+                " COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,"
+                " COALESCE(SUM(output_tokens), 0) AS output_tokens,"
+                " COALESCE(SUM(cost_usd), 0) AS cost_usd,"
+                " COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,"
+                " COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END), 0) AS failures"
+                " FROM calls WHERE ts>=?"
+                " GROUP BY backend, model_ref, virtual_model, role"
+                " ORDER BY calls DESC",
+                (since,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_calls(
+        self,
+        *,
+        limit: int = 40,
+        build_id: str | None = None,
+    ) -> list[dict]:
+        """Newest concrete inference calls for the live operator feed.
+
+        A call may not have build metadata when it originates inside an external
+        harness, so callers can request a build when metadata is available while
+        still receiving the global tail needed to make local activity visible.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if build_id:
+            clauses.append("build_id=?")
+            params.append(build_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(limit, 200)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, build_id, role, tier, virtual_model, backend,"
+                " model_ref, prompt_tokens, output_tokens, latency_ms, ok,"
+                " failure_kind, cost_usd, attempt"
+                f" FROM calls {where} ORDER BY id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]

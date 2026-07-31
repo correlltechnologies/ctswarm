@@ -252,6 +252,18 @@ class CapacityManager:
         if not budget or budget.max_usd <= 0:
             return Headroom(runtime, True, 1.0, spent, calls, 0.0, "no budget cap set")
 
+        if calls == 0:
+            return Headroom(
+                runtime,
+                True,
+                1.0,
+                spent,
+                calls,
+                0.0,
+                "actual subscription quota is not queryable; no metered harness "
+                "usage has been observed in this window",
+            )
+
         fraction = max(0.0, 1.0 - (spent / budget.max_usd))
         if fraction <= 0.0:
             return Headroom(
@@ -345,7 +357,11 @@ class CapacityManager:
         table = RoutingTable.load(
             self.env.get("CTSWARM_ROUTING", "bench/results/routing.json")
         )
-        return any(score.eligible_for_agent_roles for score in table.all())
+        local_backends = {"ollama", "mlx", "lmstudio"}
+        return any(
+            score.eligible_for_agent_roles and score.backend in local_backends
+            for score in table.all()
+        )
 
     def report(self) -> dict:
         """Headroom across every runtime, for `ctswarm capacity`."""

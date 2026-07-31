@@ -1,0 +1,17 @@
+[Unit]
+Description=Isolated Ollama endpoint for ctswarm local workers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=OLLAMA_HOST=172.17.0.1:11435
+Environment=OLLAMA_MODELS=%h/.cache/ctswarm-ollama/models
+Environment=OLLAMA_KEEP_ALIVE=30m
+Environment=OLLAMA_NUM_PARALLEL=2
+ExecStart=/usr/local/bin/ollama serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -139,6 +139,37 @@ def runtime_model_overrides(runtime: Runtime) -> dict[str, str]:
     return {"default": "gpt-5.3-codex" if uses_api_key else "gpt-5.5"}
 
 
+HOSTED_ROLES = (
+    "pm",
+    "architect",
+    "tech_lead",
+    "sprint_planner",
+    "code_reviewer",
+    "verifier",
+)
+
+
+def hybrid_role_policy(
+    planning_runtime: Runtime,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return provider/model maps for local work plus bounded hosted judgment.
+
+    OpenCode is always the base runtime. A subscription harness, when available,
+    is assigned only to planning and independent review roles. If both hosted
+    subscriptions are unavailable the same map collapses cleanly to local models.
+    """
+    models = runtime_model_overrides(Runtime.OPEN_CODE)
+    providers = {"default": Runtime.OPEN_CODE.value}
+    if planning_runtime is Runtime.OPEN_CODE:
+        return providers, models
+
+    hosted_model = runtime_model_overrides(planning_runtime)["default"]
+    for role in HOSTED_ROLES:
+        providers[role] = planning_runtime.value
+        models[role] = hosted_model
+    return providers, models
+
+
 class Orchestrator:
     """Drives one build from goal to gated result."""
 
@@ -208,7 +239,11 @@ class Orchestrator:
         """Start a SWE-AF build with a capacity-chosen runtime."""
         build_id = build_id or f"build-{uuid.uuid4().hex[:10]}"
 
-        runtime, why = self.capacity.select(require_strong=require_strong_planning)
+        planning_runtime, why = self.capacity.select(
+            require_strong=require_strong_planning
+        )
+        runtime = Runtime.OPEN_CODE
+        providers, models = hybrid_role_policy(planning_runtime)
         record = BuildRecord(
             build_id=build_id, goal=goal, repo_url=repo_url, runtime=runtime
         )
@@ -220,19 +255,23 @@ class Orchestrator:
                 "repo_url": repo_url,
                 "runtime": runtime.value,
                 "runtime_reason": why,
+                "planning_runtime": planning_runtime.value,
+                "provider_policy": providers,
             },
             build_id=build_id,
         )
 
         config: dict = {
             "runtime": runtime.value,
+            "providers": providers,
             "check_ci": True,
             "max_ci_fix_cycles": max_ci_fix_cycles,
             # Acceptance failures must have enough room to become repair work.
             # A single retry is routinely consumed by the first cross-feature
             # browser failure on UI builds.
             "max_verify_fix_cycles": 3,
-            "models": runtime_model_overrides(runtime),
+            "continuous_repair": True,
+            "models": models,
         }
 
         payload = {
@@ -396,11 +435,11 @@ class Orchestrator:
         record: BuildRecord,
         *,
         poll_interval_s: float = 30.0,
-        max_hours: float = 12.0,
+        max_hours: float = 0.0,
         on_status=None,
     ) -> BuildRecord:
         """Poll until the build finishes, is paused, or is stopped."""
-        deadline = time.time() + max_hours * 3600.0
+        deadline = time.time() + max_hours * 3600.0 if max_hours > 0 else None
         last_status_at = 0.0
         last_state = record.state
 
@@ -433,7 +472,7 @@ class Orchestrator:
                 record.state = BuildState.EXECUTING
                 self.ledger.record_event("build_resumed", {}, build_id=record.build_id)
 
-            if time.time() > deadline:
+            if deadline is not None and time.time() > deadline:
                 reason = f"exceeded the {max_hours}h wall-clock limit"
                 cancelled = await self.cancel_execution(record, reason)
                 record.state = BuildState.FAILED
@@ -576,6 +615,11 @@ def load_build(ledger: Ledger, build_id: str) -> BuildRecord | None:
             record.state = BuildState.PAUSED
         elif event["kind"] == "build_resumed":
             record.state = BuildState.EXECUTING
+        elif event["kind"] == "build_infrastructure_retry":
+            record.state = BuildState.QUEUED
+            record.execution_id = ""
+            record.error = ""
+            record.phase_detail = "agent node restarted; retrying automatically"
         elif event["kind"] == "build_status":
             try:
                 status = json.loads(event["detail"])

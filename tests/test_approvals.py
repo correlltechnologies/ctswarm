@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 
+import httpx
 import pytest
 
 from ctswarm.approvals.rules import (
@@ -18,6 +19,7 @@ from ctswarm.approvals.rules import (
     Risk,
     classify,
 )
+from ctswarm.approvals.service import app
 from ctswarm.approvals.slack import verify_signature
 from ctswarm.approvals.store import ApprovalStore
 
@@ -186,6 +188,27 @@ class TestSlackSignature:
         assert not verify_signature(
             signing_secret="", timestamp="1", signature="v0=x", body=b""
         )
+
+
+async def test_expired_approval_cannot_be_decided(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "approvals.db"
+    monkeypatch.setenv("CTSWARM_DB", str(db_path))
+    store = ApprovalStore(db_path)
+    request = classify(action="x", detail="DROP TABLE t", build_id="b")
+    store.create(request, ttl_s=-1.0)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://approvals.test",
+    ) as client:
+        response = await client.post(
+            f"/approvals/{request.dedupe_key}/decide",
+            json={"decision": "approve", "decided_by": "test"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["decision"] == Decision.EXPIRED.value
+    assert store.current_decision(request.dedupe_key) is None
 
 
 def test_every_rule_has_a_reason():

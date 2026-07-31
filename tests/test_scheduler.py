@@ -44,11 +44,61 @@ class _ControlledOrchestrator:
         return record
 
 
+class _RestartingOrchestrator(_ControlledOrchestrator):
+    def __init__(self, ledger: Ledger) -> None:
+        super().__init__(ledger)
+        self.runs = 0
+
+    async def run_until_done(self, record: BuildRecord, **_kwargs):
+        self.started.append(record.build_id)
+        self.runs += 1
+        if self.runs == 1:
+            record.state = BuildState.STOPPED
+            record.error = "cancelled_by_control_plane"
+        else:
+            record.state = BuildState.COMPLETE
+        return record
+
+
 def _request(name: str) -> BuildRequest:
     return BuildRequest(
         goal=f"build {name}",
         repo_url=f"https://example.invalid/{name}",
     )
+
+
+def test_recent_calls_returns_newest_concrete_inference(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    ledger.record_call(
+        build_id="build-one",
+        role="coder",
+        tier="med",
+        virtual_model="ctswarm/med",
+        backend="ollama",
+        model_ref="qwen3.5:4b",
+        ok=True,
+        prompt_tokens=12,
+        output_tokens=34,
+    )
+    ledger.record_call(
+        build_id="build-two",
+        role="reviewer",
+        tier="high",
+        virtual_model="ctswarm/high",
+        backend="openrouter",
+        model_ref="review-model",
+        ok=False,
+        failure_kind="timeout",
+    )
+
+    assert [row["model_ref"] for row in ledger.recent_calls(limit=2)] == [
+        "review-model",
+        "qwen3.5:4b",
+    ]
+    selected = ledger.recent_calls(build_id="build-one")
+    assert len(selected) == 1
+    assert selected[0]["backend"] == "ollama"
+    assert selected[0]["output_tokens"] == 34
 
 
 def test_queue_survives_a_new_scheduler_instance(tmp_path) -> None:
@@ -176,4 +226,27 @@ async def test_stopped_queued_build_finishes_without_waiting_for_a_slot(
     assert orchestrator.started == [active]
     orchestrator.release.set()
     await asyncio.wait_for(scheduler._tasks[active], timeout=1)  # noqa: SLF001
+    await scheduler.close()
+
+
+async def test_control_plane_cancellation_is_retried_automatically(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    orchestrator = _RestartingOrchestrator(ledger)
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=orchestrator,
+        notifier=_Notifier(),
+        poll_interval_s=0.0,
+    )
+    build_id = scheduler.enqueue(_request("restart"), build_id="build-restart")
+
+    await scheduler.run_once()
+    await asyncio.wait_for(scheduler._tasks[build_id], timeout=1)  # noqa: SLF001
+    await scheduler.run_once()
+
+    assert orchestrator.submitted == [build_id, build_id]
+    assert orchestrator.started == [build_id, build_id]
+    assert scheduler.snapshot(build_id)["state"] == "complete"
+    retries = ledger.events(kind="build_infrastructure_retry", build_id=build_id)
+    assert len(retries) == 1
     await scheduler.close()
