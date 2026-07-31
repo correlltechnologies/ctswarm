@@ -1,0 +1,1010 @@
+diff --git a/Dockerfile b/Dockerfile
+index 9687f53..dad65d5 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -8,7 +8,11 @@ WORKDIR /app
+ # System deps: git (worktrees, branches), curl (healthcheck), jq (agent bash),
+ # openssh-client (optional SSH git), gh CLI (draft PRs)
+ RUN apt-get update && apt-get install -y --no-install-recommends \
+-    git curl openssh-client jq nodejs npm && \
++    git curl ca-certificates openssh-client jq chromium && \
++    # agent-browser requires Node.js 24+. Use the NodeSource major-version
++    # channel so npm and the browser CLI run on a supported runtime.
++    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
++    apt-get install -y --no-install-recommends nodejs && \
+     # Install GitHub CLI
+     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+@@ -18,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     # Install OpenCode CLI v1.2+ for opencode provider (with run --model support)
+     curl -fsSL https://opencode.ai/install | bash && \
+     # Install Codex CLI for codex runtime provider
+-    npm install -g @openai/codex && \
++    npm install -g @openai/codex agent-browser && \
+     codex_path="$(command -v codex)" && \
+     mv "${codex_path}" /usr/local/bin/codex-real && \
+     printf '%s\n' \
+diff --git a/swe_af/app.py b/swe_af/app.py
+index 7f6069d..acc0a4c 100644
+--- a/swe_af/app.py
++++ b/swe_af/app.py
+@@ -10,8 +10,10 @@ from __future__ import annotations
+ 
+ import asyncio
+ import os
++import re
+ import subprocess
+ import uuid
++from pathlib import Path
+ 
+ from dotenv import load_dotenv
+ 
+@@ -493,6 +495,127 @@ def _is_empty_build(success: bool, ever_completed: int, ever_merged: int) -> boo
+     return not success and ever_completed == 0 and ever_merged == 0
+ 
+ 
++_PLACEHOLDER_PATTERN = re.compile(
++    r"\b(?:coming soon|not (?:yet )?available|not implemented|"
++    r"would (?:begin|happen|start) here|"
++    r"placeholder (?:implementation|logic|screen)|implement(?:ed)? later)\b",
++    re.IGNORECASE,
++)
++_PRODUCTION_SUFFIXES = {
++    ".c",
++    ".cpp",
++    ".cs",
++    ".css",
++    ".go",
++    ".html",
++    ".htm",
++    ".java",
++    ".js",
++    ".jsx",
++    ".kt",
++    ".php",
++    ".py",
++    ".rb",
++    ".rs",
++    ".svelte",
++    ".swift",
++    ".ts",
++    ".tsx",
++    ".vue",
++}
++
++
++def _added_placeholder_failures(repo_path: str, base_sha: str) -> list[str]:
++    """Find newly-added production placeholders that cannot ship as features."""
++    if not base_sha:
++        return []
++    proc = subprocess.run(
++        ["git", "diff", "--unified=0", f"{base_sha}...HEAD", "--"],
++        cwd=repo_path,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    if proc.returncode != 0:
++        return [f"placeholder scan could not read the integrated diff: {proc.stderr.strip()}"]
++
++    failures: list[str] = []
++    current_path = ""
++    for line in proc.stdout.splitlines():
++        if line.startswith("+++ b/"):
++            current_path = line[6:]
++            continue
++        if not line.startswith("+") or line.startswith("+++"):
++            continue
++        lowered_path = current_path.lower()
++        if (
++            Path(current_path).suffix.lower() not in _PRODUCTION_SUFFIXES
++            or "/test" in lowered_path
++            or lowered_path.startswith(("test", "docs/"))
++        ):
++            continue
++        match = _PLACEHOLDER_PATTERN.search(line[1:])
++        if match:
++            failures.append(f"{current_path}: {match.group(0)}")
++    return failures[:20]
++
++
++def _apply_deterministic_acceptance_failures(
++    verification: dict,
++    dag_result: dict,
++    *,
++    repo_path: str,
++    base_sha: str,
++) -> dict:
++    """Turn integration and placeholder evidence into blocking criteria."""
++    criteria = verification.setdefault("criteria_results", [])
++    suggested = verification.setdefault("suggested_fixes", [])
++    failures: list[dict] = []
++
++    for result in dag_result.get("integration_test_results", []) or []:
++        if result.get("passed") is True:
++            continue
++        summary = result.get("summary") or "integration tester did not pass"
++        details = result.get("failure_details") or []
++        detail_text = "; ".join(
++            str(item.get("error", item)) if isinstance(item, dict) else str(item)
++            for item in details[:5]
++        )
++        evidence = summary + (f" — {detail_text}" if detail_text else "")
++        failures.append(
++            {
++                "criterion": "Merged cross-feature integration must pass.",
++                "passed": False,
++                "evidence": evidence,
++                "issue_name": "",
++            }
++        )
++
++    placeholders = _added_placeholder_failures(repo_path, base_sha)
++    if placeholders:
++        failures.append(
++            {
++                "criterion": (
++                    "Production paths must not contain newly-added placeholder "
++                    "or deferred feature behavior."
++                ),
++                "passed": False,
++                "evidence": "; ".join(placeholders),
++                "issue_name": "",
++            }
++        )
++
++    if failures:
++        verification["passed"] = False
++        criteria.extend(failures)
++        suggested.extend(item["evidence"] for item in failures)
++        verification["summary"] = (
++            f"{verification.get('summary', '').strip()} "
++            f"Deterministic acceptance gates found {len(failures)} failure(s)."
++        ).strip()
++    return verification
++
++
+ @app.reasoner(
+     tags=["entrypoint"],
+     description=(
+@@ -1031,6 +1154,16 @@ async def build(
+                 ai_provider=cfg.ai_provider,
+                 workspace_manifest=manifest.model_dump() if manifest else None,
+             ), "run_verifier")
++            verification = _apply_deterministic_acceptance_failures(
++                verification,
++                dag_result,
++                repo_path=repo_path,
++                base_sha=(
++                    git_config.get("initial_commit_sha", "")
++                    if git_config
++                    else ""
++                ),
++            )
+ 
+             if verification.get("passed", False) or cycle >= cfg.max_verify_fix_cycles:
+                 break
+@@ -1104,7 +1237,10 @@ async def build(
+                 )
+                 continue  # Re-verify
+             else:
+-                app.note("No fixable issues generated — accepting with debt", tags=["build", "verify"])
++                app.note(
++                    "No fixable issues generated — verification remains failed",
++                    tags=["build", "verify", "blocked"],
++                )
+                 break
+ 
+         success = verification.get("passed", False) if verification else False
+@@ -1117,6 +1253,25 @@ async def build(
+             tags=["build", "complete"],
+         )
+ 
++        if not success:
++            failed_result = BuildResult(
++                plan_result=plan_result,
++                dag_state=dag_result,
++                verification=verification,
++                success=False,
++                summary=(
++                    f"Verification failed after "
++                    f"{cfg.max_verify_fix_cycles} autonomous repair cycle(s): "
++                    f"{completed}/{total} issues in the final execution"
++                ),
++            ).model_dump()
++            raise ReasonerFailed(
++                "Build stopped before finalization and PR creation because "
++                "acceptance verification did not pass",
++                result=failed_result,
++                error_details={"reason": "acceptance_verification_failed"},
++            )
++
+         # Capture plan docs before finalize cleans up .artifacts/
+         _plan_dir = os.path.join(
+             plan_result.get("artifacts_dir", ""), "plan"
+@@ -1136,6 +1291,7 @@ async def build(
+                     pass
+ 
+         # 3b. FINALIZE — clean up repo artifacts before PR
++        finalize_failures: list[str] = []
+         if manifest and len(manifest.repos) > 1:
+             # Multi-repo: finalize each repo individually
+             app.note(
+@@ -1158,13 +1314,18 @@ async def build(
+                             tags=["build", "finalize", "complete"],
+                         )
+                     else:
++                        finalize_failures.append(
++                            f"{ws_repo.repo_name}: "
++                            f"{finalize_result.get('summary', 'incomplete')}"
++                        )
+                         app.note(
+                             f"Repo finalize incomplete ({ws_repo.repo_name}): {finalize_result.get('summary', '')}",
+                             tags=["build", "finalize", "warning"],
+                         )
+                 except Exception as e:
++                    finalize_failures.append(f"{ws_repo.repo_name}: {e}")
+                     app.note(
+-                        f"Repo finalize failed for {ws_repo.repo_name} (non-blocking): {e}",
++                        f"Repo finalize failed for {ws_repo.repo_name}: {e}",
+                         tags=["build", "finalize", "error"],
+                     )
+         else:
+@@ -1185,16 +1346,38 @@ async def build(
+                         tags=["build", "finalize", "complete"],
+                     )
+                 else:
++                    finalize_failures.append(
++                        finalize_result.get("summary", "finalization incomplete")
++                    )
+                     app.note(
+                         f"Repo finalize incomplete: {finalize_result.get('summary', '')}",
+                         tags=["build", "finalize", "warning"],
+                     )
+             except Exception as e:
++                finalize_failures.append(str(e))
+                 app.note(
+-                    f"Repo finalize failed (non-blocking): {e}",
++                    f"Repo finalize failed: {e}",
+                     tags=["build", "finalize", "error"],
+                 )
+ 
++        if finalize_failures:
++            failed_result = BuildResult(
++                plan_result=plan_result,
++                dag_state=dag_result,
++                verification=verification,
++                success=False,
++                summary=(
++                    "Acceptance passed, but repository finalization failed: "
++                    + "; ".join(finalize_failures)
++                ),
++            ).model_dump()
++            raise ReasonerFailed(
++                "Build stopped before PR creation because repository "
++                "finalization did not pass",
++                result=failed_result,
++                error_details={"reason": "repository_finalization_failed"},
++            )
++
+         # 4. PUSH & DRAFT PR (if repo has a remote and PR creation is enabled)
+         pr_results: list[RepoPRResult] = []
+         ci_gate_results: list[dict] = []
+diff --git a/swe_af/execution/dag_executor.py b/swe_af/execution/dag_executor.py
+index a949709..8537e6a 100644
+--- a/swe_af/execution/dag_executor.py
++++ b/swe_af/execution/dag_executor.py
+@@ -574,29 +574,24 @@ async def _run_integration_tests(
+             if ws_repo and ws_repo.absolute_path:
+                 integration_test_repo_path = ws_repo.absolute_path
+ 
+-    test_result = None
+-    for attempt in range(config.max_integration_test_retries + 1):
+-        test_result = await call_fn(
+-            f"{node_id}.run_integration_tester",
+-            repo_path=integration_test_repo_path,
+-            integration_branch=dag_state.git_integration_branch,
+-            merged_branches=merged_branches,
+-            prd_summary=dag_state.prd_summary,
+-            architecture_summary=dag_state.architecture_summary,
+-            conflict_resolutions=merge_result.get("conflict_resolutions", []),
+-            artifacts_dir=dag_state.artifacts_dir,
+-            level=level_result.level_index,
+-            model=config.integration_tester_model,
+-            ai_provider=config.ai_provider,
+-            workspace_manifest=dag_state.workspace_manifest,
+-        )
+-        if test_result.get("passed"):
+-            break
+-        if note_fn and attempt < config.max_integration_test_retries:
+-            note_fn(
+-                f"Integration test failed (attempt {attempt + 1}), retrying...",
+-                tags=["execution", "integration_test", "retry"],
+-            )
++    # A repeated tester cannot repair application code and previously consumed
++    # time only to rediscover the same defect. Record one evidence-producing
++    # pass; build() converts a failure into a blocking acceptance criterion and
++    # sends it through the autonomous fix-issue/coder loop.
++    test_result = await call_fn(
++        f"{node_id}.run_integration_tester",
++        repo_path=integration_test_repo_path,
++        integration_branch=dag_state.git_integration_branch,
++        merged_branches=merged_branches,
++        prd_summary=dag_state.prd_summary,
++        architecture_summary=dag_state.architecture_summary,
++        conflict_resolutions=merge_result.get("conflict_resolutions", []),
++        artifacts_dir=dag_state.artifacts_dir,
++        level=level_result.level_index,
++        model=config.integration_tester_model,
++        ai_provider=config.ai_provider,
++        workspace_manifest=dag_state.workspace_manifest,
++    )
+ 
+     if test_result:
+         dag_state.integration_test_results.append(test_result)
+diff --git a/swe_af/execution/schemas.py b/swe_af/execution/schemas.py
+index bcde3cf..dc16717 100644
+--- a/swe_af/execution/schemas.py
++++ b/swe_af/execution/schemas.py
+@@ -435,6 +435,10 @@ class IntegrationTestResult(BaseModel):
+     tests_passed: int
+     tests_failed: int
+     failure_details: list[dict] = []  # [{test_name, error, file}]
++    browser_required: bool = False
++    browser_evidence: list[str] = []
++    browser_scenarios: list[dict] = []  # [{name, passed, evidence}]
++    browser_console_errors: list[str] = []
+     summary: str
+ 
+ 
+@@ -464,6 +468,10 @@ class VerificationResult(BaseModel):
+     criteria_results: list[CriterionResult]
+     summary: str
+     suggested_fixes: list[str] = []
++    browser_required: bool = False
++    browser_evidence: list[str] = []
++    browser_scenarios: list[dict] = []  # [{name, passed, evidence}]
++    browser_console_errors: list[str] = []
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/swe_af/prompts/integration_tester.py b/swe_af/prompts/integration_tester.py
+index b7e40b4..47dedde 100644
+--- a/swe_af/prompts/integration_tester.py
++++ b/swe_af/prompts/integration_tester.py
+@@ -32,6 +32,29 @@ the integration works end-to-end.
+ If multiple branches modified the same file, write tests for all modified
+ functions/classes to ensure nothing was broken.
+ 
++### Mandatory Browser Proof for Browser-Facing Work
++
++If the repository or PRD contains a website, browser app, HTML file, canvas,
++game, or other interactive UI, static inspection and grep-based tests are not
++acceptance evidence. You MUST:
++
++1. Start the application locally. For a standalone HTML file, serve the repo
++   with a temporary local HTTP server.
++2. Use `agent-browser` to open it in Chromium and interact through the visible
++   controls a real user would use.
++3. Exercise the complete required user loop, including each transition and
++   outcome in the PRD. A title-screen screenshot or a movement smoke test is
++   not enough for a game.
++4. Check browser console errors.
++5. Save screenshots for meaningful milestones under the supplied artifacts
++   directory, never in the deliverable source tree.
++6. Report each exercised path in `browser_scenarios` with a pass/fail verdict
++   and concrete evidence. Report screenshot paths in `browser_evidence`.
++
++Do not claim browser success when the browser command failed, when you only
++inspected source, or when you bypassed the UI by mutating application state.
++You may use state inspection to supplement a real interaction, but disclose it.
++
+ ## Test Writing Guidelines
+ 
+ - Write tests in the project's existing test framework if one exists.
+@@ -55,13 +78,19 @@ Return an IntegrationTestResult JSON object with:
+ - `tests_passed`: number of passing tests
+ - `tests_failed`: number of failing tests
+ - `failure_details`: list of dicts with `test_name`, `error`, `file`
++- `browser_required`: true for browser-facing work
++- `browser_evidence`: screenshot paths produced by real browser runs
++- `browser_scenarios`: exercised user paths with `name`, `passed`, `evidence`
++- `browser_console_errors`: console errors observed during the run
+ - `summary`: human-readable summary
+ 
+ ## Constraints
+ 
+ - Do NOT modify the merged application code — only write and run tests.
+ - If tests fail, report the failures but do NOT attempt fixes.
+-- Keep tests in a dedicated test directory if one exists, otherwise alongside the code.
++- Put temporary tests and browser evidence under the supplied artifacts
++  directory. Do not leave new test reports, helper scripts, screenshots, or
++  other verifier output in the deliverable source tree.
+ - Clean up any temporary files created during testing.
+ 
+ ## Tools Available
+@@ -81,6 +110,7 @@ def integration_tester_task_prompt(
+     prd_summary: str,
+     architecture_summary: str,
+     conflict_resolutions: list[dict],
++    artifacts_dir: str = "",
+     workspace_manifest: WorkspaceManifest | None = None,
+ ) -> str:
+     """Build the task prompt for the integration tester agent.
+@@ -92,6 +122,7 @@ def integration_tester_task_prompt(
+         prd_summary: Summary of the PRD.
+         architecture_summary: Summary of the architecture.
+         conflict_resolutions: List of conflict resolution dicts from the merger.
++        artifacts_dir: Build-owned directory for temporary tests and evidence.
+         workspace_manifest: Optional multi-repo workspace manifest.
+     """
+     sections: list[str] = []
+@@ -104,6 +135,7 @@ def integration_tester_task_prompt(
+     sections.append("## Integration Testing Task")
+     sections.append(f"- **Repository path**: `{repo_path}`")
+     sections.append(f"- **Integration branch**: `{integration_branch}`")
++    sections.append(f"- **Evidence/artifacts directory**: `{artifacts_dir}`")
+ 
+     sections.append("\n### Merged Branches")
+     for b in merged_branches:
+@@ -131,8 +163,10 @@ def integration_tester_task_prompt(
+         "1. Checkout the integration branch.\n"
+         "2. Analyze the merged code to identify interaction points.\n"
+         "3. Write targeted integration tests (prioritize conflict areas).\n"
+-        "4. Run all tests.\n"
+-        "5. Return an IntegrationTestResult JSON object."
++        "4. For browser-facing work, use agent-browser to exercise every "
++        "required user flow and save screenshot evidence.\n"
++        "5. Run all tests and inspect browser console errors.\n"
++        "6. Return an IntegrationTestResult JSON object."
+     )
+ 
+     return "\n".join(sections)
+diff --git a/swe_af/prompts/repo_finalize.py b/swe_af/prompts/repo_finalize.py
+index d66b2db..e87de6f 100644
+--- a/swe_af/prompts/repo_finalize.py
++++ b/swe_af/prompts/repo_finalize.py
+@@ -27,7 +27,8 @@ Imagine a new team member cloning this repo for the first time. They should see:
+    what's debris.
+ 2. **Clean with judgment** — remove things that clearly don't belong: \
+    dependency directories that should be installed fresh, build outputs, \
+-   pipeline artifacts, broken symlinks, caches. Don't remove anything \
++   pipeline artifacts, integration-verifier helper scripts/reports/screenshots, \
++   browser evidence, broken symlinks, caches. Don't remove anything \
+    you're unsure about — if in doubt, leave it and note it.
+ 3. **Fortify the .gitignore** — ensure it covers the standard patterns for \
+    this project's ecosystem. A good .gitignore is the repo's immune system.
+@@ -64,6 +65,9 @@ def repo_finalize_task_prompt(repo_path: str) -> str:
+         "2. Identify and remove clear artifacts: dependency dirs (node_modules, "
+         "__pycache__, .venv, etc.), build outputs, broken symlinks, pipeline "
+         "leftovers (.artifacts/, .worktrees/), caches.\n"
++        "   Remove temporary integration/browser verifier files that were not "
++        "part of the repository before this build; acceptance evidence belongs "
++        "under .artifacts/ and must not ship in the source tree.\n"
+         "3. Create or update `.gitignore` with standard patterns for the detected "
+         "language/framework, plus `.artifacts/`, `.worktrees/`, `.env`, `.DS_Store`.\n"
+         "4. Check `git status` — ensure the working tree is clean.\n"
+diff --git a/swe_af/prompts/verifier.py b/swe_af/prompts/verifier.py
+index 0682ff4..f5222a8 100644
+--- a/swe_af/prompts/verifier.py
++++ b/swe_af/prompts/verifier.py
+@@ -43,6 +43,23 @@ For each acceptance criterion in the PRD:
+ 5. **Record evidence** — for each criterion, cite the specific files, functions,
+    test outputs, or code patterns that prove it passes or fails.
+ 
++### Mandatory Browser Acceptance
++
++If this is browser-facing work (HTML, CSS, a frontend framework, canvas, a
++website, or a browser game), code inspection is not behavioral proof. You MUST
++start the app and use `agent-browser` with Chromium to interact through every
++must-have user flow. For a game, play the complete loop: start/setup,
++exploration, gameplay encounters, progression, and win/loss or ending states.
++Merely moving, opening the title screen, invoking internal functions, or
++mutating state from JavaScript does not prove the loop.
++
++Save milestone screenshots under the artifacts directory and return their paths
++in `browser_evidence`. Return every exercised flow in `browser_scenarios` as a
++dict with `name`, `passed`, and specific `evidence`. Return observed console
++errors in `browser_console_errors`. If the browser cannot run, evidence is
++missing, any required scenario fails, or an uncaught console error affects the
++flow, the overall verdict MUST be false.
++
+ ## Judgment Standards
+ 
+ - **PASS**: The criterion is demonstrably satisfied in the codebase. Code exists,
+@@ -90,6 +107,8 @@ fail do not block the overall verdict but should be reported.
+ ## Important Constraints
+ 
+ - Do NOT modify the codebase. You are a verifier, not a fixer.
++- Browser screenshots and temporary verifier files may be written only beneath
++  the supplied artifacts directory, never into the deliverable source tree.
+ - If you cannot determine whether a criterion passes (e.g., it requires a
+   running server you can't start), note this in the evidence and fail it
+   conservatively.
+@@ -215,12 +234,16 @@ def verifier_task_prompt(
+         "2. For each acceptance criterion, identify the responsible issue(s).\n"
+         "3. Inspect the code changes made by completed issues.\n"
+         "4. Run any existing tests relevant to the criteria.\n"
+-        "5. For each criterion, record whether it passes or fails with specific evidence.\n"
+-        "6. Return a VerificationResult JSON object with:\n"
++        "5. If browser-facing, use agent-browser to complete every must-have "
++        "user flow and save milestone screenshots under the artifacts path.\n"
++        "6. For each criterion, record whether it passes or fails with specific evidence.\n"
++        "7. Return a VerificationResult JSON object with:\n"
+         "   - `passed`: true only if ALL acceptance criteria pass\n"
+         "   - `criteria_results`: list of CriterionResult for each criterion\n"
+         "   - `summary`: overall assessment\n"
+-        "   - `suggested_fixes`: list of actionable fixes for any failures"
++        "   - `suggested_fixes`: list of actionable fixes for any failures\n"
++        "   - `browser_required`, `browser_evidence`, `browser_scenarios`, and "
++        "`browser_console_errors` for browser-facing work"
+     )
+ 
+     return "\n".join(sections)
+diff --git a/swe_af/reasoners/execution_agents.py b/swe_af/reasoners/execution_agents.py
+index a773946..654f86e 100644
+--- a/swe_af/reasoners/execution_agents.py
++++ b/swe_af/reasoners/execution_agents.py
+@@ -8,6 +8,8 @@ from __future__ import annotations
+ 
+ import asyncio
+ import os
++import subprocess
++from pathlib import Path
+ 
+ from pydantic import BaseModel
+ 
+@@ -89,6 +91,163 @@ from swe_af.tools.web_search import maybe_apply_coder_guardrail
+ from . import router
+ 
+ 
++_BROWSER_SUFFIXES = {
++    ".css",
++    ".html",
++    ".htm",
++    ".jsx",
++    ".tsx",
++    ".vue",
++    ".svelte",
++}
++_BROWSER_PRD_TERMS = (
++    "browser",
++    "canvas",
++    "frontend",
++    "game",
++    "html",
++    "user interface",
++    "website",
++    "web app",
++)
++_EVIDENCE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
++
++
++def _requires_browser_verification(repo_path: str, requirements: object) -> bool:
++    """Detect deliverables whose behavior can only be proven in a browser."""
++    requirement_text = str(requirements).lower()
++    if any(term in requirement_text for term in _BROWSER_PRD_TERMS):
++        return True
++
++    ignored = {".artifacts", ".git", ".worktrees", "node_modules", "vendor"}
++    try:
++        for _root, dirs, files in os.walk(repo_path):
++            dirs[:] = [name for name in dirs if name not in ignored]
++            if any(Path(name).suffix.lower() in _BROWSER_SUFFIXES for name in files):
++                return True
++    except OSError:
++        return False
++    return False
++
++
++def _browser_evidence_failures(
++    result: dict,
++    *,
++    repo_path: str,
++    artifacts_dir: str,
++) -> list[str]:
++    """Validate that a UI verdict is backed by real, retained browser output."""
++    failures: list[str] = []
++    scenarios = result.get("browser_scenarios") or []
++    if not scenarios:
++        failures.append("no browser scenarios were reported")
++    else:
++        malformed = [
++            item
++            for item in scenarios
++            if not isinstance(item, dict)
++            or not item.get("name")
++            or not item.get("evidence")
++        ]
++        if malformed:
++            failures.append("browser scenarios are missing names or concrete evidence")
++        if any(
++            not isinstance(item, dict) or item.get("passed") is not True
++            for item in scenarios
++        ):
++            failures.append("one or more browser scenarios did not pass")
++
++    evidence_root = artifacts_dir or ".artifacts"
++    artifacts_root = Path(
++        evidence_root
++        if os.path.isabs(evidence_root)
++        else os.path.join(repo_path, evidence_root)
++    ).resolve()
++    existing_images: list[str] = []
++    for raw_path in result.get("browser_evidence") or []:
++        candidate = Path(str(raw_path))
++        if not candidate.is_absolute():
++            from_repo = Path(repo_path, candidate)
++            from_artifacts = Path(artifacts_root, candidate)
++            candidate = from_repo if from_repo.exists() else from_artifacts
++        try:
++            resolved = candidate.resolve()
++            inside_artifacts = os.path.commonpath(
++                (str(artifacts_root), str(resolved))
++            ) == str(artifacts_root)
++        except (OSError, ValueError):
++            inside_artifacts = False
++            resolved = candidate
++        if (
++            inside_artifacts
++            and resolved.is_file()
++            and resolved.stat().st_size > 0
++            and resolved.suffix.lower() in _EVIDENCE_IMAGE_SUFFIXES
++        ):
++            existing_images.append(str(resolved))
++    if not existing_images:
++        failures.append(
++            "no non-empty browser screenshot exists under the artifacts directory"
++        )
++
++    if result.get("browser_console_errors"):
++        failures.append("browser console errors were reported")
++    return failures
++
++
++def _enforce_browser_verification(
++    result: dict,
++    *,
++    repo_path: str,
++    artifacts_dir: str,
++    required: bool,
++    integration: bool,
++) -> dict:
++    """Fail closed when a browser-facing verdict lacks executable evidence."""
++    result["browser_required"] = required
++    if not required:
++        return result
++
++    failures = _browser_evidence_failures(
++        result,
++        repo_path=repo_path,
++        artifacts_dir=artifacts_dir,
++    )
++    if not failures:
++        return result
++
++    message = "Browser acceptance failed: " + "; ".join(failures)
++    result["passed"] = False
++    result["summary"] = f"{result.get('summary', '').strip()} {message}".strip()
++    if integration:
++        result.setdefault("failure_details", []).append(
++            {
++                "test_name": "mandatory_browser_acceptance",
++                "error": message,
++                "file": "",
++            }
++        )
++        result["tests_failed"] = max(1, int(result.get("tests_failed") or 0))
++        result["tests_run"] = max(
++            int(result.get("tests_run") or 0),
++            int(result.get("tests_passed") or 0) + result["tests_failed"],
++        )
++    else:
++        result.setdefault("criteria_results", []).append(
++            {
++                "criterion": (
++                    "Browser-facing acceptance must be proven by complete "
++                    "interactive scenarios and retained screenshots."
++                ),
++                "passed": False,
++                "evidence": message,
++                "issue_name": "",
++            }
++        )
++        result.setdefault("suggested_fixes", []).append(message)
++    return result
++
++
+ def _maybe_workspace_manifest(raw: dict | None):
+     """Deserialize workspace_manifest dict to WorkspaceManifest, or return None."""
+     if raw is None:
+@@ -569,11 +728,19 @@ async def run_verifier(
+         )
+         check_fatal_harness_error(result)
+         if result.parsed is not None:
++            parsed = _enforce_browser_verification(
++                result.parsed.model_dump(),
++                repo_path=repo_path,
++                artifacts_dir=artifacts_dir,
++                required=_requires_browser_verification(repo_path, prd),
++                integration=False,
++            )
+             router.note(
+-                f"Verifier complete: passed={result.parsed.passed}, summary={result.parsed.summary}",
++                f"Verifier complete: passed={parsed['passed']}, "
++                f"summary={parsed['summary']}",
+                 tags=["verifier", "complete"],
+             )
+-            return result.parsed.model_dump()
++            return parsed
+     except FatalHarnessError:
+         raise  # Non-retryable — propagate immediately
+     except Exception as e:
+@@ -815,6 +982,7 @@ async def run_integration_tester(
+         prd_summary=prd_summary,
+         architecture_summary=architecture_summary,
+         conflict_resolutions=conflict_resolutions,
++        artifacts_dir=artifacts_dir,
+         workspace_manifest=ws_manifest,
+     )
+ 
+@@ -834,12 +1002,19 @@ async def run_integration_tester(
+         )
+         check_fatal_harness_error(result)
+         if result.parsed is not None:
++            parsed = _enforce_browser_verification(
++                result.parsed.model_dump(),
++                repo_path=repo_path,
++                artifacts_dir=artifacts_dir,
++                required=_requires_browser_verification(repo_path, prd_summary),
++                integration=True,
++            )
+             router.note(
+-                f"Integration tester complete: passed={result.parsed.passed}, "
+-                f"{result.parsed.tests_passed}/{result.parsed.tests_run} tests passed",
++                f"Integration tester complete: passed={parsed['passed']}, "
++                f"{parsed['tests_passed']}/{parsed['tests_run']} tests passed",
+                 tags=["integration_tester", "complete"],
+             )
+-            return result.parsed.model_dump()
++            return parsed
+     except FatalHarnessError:
+         raise  # Non-retryable — propagate immediately
+     except Exception as e:
+@@ -1387,8 +1562,7 @@ async def run_repo_finalize(
+ ) -> dict:
+     """Clean up the repository after verification — remove artifacts, fortify .gitignore.
+ 
+-    Returns a RepoFinalizeResult dict. Non-blocking: failure does not affect
+-    build success.
++    Returns a RepoFinalizeResult dict. The build treats failure as blocking.
+     """
+     router.note("Repo finalize starting", tags=["repo_finalize", "start"])
+ 
+@@ -1410,12 +1584,54 @@ async def run_repo_finalize(
+         )
+         check_fatal_harness_error(result)
+         if result.parsed is not None:
++            parsed = result.parsed.model_dump()
++            tracked = await asyncio.to_thread(
++                subprocess.run,
++                ["git", "ls-files"],
++                cwd=repo_path,
++                capture_output=True,
++                text=True,
++                check=False,
++            )
++            forbidden_names = {
++                "browser_test_results.json",
++                "integration_test_results.json",
++                "write_output.py",
++            }
++            forbidden_parts = {".artifacts", ".worktrees", "__pycache__", "node_modules"}
++            leaked = [
++                path
++                for path in tracked.stdout.splitlines()
++                if Path(path).name in forbidden_names
++                or any(part in forbidden_parts for part in Path(path).parts)
++            ]
++            status = await asyncio.to_thread(
++                subprocess.run,
++                ["git", "status", "--porcelain", "--untracked-files=no"],
++                cwd=repo_path,
++                capture_output=True,
++                text=True,
++                check=False,
++            )
++            if tracked.returncode != 0 or status.returncode != 0:
++                parsed["success"] = False
++                parsed["summary"] = (
++                    f"{parsed.get('summary', '')} Could not validate final git state."
++                ).strip()
++            elif leaked or status.stdout.strip():
++                parsed["success"] = False
++                parsed["summary"] = (
++                    f"{parsed.get('summary', '')} Finalization gate failed: "
++                    f"tracked verifier artifacts={leaked}; "
++                    f"tracked status={status.stdout.strip()!r}"
++                ).strip()
+             router.note(
+-                f"Repo finalize complete: {len(result.parsed.files_removed)} files removed, "
+-                f"gitignore_updated={result.parsed.gitignore_updated}",
++                f"Repo finalize complete: {len(parsed['files_removed'])} files removed, "
++                f"gitignore_updated={parsed['gitignore_updated']}, "
++                f"success={parsed['success']}",
+                 tags=["repo_finalize", "complete"],
+             )
+-            return result.parsed.model_dump()
++            return parsed
+     except FatalHarnessError:
+         raise  # Non-retryable — propagate immediately
+     except Exception as e:
+diff --git a/vendor/SWE-AF/tests/test_browser_acceptance_gates.py b/tests/test_browser_acceptance_gates.py
+new file mode 100644
+index 0000000..7006c9b
+--- /dev/null
++++ b/tests/test_browser_acceptance_gates.py
+@@ -0,0 +1,163 @@
++"""Regression tests for autonomous browser and integration acceptance gates."""
++
++from __future__ import annotations
++
++import subprocess
++
++from swe_af.app import (
++    _added_placeholder_failures,
++    _apply_deterministic_acceptance_failures,
++)
++from swe_af.prompts.integration_tester import integration_tester_task_prompt
++from swe_af.prompts.verifier import SYSTEM_PROMPT as VERIFIER_SYSTEM_PROMPT
++from swe_af.reasoners.execution_agents import (
++    _enforce_browser_verification,
++    _requires_browser_verification,
++)
++
++
++def test_html_repo_requires_browser_verification(tmp_path) -> None:
++    (tmp_path / "index.html").write_text("<canvas></canvas>")
++
++    assert _requires_browser_verification(str(tmp_path), "small app") is True
++
++
++def test_missing_browser_evidence_forces_failed_verdict(tmp_path) -> None:
++    artifacts = tmp_path / ".artifacts"
++    artifacts.mkdir()
++    result = {
++        "passed": True,
++        "criteria_results": [],
++        "summary": "looks good",
++        "suggested_fixes": [],
++        "browser_evidence": [],
++        "browser_scenarios": [],
++        "browser_console_errors": [],
++    }
++
++    gated = _enforce_browser_verification(
++        result,
++        repo_path=str(tmp_path),
++        artifacts_dir=".artifacts",
++        required=True,
++        integration=False,
++    )
++
++    assert gated["passed"] is False
++    assert gated["criteria_results"][-1]["passed"] is False
++    assert "no browser scenarios" in gated["summary"]
++
++
++def test_real_browser_evidence_preserves_passing_verdict(tmp_path) -> None:
++    artifacts = tmp_path / ".artifacts" / "browser-evidence"
++    artifacts.mkdir(parents=True)
++    screenshot = artifacts / "complete-loop.png"
++    screenshot.write_bytes(b"real image bytes")
++    result = {
++        "passed": True,
++        "criteria_results": [],
++        "summary": "complete loop passed",
++        "suggested_fixes": [],
++        "browser_evidence": [str(screenshot)],
++        "browser_scenarios": [
++            {
++                "name": "complete required loop",
++                "passed": True,
++                "evidence": "starter, encounter, battle, and ending observed",
++            }
++        ],
++        "browser_console_errors": [],
++    }
++
++    gated = _enforce_browser_verification(
++        result,
++        repo_path=str(tmp_path),
++        artifacts_dir=".artifacts",
++        required=True,
++        integration=False,
++    )
++
++    assert gated["passed"] is True
++
++
++def test_failed_integration_becomes_blocking_acceptance_criterion(tmp_path) -> None:
++    verification = {
++        "passed": True,
++        "criteria_results": [],
++        "suggested_fixes": [],
++        "summary": "model approved",
++    }
++    dag_result = {
++        "integration_test_results": [
++            {
++                "passed": False,
++                "summary": "encounters never begin",
++                "failure_details": [
++                    {"error": "phase stayed EXPLORE after forced encounter"}
++                ],
++            }
++        ]
++    }
++
++    gated = _apply_deterministic_acceptance_failures(
++        verification,
++        dag_result,
++        repo_path=str(tmp_path),
++        base_sha="",
++    )
++
++    assert gated["passed"] is False
++    assert gated["criteria_results"][-1]["criterion"].startswith(
++        "Merged cross-feature"
++    )
++    assert "encounters never begin" in gated["criteria_results"][-1]["evidence"]
++
++
++def test_new_production_placeholder_is_blocking(tmp_path) -> None:
++    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
++    subprocess.run(
++        ["git", "config", "user.email", "test@example.com"],
++        cwd=tmp_path,
++        check=True,
++    )
++    subprocess.run(
++        ["git", "config", "user.name", "Test"],
++        cwd=tmp_path,
++        check=True,
++    )
++    (tmp_path / "index.html").write_text("<button>Start</button>")
++    subprocess.run(["git", "add", "index.html"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "commit", "-m", "base"], cwd=tmp_path, check=True)
++    base = subprocess.run(
++        ["git", "rev-parse", "HEAD"],
++        cwd=tmp_path,
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout.strip()
++    (tmp_path / "index.html").write_text(
++        "<button>Start</button><script>console.log('Battle not yet available')</script>"
++    )
++    subprocess.run(["git", "add", "index.html"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "commit", "-m", "feature"], cwd=tmp_path, check=True)
++
++    assert _added_placeholder_failures(str(tmp_path), base) == [
++        "index.html: not yet available"
++    ]
++
++
++def test_ui_prompts_require_agent_browser_and_artifact_evidence() -> None:
++    prompt = integration_tester_task_prompt(
++        repo_path="/repo",
++        integration_branch="feature/test",
++        merged_branches=[],
++        prd_summary="A browser game",
++        architecture_summary="One HTML file",
++        conflict_resolutions=[],
++        artifacts_dir="/repo/.artifacts",
++    )
++
++    assert "agent-browser" in prompt
++    assert "/repo/.artifacts" in prompt
++    assert "every required user flow" in prompt
++    assert "agent-browser" in VERIFIER_SYSTEM_PROMPT

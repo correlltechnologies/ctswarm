@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
+
 from ctswarm.capacity import Runtime
 from ctswarm.orchestrator import (
     BuildRecord,
     BuildState,
+    Orchestrator,
     runtime_model_overrides,
     update_record_from_execution,
 )
@@ -123,3 +126,41 @@ def test_succeeded_execution_without_explicit_success_fails_closed() -> None:
 
     assert record.state is BuildState.FAILED
     assert record.error == "reasoner exited without a build verdict"
+
+
+async def test_deadline_cancels_agentfield_execution(monkeypatch) -> None:
+    orchestrator = Orchestrator()
+    record = BuildRecord(
+        build_id="build-timeout",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+        execution_id="exec-timeout",
+    )
+    cancellations: list[tuple[str, str]] = []
+
+    async def cancel(current: BuildRecord, reason: str) -> bool:
+        cancellations.append((current.execution_id, reason))
+        return True
+
+    monkeypatch.setattr(orchestrator, "cancel_execution", cancel)
+    clock_calls = 0
+
+    def fake_time() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        return 1_000_000.0 if clock_calls == 1 else 1_000_001.0
+
+    monkeypatch.setattr(time, "time", fake_time)
+
+    result = await orchestrator.run_until_done(
+        record,
+        max_hours=0.000001,
+        poll_interval_s=0,
+    )
+
+    assert result.state is BuildState.FAILED
+    assert cancellations == [
+        ("exec-timeout", "exceeded the 1e-06h wall-clock limit")
+    ]

@@ -175,6 +175,13 @@ services:
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # ctswarm's scheduler owns the per-build deadline (up to 72h) and sends a
+      # cooperative cancel when it expires. Keep AgentField's process-local
+      # watchdog just above that supported maximum so its historical 7200s
+      # default cannot kill a healthy build before the scheduler does.
+      - AGENTFIELD_ASYNC_DEFAULT_EXECUTION_TIMEOUT=${CTSWARM_AGENTFIELD_REASONER_TIMEOUT_SECONDS:-259500}
+      - AGENTFIELD_ASYNC_MAX_EXECUTION_TIMEOUT=${CTSWARM_AGENTFIELD_REASONER_TIMEOUT_SECONDS:-259500}
+      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

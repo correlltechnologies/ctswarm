@@ -228,6 +228,10 @@ class Orchestrator:
             "runtime": runtime.value,
             "check_ci": True,
             "max_ci_fix_cycles": max_ci_fix_cycles,
+            # Acceptance failures must have enough room to become repair work.
+            # A single retry is routinely consumed by the first cross-feature
+            # browser failure on UI builds.
+            "max_verify_fix_cycles": 3,
             "models": runtime_model_overrides(runtime),
         }
 
@@ -287,6 +291,28 @@ class Orchestrator:
             return record
 
         return update_record_from_execution(record, body)
+
+    async def cancel_execution(self, record: BuildRecord, reason: str) -> bool:
+        """Cooperatively stop the AgentField reasoner behind a terminal build.
+
+        The scheduler owns the user-selected wall-clock deadline. AgentField's
+        SDK watchdog is deliberately configured above the scheduler's maximum
+        so it cannot preempt valid work; this cancellation closes the other
+        half of that contract and prevents timed-out builds from running in the
+        background after the queue has released their slot.
+        """
+        if not record.execution_id:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.agentfield_url}/api/v1/executions/"
+                    f"{record.execution_id}/cancel",
+                    json={"reason": reason},
+                )
+        except httpx.HTTPError:
+            return False
+        return response.status_code < 400
 
     # -- gating ------------------------------------------------------------
 
@@ -382,6 +408,7 @@ class Orchestrator:
             control = self.control_state(record.build_id)
 
             if control == "stopped":
+                await self.cancel_execution(record, "stopped by owner")
                 record.state = BuildState.STOPPED
                 record.phase_detail = "stopped by owner"
                 self.ledger.record_event("build_stopped", {}, build_id=record.build_id)
@@ -407,8 +434,18 @@ class Orchestrator:
                 self.ledger.record_event("build_resumed", {}, build_id=record.build_id)
 
             if time.time() > deadline:
+                reason = f"exceeded the {max_hours}h wall-clock limit"
+                cancelled = await self.cancel_execution(record, reason)
                 record.state = BuildState.FAILED
-                record.error = f"exceeded the {max_hours}h wall-clock limit"
+                record.error = reason
+                self.ledger.record_event(
+                    "build_deadline_exceeded",
+                    {
+                        "max_hours": max_hours,
+                        "execution_cancelled": cancelled,
+                    },
+                    build_id=record.build_id,
+                )
                 break
 
             await self.poll(record)
