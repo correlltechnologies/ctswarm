@@ -25,6 +25,7 @@ an input to the decision, never the decision itself.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -72,11 +73,13 @@ class BuildRecord:
     state: BuildState = BuildState.QUEUED
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    last_progress_at: float = field(default_factory=time.time)
     phase_detail: str = ""
     execution_id: str = ""
     pr_url: str = ""
     error: str = ""
     gate_results: dict = field(default_factory=dict)
+    _progress_fingerprint: str = field(default="", repr=False)
 
     @property
     def elapsed_s(self) -> float:
@@ -92,6 +95,7 @@ class BuildRecord:
             "execution_id": self.execution_id,
             "phase_detail": self.phase_detail,
             "elapsed_s": int(self.elapsed_s),
+            "stalled_s": max(0, int(time.time() - self.last_progress_at)),
             "pr_url": self.pr_url,
             "error": self.error,
             "gate_results": self.gate_results,
@@ -180,6 +184,7 @@ class Orchestrator:
         approvals_url: str | None = None,
         ledger: Ledger | None = None,
         status_interval_s: float = 900.0,
+        no_progress_timeout_s: float | None = None,
     ) -> None:
         self.agentfield_url = (
             agentfield_url
@@ -193,6 +198,11 @@ class Orchestrator:
         self.ledger = ledger or Ledger(os.environ.get("CTSWARM_DB", "var/ctswarm.db"))
         self.capacity = CapacityManager(ledger=self.ledger)
         self.status_interval_s = status_interval_s
+        self.no_progress_timeout_s = (
+            float(os.environ.get("CTSWARM_NO_PROGRESS_TIMEOUT_S", "900"))
+            if no_progress_timeout_s is None
+            else no_progress_timeout_s
+        )
 
     # -- control -----------------------------------------------------------
 
@@ -266,6 +276,12 @@ class Orchestrator:
             "providers": providers,
             "check_ci": True,
             "max_ci_fix_cycles": max_ci_fix_cycles,
+            # Bound every individual agent call as well as the build-level
+            # semantic watchdog. The old upstream default was 45 minutes,
+            # allowing two no-output coder attempts to waste roughly 90 minutes.
+            "agent_timeout_seconds": int(
+                os.environ.get("CTSWARM_AGENT_TIMEOUT_SECONDS", "900")
+            ),
             # Acceptance failures must have enough room to become repair work.
             # A single retry is routinely consumed by the first cross-feature
             # browser failure on UI builds.
@@ -489,6 +505,34 @@ class Orchestrator:
 
             await self.poll(record)
 
+            # A running status is not progress. If the control plane reports the
+            # same semantic execution state for too long, fail closed and free
+            # the worker instead of letting a dead agent consume hours silently.
+            stalled_s = time.time() - record.last_progress_at
+            if (
+                not record.state.terminal
+                and self.no_progress_timeout_s > 0
+                and stalled_s >= self.no_progress_timeout_s
+            ):
+                reason = (
+                    "no semantic build progress for "
+                    f"{int(stalled_s)}s (limit {int(self.no_progress_timeout_s)}s)"
+                )
+                cancelled = await self.cancel_execution(record, reason)
+                record.state = BuildState.FAILED
+                record.error = reason
+                record.phase_detail = "stalled execution cancelled"
+                self.ledger.record_event(
+                    "build_no_progress_timeout",
+                    {
+                        "stalled_s": int(stalled_s),
+                        "limit_s": int(self.no_progress_timeout_s),
+                        "execution_cancelled": cancelled,
+                    },
+                    build_id=record.build_id,
+                )
+                break
+
             # Update on a phase change immediately, or on the timer if something
             # is still moving. Never on a fixed schedule regardless of change,
             # which is how status updates become noise people stop reading.
@@ -542,6 +586,13 @@ def update_record_from_execution(record: BuildRecord, body: dict) -> BuildRecord
     matter: terminal transport status ends polling, while the result decides
     whether the build completed or failed.
     """
+    fingerprint = _execution_progress_fingerprint(body)
+    if fingerprint and fingerprint != record._progress_fingerprint:
+        now = time.time()
+        record._progress_fingerprint = fingerprint
+        record.last_progress_at = now
+        record.updated_at = now
+
     result = body.get("result") or body.get("output") or {}
     if isinstance(result, dict):
         record.pr_url = result.get("pr_url") or record.pr_url
@@ -583,6 +634,49 @@ def update_record_from_execution(record: BuildRecord, body: dict) -> BuildRecord
             str(value) for value in (body["error"], reason, detail) if value
         )[:400]
     return record
+
+
+_VOLATILE_PROGRESS_KEYS = frozenset(
+    {
+        "created_at",
+        "updated_at",
+        "timestamp",
+        "last_heartbeat",
+        "heartbeat_at",
+        "elapsed",
+        "elapsed_s",
+        "duration",
+        "duration_ms",
+    }
+)
+
+
+def _execution_progress_fingerprint(body: dict) -> str:
+    """Hash semantic execution state while ignoring heartbeat-only churn.
+
+    The control plane may refresh timestamps on every poll. Treating those as
+    progress recreated the exact failure mode this watchdog prevents: a wedged
+    coder could look alive forever while producing no output or phase change.
+    """
+
+    def stable(value):
+        if isinstance(value, dict):
+            return {
+                str(key): stable(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                if str(key).lower() not in _VOLATILE_PROGRESS_KEYS
+            }
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    try:
+        payload = json.dumps(stable(body), sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def load_build(ledger: Ledger, build_id: str) -> BuildRecord | None:

@@ -186,3 +186,57 @@ async def test_deadline_cancels_agentfield_execution(monkeypatch) -> None:
     assert cancellations == [
         ("exec-timeout", "exceeded the 1e-06h wall-clock limit")
     ]
+
+
+async def test_no_progress_watchdog_cancels_stalled_execution(monkeypatch) -> None:
+    orchestrator = Orchestrator(no_progress_timeout_s=60)
+    record = BuildRecord(
+        build_id="build-stalled",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+        execution_id="exec-stalled",
+        last_progress_at=1_000.0,
+    )
+    cancellations: list[str] = []
+
+    async def poll_unchanged(current: BuildRecord) -> BuildRecord:
+        return current
+
+    async def cancel(_current: BuildRecord, reason: str) -> bool:
+        cancellations.append(reason)
+        return True
+
+    monkeypatch.setattr(orchestrator, "poll", poll_unchanged)
+    monkeypatch.setattr(orchestrator, "cancel_execution", cancel)
+    monkeypatch.setattr(time, "time", lambda: 1_061.0)
+
+    result = await orchestrator.run_until_done(record, poll_interval_s=0)
+
+    assert result.state is BuildState.FAILED
+    assert result.phase_detail == "stalled execution cancelled"
+    assert result.error == "no semantic build progress for 61s (limit 60s)"
+    assert cancellations == [result.error]
+
+
+def test_progress_fingerprint_ignores_heartbeat_only_updates() -> None:
+    record = BuildRecord(
+        build_id="build-progress",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+    )
+
+    update_record_from_execution(
+        record,
+        {"status": "running", "phase": "coding", "updated_at": "first"},
+    )
+    first_progress_at = record.last_progress_at
+    update_record_from_execution(
+        record,
+        {"status": "running", "phase": "coding", "updated_at": "second"},
+    )
+
+    assert record.last_progress_at == first_progress_at
