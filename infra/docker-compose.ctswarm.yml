@@ -59,6 +59,9 @@ services:
       # local inference server needs no public exposure.
       - CTSWARM_OLLAMA_HOST=${CTSWARM_OLLAMA_HOST_DOCKER:-http://host.docker.internal:11434}
       - CTSWARM_OLLAMA_MODEL_ALLOWLIST=${CTSWARM_OLLAMA_MODEL_ALLOWLIST:-}
+      # Hard ceiling for explicit native Ollama requests. This prevents a model's
+      # advertised 128k/256k maximum from allocating tens of GiB of KV cache.
+      - CTSWARM_OLLAMA_CONTEXT_CEILING=${CTSWARM_OLLAMA_CONTEXT_CEILING:-16384}
       - CTSWARM_MLX_HOST=${CTSWARM_MLX_HOST:-http://host.docker.internal:8081}
       - CTSWARM_LMSTUDIO_HOST=${CTSWARM_LMSTUDIO_HOST:-http://host.docker.internal:1234}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}

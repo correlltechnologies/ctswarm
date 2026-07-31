@@ -32,6 +32,13 @@ from .capacity import Runtime
 from .ledger import Ledger
 from .observability import AgentFieldTraceClient, harness_label, model_overview
 from .orchestrator import BuildRecord, BuildState, Orchestrator, load_build
+from .routing_config import (
+    RoutingPolicyError,
+    load_routing_policy,
+    normalize_routing_policy,
+    save_routing_policy,
+    validate_policy_availability,
+)
 
 BUILD_ENQUEUED = "build_enqueued"
 BUILD_TERMINAL = "build_terminal"
@@ -62,6 +69,14 @@ class BuildRequest(BaseModel):
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     # Zero means no scheduler deadline; the owner can still pause or stop.
     max_hours: float = Field(default=0.0, ge=0, le=720)
+
+
+class RoutingPolicyRequest(BaseModel):
+    """Operator routing assignments for future builds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy: dict[str, dict[str, str]]
 
 
 def _event_detail(event: dict) -> dict:
@@ -504,12 +519,13 @@ async def get_execution_detail(execution_id: str) -> dict:
 async def get_model_overview(window_hours: float = 168.0) -> dict:
     """Fleet-wide graph and statistics across builds and concrete routes."""
     routes, catalog = await asyncio.gather(_live_routes(), _model_catalog())
+    capacity = scheduler.orchestrator.capacity.report()
     overview = await model_overview(
         builds=scheduler.list_snapshots(200),
         trace_client=trace_client,
         ledger=scheduler.ledger,
         routing_path=os.environ.get("CTSWARM_ROUTING", "bench/results/routing.json"),
-        capacity=scheduler.orchestrator.capacity.report(),
+        capacity=capacity,
         routes=routes,
         window_hours=max(1.0, min(window_hours, 24.0 * 90.0)),
     )
@@ -518,7 +534,35 @@ async def get_model_overview(window_hours: float = 168.0) -> dict:
     overview["catalog_host"] = catalog.get("host", {})
     overview["catalog_local_only"] = bool(catalog.get("local_only", False))
     overview["catalog_error"] = str(catalog.get("error") or "")
+    overview["routing_policy"] = load_routing_policy(scheduler.ledger)
     return overview
+
+
+@app.get("/api/dashboard/routing-policy")
+async def get_routing_policy() -> dict:
+    """Return the operator policy applied when the next build is submitted."""
+    return {"policy": load_routing_policy(scheduler.ledger)}
+
+
+@app.put("/api/dashboard/routing-policy")
+async def put_routing_policy(request: RoutingPolicyRequest) -> dict:
+    """Validate and persist concrete work-to-provider assignments."""
+    try:
+        policy = normalize_routing_policy(request.policy)
+        catalog = await _model_catalog()
+        validate_policy_availability(
+            policy,
+            catalog=list(catalog.get("models") or []),
+            capacity=scheduler.orchestrator.capacity.report(),
+        )
+        saved = save_routing_policy(scheduler.ledger, policy)
+    except RoutingPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "policy": saved,
+        "applies_to": "new_builds",
+        "message": "Routing assignments saved for new builds.",
+    }
 
 
 async def _dashboard_stream_snapshot(build_id: str | None) -> dict:

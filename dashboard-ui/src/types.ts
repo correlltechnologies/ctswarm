@@ -141,6 +141,20 @@ export type ModelCatalogEntry = {
   } | null
 }
 
+export type RoutingTarget = "auto" | "ollama" | "openrouter" | "claude_code" | "codex"
+
+export type RoutingAssignment = {
+  target: RoutingTarget
+  model: string
+}
+
+export type RoutingPolicy = {
+  planning: RoutingAssignment
+  implementation: RoutingAssignment
+  review: RoutingAssignment
+  maintenance: RoutingAssignment
+}
+
 export type ModelOverview = {
   window_hours: number
   summary: {
@@ -170,6 +184,7 @@ export type ModelOverview = {
   catalog_host?: Record<string, unknown>
   catalog_local_only?: boolean
   catalog_error?: string
+  routing_policy: RoutingPolicy
   models: ModelMetric[]
   routes: Record<string, LiveRoute>
   graph: {

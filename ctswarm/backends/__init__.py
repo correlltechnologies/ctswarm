@@ -50,8 +50,15 @@ def build_backends(
     backends: dict[str, Backend] = {}
 
     if host.has_ollama or env.get("CTSWARM_OLLAMA_HOST"):
+        try:
+            context_ceiling = max(
+                0, int(env.get("CTSWARM_OLLAMA_CONTEXT_CEILING", "0"))
+            )
+        except (TypeError, ValueError):
+            context_ceiling = 0
         backends["ollama"] = OllamaBackend(
-            host=env.get("CTSWARM_OLLAMA_HOST", "http://localhost:11434")
+            host=env.get("CTSWARM_OLLAMA_HOST", "http://localhost:11434"),
+            context_ceiling=context_ceiling,
         )
 
     if host.has_mlx or env.get("CTSWARM_MLX_HOST"):

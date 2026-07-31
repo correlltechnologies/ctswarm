@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from ctswarm.capacity import Runtime
+from ctswarm.ledger import Ledger
 from ctswarm.orchestrator import (
     HOSTED_ROLES,
     BuildRecord,
@@ -15,7 +16,6 @@ from ctswarm.orchestrator import (
     runtime_model_overrides,
     update_record_from_execution,
 )
-from ctswarm.ledger import Ledger
 
 
 def test_production_delivery_context_requires_testable_acceptance() -> None:
@@ -289,3 +289,36 @@ def test_progress_fingerprint_ignores_heartbeat_only_updates() -> None:
     )
 
     assert record.last_progress_at == first_progress_at
+
+
+def test_child_status_transition_counts_as_semantic_progress(monkeypatch) -> None:
+    record = BuildRecord(
+        build_id="build-child-progress",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+    )
+    clock = iter((1_000.0, 1_100.0))
+    monkeypatch.setattr(time, "time", lambda: next(clock))
+
+    update_record_from_execution(
+        record,
+        {
+            "status": "running",
+            "_workflow_progress": {
+                "nodes": [{"execution_id": "child", "status": "running"}]
+            },
+        },
+    )
+    update_record_from_execution(
+        record,
+        {
+            "status": "running",
+            "_workflow_progress": {
+                "nodes": [{"execution_id": "child", "status": "succeeded"}]
+            },
+        },
+    )
+
+    assert record.last_progress_at == 1_100.0

@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS events (
     detail    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, ts);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 # A failure that means "this model is misbehaving" and should count toward the
@@ -261,6 +267,22 @@ class Ledger:
                 ),
             )
 
+    def set_setting(self, key: str, value: Any) -> None:
+        """Persist one operator-controlled setting as JSON.
+
+        Settings are deliberately separate from the append-only event log: the
+        current value is read on every new build, while changes are still
+        recorded as events by the caller for auditability.
+        """
+        payload = json.dumps(value, default=str)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+                " updated_at=excluded.updated_at",
+                (key, payload, time.time()),
+            )
+
     # -- reads -------------------------------------------------------------
 
     def is_open(self, model_ref: str) -> bool:
@@ -311,6 +333,19 @@ class Ledger:
                 "SELECT * FROM quota WHERE provider=?", (provider,)
             ).fetchone()
         return dict(row) if row else None
+
+    def setting(self, key: str, default: Any = None) -> Any:
+        """Return a JSON setting, falling back safely when it is absent/corrupt."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (TypeError, ValueError):
+            return default
 
     def events(self, kind: str | None = None, build_id: str | None = None) -> list[dict]:
         clauses, params = [], []

@@ -5,12 +5,36 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock
 
+from ctswarm.backends import build_backends
 from ctswarm.backends.base import ChatRequest, ChatResponse, FailureKind
 from ctswarm.backends.ollama import (
     OllamaBackend,
     _to_native_messages,
     _to_sse_lines,
 )
+from ctswarm.platform_detect import Accelerator, HostProfile
+
+
+async def test_backend_registry_enforces_configured_ollama_context_ceiling() -> None:
+    host = HostProfile(
+        os_name="Linux",
+        arch="x86_64",
+        accelerator=Accelerator.CPU,
+        accel_memory_gb=0,
+        system_memory_gb=16,
+    )
+    backends = build_backends(
+        host,
+        {
+            "CTSWARM_OLLAMA_HOST": "http://unused.invalid",
+            "CTSWARM_OLLAMA_CONTEXT_CEILING": "16384",
+        },
+    )
+
+    backend = backends["ollama"]
+    assert isinstance(backend, OllamaBackend)
+    assert backend.context_ceiling == 16384
+    await backend.close()
 
 
 def test_native_messages_decode_openai_tool_history() -> None:

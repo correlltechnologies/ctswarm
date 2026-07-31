@@ -38,6 +38,7 @@ import httpx
 
 from .capacity import CapacityManager, Runtime
 from .ledger import Ledger
+from .routing_config import apply_routing_policy, load_routing_policy
 
 
 class BuildState(str, Enum):
@@ -148,6 +149,7 @@ HOSTED_ROLES = (
     "architect",
     "tech_lead",
     "sprint_planner",
+    "issue_writer",
     "code_reviewer",
     "verifier",
 )
@@ -226,7 +228,7 @@ class Orchestrator:
         self.capacity = CapacityManager(ledger=self.ledger)
         self.status_interval_s = status_interval_s
         self.no_progress_timeout_s = (
-            float(os.environ.get("CTSWARM_NO_PROGRESS_TIMEOUT_S", "900"))
+            float(os.environ.get("CTSWARM_NO_PROGRESS_TIMEOUT_S", "1800"))
             if no_progress_timeout_s is None
             else no_progress_timeout_s
         )
@@ -281,6 +283,13 @@ class Orchestrator:
         )
         runtime = Runtime.OPEN_CODE
         providers, models = hybrid_role_policy(planning_runtime)
+        providers, models = apply_routing_policy(
+            load_routing_policy(self.ledger),
+            providers=providers,
+            models=models,
+            claude_model=runtime_model_overrides(Runtime.CLAUDE_CODE)["default"],
+            codex_model=runtime_model_overrides(Runtime.CODEX)["default"],
+        )
         record = BuildRecord(
             build_id=build_id, goal=goal, repo_url=repo_url, runtime=runtime
         )
@@ -369,7 +378,41 @@ class Orchestrator:
                 response = await client.get(
                     f"{self.agentfield_url}/api/v1/executions/{record.execution_id}"
                 )
-            body = response.json() if response.status_code == 200 else {}
+                body = response.json() if response.status_code == 200 else {}
+                workflow_id = str(
+                    body.get("run_id") or body.get("workflow_id") or ""
+                )
+                if workflow_id:
+                    workflow_response = await client.get(
+                        f"{self.agentfield_url}/api/ui/v1/workflows/"
+                        f"{workflow_id}/dag?mode=lightweight"
+                    )
+                    if workflow_response.status_code == 200:
+                        workflow = workflow_response.json()
+                        timeline = workflow.get("timeline")
+                        if not isinstance(timeline, list):
+                            timeline = []
+                        # The root execution can remain byte-for-byte unchanged
+                        # while children plan, code, and review. Include only
+                        # stable child state so those real transitions reset the
+                        # watchdog without allowing heartbeat churn to mask a
+                        # genuinely wedged workflow.
+                        body["_workflow_progress"] = {
+                            "status": workflow.get("workflow_status"),
+                            "total_nodes": workflow.get("total_nodes"),
+                            "nodes": sorted(
+                                (
+                                    {
+                                        "execution_id": node.get("execution_id"),
+                                        "reasoner_id": node.get("reasoner_id"),
+                                        "status": node.get("status"),
+                                    }
+                                    for node in timeline
+                                    if isinstance(node, dict)
+                                ),
+                                key=lambda node: str(node["execution_id"] or ""),
+                            ),
+                        }
         except (httpx.HTTPError, ValueError):
             return record
 
