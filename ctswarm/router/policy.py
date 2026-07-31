@@ -236,6 +236,69 @@ class Router:
         self.local_only = local_only
         self._catalog: tuple[CatalogEntry, ...] = build_catalog(host, backends)
 
+    def catalog_snapshot(
+        self,
+        *,
+        installed_by_backend: dict[str, set[str]],
+        warm_by_backend: dict[str, set[str]],
+    ) -> list[dict]:
+        """Explain every configured model's current operational availability.
+
+        This uses the same hard gates as dispatch so the operator catalog cannot
+        label a model available while the router would reject it.
+        """
+        rows: list[dict] = []
+        for entry in self._catalog:
+            spec = entry.spec
+            backend_installed = installed_by_backend.get(spec.backend, set())
+            backend_warm = warm_by_backend.get(spec.backend, set())
+            installed = spec.ref in backend_installed
+            routable_tiers: list[str] = []
+            exclusions: dict[str, str] = {}
+
+            for tier in spec.tiers:
+                if spec.backend in installed_by_backend and not installed:
+                    reason = "not installed on backend"
+                else:
+                    reason = self._ineligible_reason(
+                        entry,
+                        tier=tier,
+                        needs_tools=True,
+                        min_context=8192,
+                        privacy=Privacy.ANY,
+                        installed=backend_installed,
+                        warm=backend_warm,
+                    )
+                if reason:
+                    exclusions[tier.value] = reason
+                else:
+                    routable_tiers.append(tier.value)
+
+            benchmark = self.table.get(spec.ref)
+            row = entry.to_dict()
+            row.update(
+                {
+                    "installed": installed,
+                    "warm": spec.ref in backend_warm,
+                    "routable": bool(routable_tiers),
+                    "routable_tiers": routable_tiers,
+                    "exclusions": exclusions,
+                    "benchmark": benchmark.to_dict() if benchmark else None,
+                    "circuit_open": self.ledger.is_open(spec.ref),
+                }
+            )
+            rows.append(row)
+
+        return sorted(
+            rows,
+            key=lambda row: (
+                not row["routable"],
+                row["placement"] == "hosted",
+                row["backend"],
+                row["ref"],
+            ),
+        )
+
     # -- eligibility -------------------------------------------------------
 
     def _ineligible_reason(

@@ -114,6 +114,33 @@ export type Capacity = {
   reason: string
 }
 
+export type ModelCatalogEntry = {
+  ref: string
+  backend: string
+  weight_gb: number
+  context: number
+  tiers: string[]
+  placement: string
+  penalty: number
+  usable: boolean
+  verified_ref: boolean
+  notes: string
+  installed: boolean
+  warm: boolean
+  routable: boolean
+  routable_tiers: string[]
+  exclusions: Record<string, string>
+  circuit_open: boolean
+  benchmark?: {
+    quality: number
+    eligible: boolean
+    tokens_per_s: number
+    p50_latency_ms: number
+    tool_call_rate: number
+    schema_rate: number
+  } | null
+}
+
 export type ModelOverview = {
   window_hours: number
   summary: {
@@ -133,6 +160,16 @@ export type ModelOverview = {
     cost_usd: number
   }
   capacity: Record<string, Capacity>
+  catalog: ModelCatalogEntry[]
+  catalog_summary: {
+    configured?: number
+    installed?: number
+    routable?: number
+    measured?: number
+  }
+  catalog_host?: Record<string, unknown>
+  catalog_local_only?: boolean
+  catalog_error?: string
   models: ModelMetric[]
   routes: Record<string, LiveRoute>
   graph: {

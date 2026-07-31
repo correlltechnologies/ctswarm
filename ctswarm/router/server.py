@@ -229,6 +229,30 @@ async def list_models(request: Request) -> JSONResponse:
     return JSONResponse({"object": "list", "data": entries})
 
 
+@app.get("/catalog")
+async def model_catalog(request: Request) -> JSONResponse:
+    """Return the curated model catalog with live policy eligibility."""
+    state: RouterState = request.app.state.ctswarm
+    await state.discover()
+    models = state.router.catalog_snapshot(
+        installed_by_backend=state._installed,
+        warm_by_backend=state._warm,
+    )
+    return JSONResponse(
+        {
+            "models": models,
+            "host": state.host.to_dict(),
+            "local_only": state.router.local_only,
+            "summary": {
+                "configured": len(models),
+                "installed": sum(bool(model["installed"]) for model in models),
+                "routable": sum(bool(model["routable"]) for model in models),
+                "measured": sum(model["benchmark"] is not None for model in models),
+            },
+        }
+    )
+
+
 @app.get("/routing/explain")
 async def explain(
     request: Request,

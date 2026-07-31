@@ -350,6 +350,19 @@ async def _live_routes() -> dict[str, dict[str, Any]]:
     return routes
 
 
+async def _model_catalog() -> dict[str, Any]:
+    """Fetch the router's curated availability catalog for the operator UI."""
+    base_url = os.environ.get("CTSWARM_ROUTER_URL", "http://ctswarm-router:8090")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{base_url}/catalog")
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, dict) else {}
+    except (httpx.HTTPError, ValueError):
+        return {"models": [], "error": "router catalog unavailable"}
+
+
 def _enrich_trace_routes(trace: dict, routes: dict[str, dict[str, Any]]) -> dict:
     for node in trace.get("timeline", []):
         requested = str(node.get("model") or "")
@@ -490,8 +503,8 @@ async def get_execution_detail(execution_id: str) -> dict:
 @app.get("/api/dashboard/models")
 async def get_model_overview(window_hours: float = 168.0) -> dict:
     """Fleet-wide graph and statistics across builds and concrete routes."""
-    routes = await _live_routes()
-    return await model_overview(
+    routes, catalog = await asyncio.gather(_live_routes(), _model_catalog())
+    overview = await model_overview(
         builds=scheduler.list_snapshots(200),
         trace_client=trace_client,
         ledger=scheduler.ledger,
@@ -500,6 +513,12 @@ async def get_model_overview(window_hours: float = 168.0) -> dict:
         routes=routes,
         window_hours=max(1.0, min(window_hours, 24.0 * 90.0)),
     )
+    overview["catalog"] = catalog.get("models", [])
+    overview["catalog_summary"] = catalog.get("summary", {})
+    overview["catalog_host"] = catalog.get("host", {})
+    overview["catalog_local_only"] = bool(catalog.get("local_only", False))
+    overview["catalog_error"] = str(catalog.get("error") or "")
+    return overview
 
 
 async def _dashboard_stream_snapshot(build_id: str | None) -> dict:
