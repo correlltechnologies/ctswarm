@@ -18,7 +18,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -32,6 +32,16 @@ from .capacity import Runtime
 from .ledger import Ledger
 from .observability import AgentFieldTraceClient, harness_label, model_overview
 from .orchestrator import BuildRecord, BuildState, Orchestrator, load_build
+from .project_workspace import (
+    ProjectWorkspaceError,
+    detect_scm,
+    discover_mcp_servers,
+    discover_projects,
+    project_details,
+    resolve_project,
+    selected_mcp_context,
+    validate_remote,
+)
 from .routing_config import (
     RoutingPolicyError,
     load_routing_policy,
@@ -68,6 +78,34 @@ class BuildRequest(BaseModel):
     require_strong_planning: bool = True
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     # Zero means no scheduler deadline; the owner can still pause or stop.
+    max_hours: float = Field(default=0.0, ge=0, le=720)
+    project_id: str = Field(default="", max_length=1024)
+    project_path: str = Field(default="", max_length=4096)
+    scm_provider: Literal[
+        "github", "bitbucket", "gitlab", "azure_devops", "other", "local"
+    ] = "github"
+    source_branch: str = Field(default="", max_length=255)
+    create_pull_request: bool = True
+    mcp_servers: list[str] = Field(default_factory=list, max_length=64)
+
+
+class SwarmLaunchRequest(BaseModel):
+    """One message plus its project/integration context from Mission Control."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal: str = Field(min_length=1, max_length=100_000)
+    project_id: str = Field(default="", max_length=1024)
+    repo_url: str = Field(default="", max_length=4096)
+    scm_provider: Literal[
+        "auto", "github", "bitbucket", "gitlab", "azure_devops", "other", "local"
+    ] = "auto"
+    source_branch: str = Field(default="", max_length=255)
+    create_pull_request: bool = True
+    inherit_mcp: bool = True
+    mcp_servers: list[str] | None = Field(default=None, max_length=64)
+    require_strong_planning: bool = True
+    max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     max_hours: float = Field(default=0.0, ge=0, le=720)
 
 
@@ -160,28 +198,42 @@ class BuildScheduler:
         return list(requests.items())
 
     def snapshot(self, build_id: str) -> dict | None:
+        queued = self.ledger.events(kind=BUILD_ENQUEUED, build_id=build_id)
+        request_detail = _event_detail(queued[-1]) if queued else {}
+        metadata = {
+            key: request_detail.get(key, [] if key == "mcp_servers" else "")
+            for key in (
+                "project_id",
+                "project_path",
+                "scm_provider",
+                "source_branch",
+                "mcp_servers",
+            )
+        }
+        metadata["create_pull_request"] = bool(
+            request_detail.get("create_pull_request", True)
+        )
         terminal = self.ledger.events(kind=BUILD_TERMINAL, build_id=build_id)
         if terminal:
-            return _event_detail(terminal[-1])
+            return {**_event_detail(terminal[-1]), **metadata}
 
         record = load_build(self.ledger, build_id)
         if record is not None:
-            return record.to_dict()
+            return {**record.to_dict(), **metadata}
 
-        queued = self.ledger.events(kind=BUILD_ENQUEUED, build_id=build_id)
         if not queued:
             return None
-        detail = _event_detail(queued[-1])
         return {
             "build_id": build_id,
-            "goal": detail.get("goal", ""),
-            "repo_url": detail.get("repo_url", ""),
+            "goal": request_detail.get("goal", ""),
+            "repo_url": request_detail.get("repo_url", ""),
             "state": BuildState.QUEUED.value,
             "execution_id": "",
             "phase_detail": "waiting for a scheduler slot",
             "pr_url": "",
             "error": "",
             "gate_results": {},
+            **metadata,
         }
 
     def list_snapshots(self, limit: int = 50) -> list[dict]:
@@ -252,6 +304,17 @@ class BuildScheduler:
                         repo_url=request.repo_url,
                         require_strong_planning=request.require_strong_planning,
                         max_ci_fix_cycles=request.max_ci_fix_cycles,
+                        scm_provider=request.scm_provider,
+                        source_branch=request.source_branch,
+                        create_pull_request=request.create_pull_request,
+                        mcp_context=selected_mcp_context(
+                            request.mcp_servers,
+                            discover_mcp_servers(
+                                Path(request.project_path)
+                                if request.project_path
+                                else None
+                            ),
+                        ),
                         build_id=build_id,
                     )
                 if not record.state.terminal:
@@ -437,6 +500,111 @@ async def health() -> dict:
 @app.get("/builds")
 async def list_builds(limit: int = 50) -> dict:
     return {"builds": scheduler.list_snapshots(max(1, min(limit, 200)))}
+
+
+@app.get("/api/projects")
+async def list_projects() -> dict:
+    """Return Git repositories beneath the configured projects root."""
+    return {"projects": await asyncio.to_thread(discover_projects)}
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str, history_limit: int = 30) -> dict:
+    try:
+        return await asyncio.to_thread(
+            project_details,
+            project_id,
+            history_limit=max(1, min(history_limit, 100)),
+        )
+    except ProjectWorkspaceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/mcp-servers")
+async def list_mcp_servers(project_id: str = "") -> dict:
+    try:
+        project_path = resolve_project(project_id) if project_id else None
+        servers = await asyncio.to_thread(discover_mcp_servers, project_path)
+    except ProjectWorkspaceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "servers": servers,
+        "privacy": (
+            "Only server names, source runtimes, transport types, and readiness "
+            "are exposed. Configuration values and credentials remain hidden."
+        ),
+    }
+
+
+@app.post("/api/swarms", status_code=status.HTTP_202_ACCEPTED)
+async def launch_swarm(request: SwarmLaunchRequest, response: Response) -> dict:
+    """Resolve a project/message into one durable build queue item."""
+    try:
+        project = project_details(request.project_id) if request.project_id else None
+        repo_url = (
+            str(project.get("remote_url") or project["path"])
+            if project
+            else validate_remote(request.repo_url)
+        )
+        repo_url = validate_remote(repo_url)
+        inferred_provider = detect_scm(repo_url)
+        scm_provider = (
+            inferred_provider if request.scm_provider == "auto" else request.scm_provider
+        )
+        project_path = str(project["path"]) if project else ""
+        source_branch = request.source_branch or (
+            str(project.get("default_branch") or project.get("branch") or "")
+            if project
+            else ""
+        )
+        inventory = discover_mcp_servers(Path(project_path) if project_path else None)
+        known_servers = {item["id"] for item in inventory}
+        if not request.inherit_mcp:
+            selected_servers: list[str] = []
+        elif request.mcp_servers is None:
+            selected_servers = [
+                item["id"] for item in inventory if item.get("available")
+            ]
+        else:
+            unknown = sorted(set(request.mcp_servers) - known_servers)
+            if unknown:
+                raise ProjectWorkspaceError(
+                    f"unknown MCP server selection: {', '.join(unknown)}"
+                )
+            selected_servers = list(dict.fromkeys(request.mcp_servers))
+    except ProjectWorkspaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    build_request = BuildRequest(
+        goal=request.goal,
+        repo_url=repo_url,
+        require_strong_planning=request.require_strong_planning,
+        max_ci_fix_cycles=request.max_ci_fix_cycles,
+        max_hours=request.max_hours,
+        project_id=request.project_id,
+        project_path=project_path,
+        scm_provider=scm_provider,
+        source_branch=source_branch,
+        create_pull_request=bool(
+            request.create_pull_request and scm_provider == "github"
+        ),
+        mcp_servers=selected_servers,
+    )
+    try:
+        build_id = scheduler.enqueue(build_request)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response.headers["Location"] = f"/builds/{build_id}"
+    snapshot = scheduler.snapshot(build_id) or {
+        "build_id": build_id,
+        "state": "queued",
+    }
+    if request.create_pull_request and scm_provider != "github":
+        snapshot["delivery_notice"] = (
+            "Automatic publishing currently uses GitHub. This provider will run "
+            "and verify the build, but the result will not be published automatically."
+        )
+    return snapshot
 
 
 @app.post("/builds", status_code=status.HTTP_202_ACCEPTED)

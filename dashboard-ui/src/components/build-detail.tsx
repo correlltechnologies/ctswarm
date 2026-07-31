@@ -116,6 +116,13 @@ export function BuildDetail({
 
       {(build.error || trace?.error) && <Alert variant="destructive"><AlertTitle>Build needs attention</AlertTitle><AlertDescription>{build.error || trace?.error}</AlertDescription></Alert>}
 
+      {(build.project_path || build.scm_provider || build.mcp_servers?.length) && <Card><CardHeader><CardTitle>Workflow context</CardTitle><CardDescription>The repository and existing tool configuration attached when this swarm was launched.</CardDescription></CardHeader><CardContent className="grid gap-px bg-border p-0 sm:grid-cols-2 xl:grid-cols-4">{[
+        ["Project folder", build.project_path || build.repo_url],
+        ["Git provider", (build.scm_provider || "other").replaceAll("_", " ")],
+        ["Starting branch", build.source_branch || "Remote default"],
+        ["Inherited MCP servers", build.mcp_servers?.map((server) => server.replace(/^claude:|^codex:/, "")).join(", ") || "None"],
+      ].map(([label, value]) => <div key={label} className="min-w-0 bg-card p-4"><p className="text-[10px] uppercase tracking-[.12em] text-muted-foreground">{label}</p><p className="mt-2 break-words text-xs leading-5">{value}</p></div>)}</CardContent></Card>}
+
       <Card className="grid overflow-hidden sm:grid-cols-2 xl:grid-cols-5">
         <Metric label="State" value={build.state} detail={`${formatDuration(build.elapsed_s || 0)} elapsed`} />
         <Metric label="Harness" value={trace?.harness || build.runtime || "Pending"} detail={trace?.runtime || build.runtime || "not assigned"} />

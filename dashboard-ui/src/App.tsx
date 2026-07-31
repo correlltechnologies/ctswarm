@@ -15,9 +15,11 @@ import { cn } from "@/lib/utils"
 import { useDashboardStream } from "@/hooks/use-dashboard-stream"
 import type { Approval, Build, ModelOverview, Trace } from "@/types"
 
-type View = "fleet" | "builds"
+type View = "launch" | "repositories" | "fleet" | "builds"
 
 const ModelFleet = lazy(() => import("@/components/model-fleet").then((module) => ({ default: module.ModelFleet })))
+const SwarmLauncher = lazy(() => import("@/components/swarm-launcher").then((module) => ({ default: module.SwarmLauncher })))
+const RepositoryBrowser = lazy(() => import("@/components/repository-browser").then((module) => ({ default: module.RepositoryBrowser })))
 
 function BuildList({ builds, selected, query, onQuery, onSelect }: { builds: Build[]; selected: string; query: string; onQuery: (value: string) => void; onSelect: (id: string) => void }) {
   const visible = useMemo(() => {
@@ -52,8 +54,10 @@ function Sidebar({ view, setView, builds, selected, query, setQuery, selectBuild
     <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
       <div className="flex h-16 items-center px-4"><div><div className="text-sm font-semibold tracking-[-0.01em]">ctswarm</div><div className="text-[11px] text-muted-foreground">Mission control</div></div></div>
       <nav className="space-y-1 px-2 pb-3" aria-label="Dashboard sections">
+        <Button variant={view === "launch" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("launch")}>New swarm</Button>
         <Button variant={view === "builds" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("builds")}>Builds <span className="ml-auto font-mono text-[10px]">{builds.length}</span></Button>
-        <Button variant={view === "fleet" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("fleet")}>Model fleet</Button>
+        <Button variant={view === "repositories" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("repositories")}>Repositories</Button>
+        <Button variant={view === "fleet" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("fleet")}>Models and routing</Button>
       </nav>
       <Separator />
       <div className="px-4 py-3 text-[10px] font-medium uppercase tracking-[.14em] text-muted-foreground">Recent builds</div>
@@ -65,7 +69,7 @@ function Sidebar({ view, setView, builds, selected, query, setQuery, selectBuild
 
 export function App() {
   const { theme, setTheme } = useTheme()
-  const [view, setView] = useState<View>("builds")
+  const [view, setView] = useState<View>("launch")
   const [builds, setBuilds] = useState<Build[]>([])
   const [selected, setSelected] = useState("")
   const [build, setBuild] = useState<Build | null>(null)
@@ -77,6 +81,7 @@ export function App() {
   const [query, setQuery] = useState("")
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [launchProjectId, setLaunchProjectId] = useState("")
   const selectedRequest = useRef(0)
   const stream = useDashboardStream(selected)
 
@@ -145,12 +150,19 @@ export function App() {
         <header className="sticky top-0 z-30 flex min-h-14 items-center justify-between border-b bg-background/95 px-4 backdrop-blur lg:min-h-16 lg:px-6">
           <div className="flex min-w-0 items-center gap-3">
             <Sheet open={mobileOpen} onOpenChange={setMobileOpen}><SheetTrigger asChild><Button variant="ghost" size="icon" className="lg:hidden"><Menu /><span className="sr-only">Open navigation</span></Button></SheetTrigger><SheetContent side="left" className="w-[min(320px,90vw)] p-0"><SheetHeader className="sr-only"><SheetTitle>Navigation</SheetTitle></SheetHeader><Sidebar {...sidebarProps} /></SheetContent></Sheet>
-            <div className="min-w-0"><div className="break-words text-sm font-medium">{view === "fleet" ? "Model fleet" : build ? repoName(build.repo_url) : "Builds"}</div><div className="mt-0.5 flex flex-wrap items-center gap-1.5 font-mono text-[10px] text-muted-foreground"><span className={cn("size-1.5 rounded-[2px] bg-amber-500", stream.state === "live" && "bg-emerald-600")} />{stream.state === "live" && updatedAt ? `Live · updated ${updatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : stream.state}</div></div>
+            <div className="min-w-0"><div className="break-words text-sm font-medium">{view === "launch" ? "New swarm" : view === "repositories" ? "Repositories" : view === "fleet" ? "Models and routing" : build ? repoName(build.repo_url) : "Builds"}</div><div className="mt-0.5 flex flex-wrap items-center gap-1.5 font-mono text-[10px] text-muted-foreground"><span className={cn("size-1.5 rounded-[2px] bg-amber-500", stream.state === "live" && "bg-emerald-600")} />{stream.state === "live" && updatedAt ? `Live · updated ${updatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : stream.state}</div></div>
           </div>
           <Button variant="ghost" size="icon" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}<span className="sr-only">Toggle theme</span></Button>
         </header>
         <main className="mx-auto w-full max-w-[1400px] p-4 sm:p-6">
-          {view === "fleet" ? <Suspense fallback={<Skeleton className="h-[36rem]" />}><ModelFleet overview={overview} loading={overviewLoading} error={overviewError} onRefresh={() => void loadOverview()} /></Suspense> : build ? <BuildDetail build={build} trace={trace} approvals={approvals} inferenceCalls={stream.snapshot?.inference_calls || []} streamState={stream.state} streamError={stream.error || stream.snapshot?.stream_error || ""} onReload={async () => { await loadBuilds(); await loadSelected() }} /> : builds.length ? <Skeleton className="h-96" /> : <div className="grid min-h-[60vh] place-items-center text-center"><div><h1 className="text-lg font-semibold">No builds yet</h1><p className="mt-1 max-w-md text-sm text-muted-foreground">Submit a build and its planning, implementation, verification, and acceptance evidence will appear here.</p></div></div>}
+          <Suspense fallback={<Skeleton className="h-[36rem]" />}>
+            {view === "launch" ? <SwarmLauncher key={launchProjectId} initialProjectId={launchProjectId} onLaunched={(nextBuild) => { setBuilds((current) => [nextBuild, ...current.filter((item) => item.build_id !== nextBuild.build_id)]); selectBuild(nextBuild.build_id) }} />
+              : view === "repositories" ? <RepositoryBrowser onLaunch={(projectId) => { setLaunchProjectId(projectId); setView("launch") }} />
+                : view === "fleet" ? <ModelFleet overview={overview} loading={overviewLoading} error={overviewError} onRefresh={() => void loadOverview()} />
+                  : build ? <BuildDetail build={build} trace={trace} approvals={approvals} inferenceCalls={stream.snapshot?.inference_calls || []} streamState={stream.state} streamError={stream.error || stream.snapshot?.stream_error || ""} onReload={async () => { await loadBuilds(); await loadSelected() }} />
+                    : builds.length ? <Skeleton className="h-96" />
+                      : <div className="grid min-h-[60vh] place-items-center text-center"><div><h1 className="text-lg font-semibold">No builds yet</h1><p className="mt-1 max-w-md text-sm text-muted-foreground">Start a swarm and its planning, implementation, verification, and acceptance evidence will appear here.</p></div></div>}
+          </Suspense>
         </main>
       </div>
     </div>

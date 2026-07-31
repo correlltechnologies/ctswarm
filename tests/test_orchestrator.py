@@ -56,13 +56,25 @@ async def test_submit_sends_production_contract_to_planner(monkeypatch, tmp_path
     monkeypatch.setattr(orchestrator.capacity, "select", lambda **_kwargs: (Runtime.OPEN_CODE, "test"))
     monkeypatch.setattr("ctswarm.orchestrator.httpx.AsyncClient", Client)
 
-    result = await orchestrator.submit(goal="Ship the complete app", repo_url="https://example.invalid/repo")
+    result = await orchestrator.submit(
+        goal="Ship the complete app",
+        repo_url="https://bitbucket.org/example/repo.git",
+        scm_provider="bitbucket",
+        source_branch="develop",
+        create_pull_request=True,
+        mcp_context="Inherited MCP context:\n- vercel via Claude Code (remote)",
+    )
 
     assert result.execution_id == "exec-production"
     contract = captured["json"]["input"]["additional_context"]
     assert "Ship the complete app" in contract
     assert "Acceptance evidence required before success" in contract
+    assert "Repository provider: bitbucket" in contract
+    assert "Starting branch: develop" in contract
+    assert "vercel via Claude Code" in contract
     assert captured["json"]["input"]["config"]["max_verify_fix_cycles"] == 3
+    assert captured["json"]["input"]["config"]["enable_github_pr"] is False
+    assert captured["json"]["input"]["config"]["github_pr_base"] == "develop"
 
 
 def test_open_code_uses_router_virtual_models() -> None:

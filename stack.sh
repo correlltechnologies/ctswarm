@@ -41,8 +41,16 @@ COMPOSE=(docker compose
   -f vendor/SWE-AF/docker-compose.yml
   -f infra/docker-compose.ctswarm.yml)
 
+refresh_mcp_inventory() {
+  # The dashboard receives metadata only. Operational commands, arguments,
+  # endpoints, environment, and credentials remain in the worker-only configs.
+  python3 -m ctswarm.project_workspace \
+    --write-inventory bench/results/mcp-inventory.json
+}
+
 case "${1:-up}" in
   up)
+    refresh_mcp_inventory
     # Infrastructure first so a slow agent image build does not hide a broken
     # control plane or router behind it.
     "${COMPOSE[@]}" up -d control-plane build-db ctswarm-router ctswarm-approvals
@@ -82,7 +90,10 @@ case "${1:-up}" in
   nuke)    "${COMPOSE[@]}" down -v ;;
   logs)    shift; "${COMPOSE[@]}" logs -f "$@" ;;
   ps)      "${COMPOSE[@]}" ps ;;
-  restart) "${COMPOSE[@]}" restart swe-agent swe-fast ;;
+  restart)
+    refresh_mcp_inventory
+    "${COMPOSE[@]}" restart swe-agent swe-fast
+    ;;
   build)   shift; "${COMPOSE[@]}" build "$@" ;;
   recreate)
     shift
@@ -90,6 +101,7 @@ case "${1:-up}" in
       echo "recreate requires at least one service name" >&2
       exit 2
     fi
+    refresh_mcp_inventory
     "${COMPOSE[@]}" up -d --no-deps --force-recreate "$@"
     ;;
   config)  "${COMPOSE[@]}" config ;;

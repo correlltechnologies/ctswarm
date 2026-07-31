@@ -133,6 +133,9 @@ services:
       - CTSWARM_APPROVALS_URL=http://ctswarm-approvals:8091
       - CTSWARM_ROUTER_URL=http://ctswarm-router:8090
       - CTSWARM_ROUTING=/bench-results/routing.json
+      - CTSWARM_PROJECTS_ROOT=${HOME}/Desktop/Projects
+      - CTSWARM_PROJECT_SCAN_DEPTH=${CTSWARM_PROJECT_SCAN_DEPTH:-3}
+      - CTSWARM_MCP_INVENTORY=/bench-results/mcp-inventory.json
       - CTSWARM_MAX_CONCURRENT_BUILDS=${CTSWARM_MAX_CONCURRENT_BUILDS:-1}
       - CTSWARM_SCHEDULER_POLL_SECONDS=${CTSWARM_SCHEDULER_POLL_SECONDS:-10}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
@@ -149,6 +152,9 @@ services:
       - ctswarm-state:/state
       - ./bench/results:/bench-results:ro
       - ${HOME}/.codex:/home/ctswarm/.codex:ro
+      # Repository inspection is read-only. Builds still clone into isolated
+      # AgentField workspaces before making changes.
+      - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
     depends_on:
       swe-agent:
         condition: service_healthy
@@ -207,6 +213,12 @@ services:
       # profile can contain thousands of skills and hundreds of MB of caches;
       # exposing it made every CLI invocation scan unrelated host state.
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+      # Reuse the operator's existing MCP registrations and Codex login. These
+      # files remain read-only and are never copied into an image or the ledger.
+      - ${HOME}/.claude.json:/root/.claude.json:ro
+      - ${HOME}/.codex/config.toml:/root/.codex/config.toml:ro
+      - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
+      - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
     depends_on:
       ctswarm-router:
         condition: service_healthy
@@ -227,6 +239,10 @@ services:
     volumes:
       - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+      - ${HOME}/.claude.json:/root/.claude.json:ro
+      - ${HOME}/.codex/config.toml:/root/.codex/config.toml:ro
+      - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
+      - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
     depends_on:
       ctswarm-router:
         condition: service_healthy

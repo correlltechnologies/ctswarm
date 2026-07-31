@@ -11,6 +11,67 @@ export type Build = {
   pr_url?: string
   error?: string
   gate_results?: Record<string, unknown>
+  project_id?: string
+  project_path?: string
+  scm_provider?: string
+  source_branch?: string
+  create_pull_request?: boolean
+  mcp_servers?: string[]
+  delivery_notice?: string
+}
+
+export type ProjectSummary = {
+  id: string
+  name: string
+  relative_path: string
+  path: string
+  remote_url: string
+  scm_provider: string
+  branch: string
+  default_branch?: string
+  dirty: boolean
+  staged: number
+  modified: number
+  untracked: number
+  ahead: number
+  behind: number
+  worktree_count: number
+}
+
+export type GitCommit = {
+  commit: string
+  short: string
+  author: string
+  committed_at: string
+  subject: string
+  refs: string
+}
+
+export type GitWorktree = {
+  path: string
+  head: string
+  branch: string
+  bare: boolean
+  detached: boolean
+  locked: boolean
+  prunable: boolean
+  current: boolean
+}
+
+export type ProjectDetails = ProjectSummary & {
+  history: GitCommit[]
+  worktrees: GitWorktree[]
+}
+
+export type McpServer = {
+  id: string
+  name: string
+  source: "claude" | "codex"
+  runtime: string
+  transport: string
+  available: boolean
+  note: string
+  project_specific?: boolean
 }
 
 export type TraceNode = {

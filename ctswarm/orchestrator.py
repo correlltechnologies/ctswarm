@@ -203,6 +203,29 @@ Acceptance evidence required before success:
 """
 
 
+def workflow_integration_context(
+    *, scm_provider: str, source_branch: str, create_pull_request: bool, mcp_context: str
+) -> str:
+    """Describe operator-selected repository delivery and inherited tools."""
+    delivery = (
+        "Create a pull request after verification."
+        if create_pull_request and scm_provider == "github"
+        else (
+            "Keep the verified integration branch in the build workspace, report its "
+            "exact name, and state clearly that it was not published automatically."
+        )
+    )
+    branch = source_branch or "the repository's remote default branch"
+    return f"""WORKFLOW INTEGRATION
+
+Repository provider: {scm_provider.replace('_', ' ')}
+Starting branch: {branch}
+Delivery: {delivery}
+
+{mcp_context}
+"""
+
+
 class Orchestrator:
     """Drives one build from goal to gated result."""
 
@@ -273,6 +296,10 @@ class Orchestrator:
         repo_url: str,
         require_strong_planning: bool = True,
         max_ci_fix_cycles: int = 2,
+        scm_provider: str = "github",
+        source_branch: str = "",
+        create_pull_request: bool = True,
+        mcp_context: str = "",
         build_id: str | None = None,
     ) -> BuildRecord:
         """Start a SWE-AF build with a capacity-chosen runtime."""
@@ -324,13 +351,27 @@ class Orchestrator:
             "max_verify_fix_cycles": 3,
             "continuous_repair": True,
             "models": models,
+            "enable_github_pr": bool(
+                create_pull_request and scm_provider == "github"
+            ),
         }
+        if source_branch:
+            config["github_pr_base"] = source_branch
 
         payload = {
             "goal": goal,
             "repo_url": repo_url,
-            "enable_github_pr": True,
-            "additional_context": production_delivery_context(goal),
+            "additional_context": "\n\n".join(
+                (
+                    production_delivery_context(goal),
+                    workflow_integration_context(
+                        scm_provider=scm_provider,
+                        source_branch=source_branch,
+                        create_pull_request=create_pull_request,
+                        mcp_context=mcp_context,
+                    ),
+                )
+            ),
             "config": config,
         }
 
