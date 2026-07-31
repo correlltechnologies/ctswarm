@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Boxes, ChartNetwork, Hammer, Menu, Moon, Radio, Search, Sun } from "lucide-react"
+import { Menu, Moon, Sun } from "lucide-react"
 
 import { BuildDetail } from "@/components/build-detail"
 import { StatusBadge } from "@/components/status-badge"
@@ -9,7 +9,6 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useTheme } from "@/components/theme-provider"
 import { api, formatDuration, repoName } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -18,81 +17,55 @@ import type { Approval, Build, ModelOverview, Trace } from "@/types"
 
 type View = "fleet" | "builds"
 
-const ModelFleet = lazy(() =>
-  import("@/components/model-fleet").then((module) => ({ default: module.ModelFleet })),
-)
+const ModelFleet = lazy(() => import("@/components/model-fleet").then((module) => ({ default: module.ModelFleet })))
 
-function BuildList({
-  builds,
-  selected,
-  query,
-  onQuery,
-  onSelect,
-}: {
-  builds: Build[]
-  selected: string
-  query: string
-  onQuery: (value: string) => void
-  onSelect: (id: string) => void
-}) {
+function BuildList({ builds, selected, query, onQuery, onSelect }: { builds: Build[]; selected: string; query: string; onQuery: (value: string) => void; onSelect: (id: string) => void }) {
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase()
     return needle ? builds.filter((item) => `${item.build_id} ${item.goal} ${item.repo_url} ${item.state}`.toLowerCase().includes(needle)) : builds
   }, [builds, query])
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="relative mx-3 mb-3"><Search className="absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" /><Input value={query} onChange={(event) => onQuery(event.target.value)} className="h-9 bg-background/50 pl-8 text-xs" placeholder="Search builds" /></div>
+      <div className="mx-3 mb-3"><Input aria-label="Search builds" value={query} onChange={(event) => onQuery(event.target.value)} className="h-9 bg-background text-xs" placeholder="Search builds" /></div>
       <ScrollArea className="min-h-0 flex-1 px-2">
         <div className="space-y-1 pb-4">
-          {visible.map((build) => (
-            <button key={build.build_id} onClick={() => onSelect(build.build_id)} className={cn("w-full rounded-lg border border-transparent p-3 text-left transition-colors hover:bg-accent/60", selected === build.build_id && "border-border bg-accent") }>
-              <div className="flex items-start justify-between gap-2"><span className="min-w-0 truncate text-sm font-medium">{repoName(build.repo_url)}</span><StatusBadge value={build.state} /></div>
-              <div className="mt-2 truncate font-mono text-[10px] text-muted-foreground">{build.build_id}</div>
-              <div className="mt-2 flex justify-between text-[11px] text-muted-foreground"><span>{(build.runtime || "pending").replaceAll("_", " ")}</span><span className="font-mono">{formatDuration(build.elapsed_s || 0)}</span></div>
+          {visible.map((item) => (
+            <button key={item.build_id} onClick={() => onSelect(item.build_id)} className={cn("w-full rounded-[6px] border border-transparent p-3 text-left transition-colors hover:bg-accent", selected === item.build_id && "border-border bg-accent")}>
+              <div className="flex min-w-0 flex-wrap items-start justify-between gap-x-3 gap-y-1">
+                <span className="min-w-0 break-words text-sm font-medium">{repoName(item.repo_url)}</span>
+                <StatusBadge value={item.state} />
+              </div>
+              <div className="mt-2 break-all font-mono text-[10px] text-muted-foreground">{item.build_id}</div>
+              <div className="mt-2 flex flex-wrap justify-between gap-2 text-[11px] text-muted-foreground"><span>{(item.runtime || "pending").replaceAll("_", " ")}</span><span className="font-mono">{formatDuration(item.elapsed_s || 0)}</span></div>
             </button>
           ))}
-          {!visible.length && <div className="p-6 text-center text-xs text-muted-foreground">No builds match.</div>}
+          {!visible.length && <div className="p-6 text-center text-xs text-muted-foreground">No builds match this search.</div>}
         </div>
       </ScrollArea>
     </div>
   )
 }
 
-function Sidebar({
-  view,
-  setView,
-  builds,
-  selected,
-  query,
-  setQuery,
-  selectBuild,
-}: {
-  view: View
-  setView: (view: View) => void
-  builds: Build[]
-  selected: string
-  query: string
-  setQuery: (value: string) => void
-  selectBuild: (id: string) => void
-}) {
+function Sidebar({ view, setView, builds, selected, query, setQuery, selectBuild }: { view: View; setView: (view: View) => void; builds: Build[]; selected: string; query: string; setQuery: (value: string) => void; selectBuild: (id: string) => void }) {
   return (
     <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
-      <div className="flex h-16 items-center gap-3 px-4"><div className="grid size-8 place-items-center rounded-lg bg-primary text-primary-foreground"><Boxes className="size-4" /></div><div><div className="text-sm font-semibold">ctswarm</div><div className="text-[11px] text-muted-foreground">Mission Control</div></div></div>
-      <div className="space-y-1 px-2 pb-3">
-        <Button variant={view === "fleet" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("fleet")}><ChartNetwork /> Model fleet</Button>
-        <Button variant={view === "builds" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("builds")}><Hammer /> Builds <span className="ml-auto rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{builds.length}</span></Button>
-      </div>
+      <div className="flex h-16 items-center px-4"><div><div className="text-sm font-semibold tracking-[-0.01em]">ctswarm</div><div className="text-[11px] text-muted-foreground">Mission control</div></div></div>
+      <nav className="space-y-1 px-2 pb-3" aria-label="Dashboard sections">
+        <Button variant={view === "builds" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("builds")}>Builds <span className="ml-auto font-mono text-[10px]">{builds.length}</span></Button>
+        <Button variant={view === "fleet" ? "secondary" : "ghost"} className="w-full justify-start" onClick={() => setView("fleet")}>Model fleet</Button>
+      </nav>
       <Separator />
-      <div className="px-4 py-3 text-[10px] font-medium uppercase tracking-[.16em] text-muted-foreground">Recent builds</div>
+      <div className="px-4 py-3 text-[10px] font-medium uppercase tracking-[.14em] text-muted-foreground">Recent builds</div>
       <BuildList builds={builds} selected={selected} query={query} onQuery={setQuery} onSelect={selectBuild} />
-      <div className="border-t p-4 text-[10px] leading-4 text-muted-foreground">Local execution first. Hosted capacity is reserved for planning and independent review.</div>
+      <div className="border-t p-4 text-[10px] leading-4 text-muted-foreground">Local execution first. Hosted capacity is reserved for planning and independent acceptance review.</div>
     </div>
   )
 }
 
 export function App() {
   const { theme, setTheme } = useTheme()
-  const [view, setView] = useState<View>("fleet")
+  const [view, setView] = useState<View>("builds")
   const [builds, setBuilds] = useState<Build[]>([])
   const [selected, setSelected] = useState("")
   const [build, setBuild] = useState<Build | null>(null)
@@ -135,12 +108,12 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    // Fetch callbacks update state asynchronously after network completion.
+    // Fetch callbacks commit only after their network requests resolve.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadBuilds(); void loadOverview()
   }, [loadBuilds, loadOverview])
   useEffect(() => {
-    // The request token prevents stale selection responses from committing.
+    // The request token inside loadSelected prevents stale commits.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadSelected()
   }, [loadSelected])
@@ -149,10 +122,9 @@ export function App() {
     const fleetTimer = window.setInterval(() => { if (!document.hidden && view === "fleet") void loadOverview() }, 20000)
     return () => { window.clearInterval(buildTimer); window.clearInterval(fleetTimer) }
   }, [loadBuilds, loadOverview, stream.state, view])
-
   useEffect(() => {
     if (!stream.snapshot) return
-    // The SSE frame is authoritative while connected; REST remains a fallback.
+    // SSE is an external subscription; its latest frame is authoritative.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setBuilds(stream.snapshot.builds || [])
     setUpdatedAt(new Date(stream.snapshot.generated_at * 1000))
@@ -167,23 +139,21 @@ export function App() {
   const sidebarProps = { view, setView: (next: View) => { setView(next); setMobileOpen(false) }, builds, selected, query, setQuery, selectBuild }
 
   return (
-    <TooltipProvider>
-      <div className="min-h-svh bg-background lg:grid lg:h-svh lg:grid-cols-[280px_minmax(0,1fr)] lg:overflow-hidden">
-        <aside className="hidden min-h-0 border-r lg:block"><Sidebar {...sidebarProps} /></aside>
-        <div className="min-w-0 lg:min-h-0 lg:overflow-y-auto">
-          <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b bg-background/90 px-4 backdrop-blur-xl lg:h-16 lg:px-6">
-            <div className="flex items-center gap-3">
-              <Sheet open={mobileOpen} onOpenChange={setMobileOpen}><SheetTrigger asChild><Button variant="ghost" size="icon" className="lg:hidden"><Menu /><span className="sr-only">Open navigation</span></Button></SheetTrigger><SheetContent side="left" className="w-[300px] p-0"><SheetHeader className="sr-only"><SheetTitle>Navigation</SheetTitle></SheetHeader><Sidebar {...sidebarProps} /></SheetContent></Sheet>
-              <div><div className="text-sm font-medium">{view === "fleet" ? "Model fleet" : build ? repoName(build.repo_url) : "Builds"}</div><div className="flex items-center gap-1.5 font-mono text-[10px] text-muted-foreground"><Radio className={cn("size-2.5", stream.state === "live" && "text-emerald-500")} />{stream.state === "live" && updatedAt ? `live · ${updatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : stream.state}</div></div>
-            </div>
-            <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}<span className="sr-only">Toggle theme</span></Button></TooltipTrigger><TooltipContent>Toggle theme</TooltipContent></Tooltip>
-          </header>
-          <main className="mx-auto w-full max-w-[1680px] p-4 sm:p-6 lg:p-8">
-            {view === "fleet" ? <Suspense fallback={<Skeleton className="h-[36rem]" />}><ModelFleet overview={overview} loading={overviewLoading} error={overviewError} onRefresh={() => void loadOverview()} /></Suspense> : build ? <BuildDetail build={build} trace={trace} approvals={approvals} inferenceCalls={stream.snapshot?.inference_calls || []} streamState={stream.state} streamError={stream.error || stream.snapshot?.stream_error || ""} onReload={async () => { await loadBuilds(); await loadSelected() }} /> : builds.length ? <Skeleton className="h-96" /> : <div className="grid min-h-[60vh] place-items-center text-center"><div><Hammer className="mx-auto size-8 text-muted-foreground" /><h1 className="mt-4 text-lg font-semibold">No builds yet</h1><p className="mt-1 text-sm text-muted-foreground">Submit a build and its full execution trace will appear here.</p></div></div>}
-          </main>
-        </div>
+    <div className="min-h-svh bg-background lg:grid lg:h-svh lg:grid-cols-[264px_minmax(0,1fr)] lg:overflow-hidden">
+      <aside className="hidden min-h-0 border-r lg:block"><Sidebar {...sidebarProps} /></aside>
+      <div className="min-w-0 lg:min-h-0 lg:overflow-y-auto">
+        <header className="sticky top-0 z-30 flex min-h-14 items-center justify-between border-b bg-background/95 px-4 backdrop-blur lg:min-h-16 lg:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <Sheet open={mobileOpen} onOpenChange={setMobileOpen}><SheetTrigger asChild><Button variant="ghost" size="icon" className="lg:hidden"><Menu /><span className="sr-only">Open navigation</span></Button></SheetTrigger><SheetContent side="left" className="w-[min(320px,90vw)] p-0"><SheetHeader className="sr-only"><SheetTitle>Navigation</SheetTitle></SheetHeader><Sidebar {...sidebarProps} /></SheetContent></Sheet>
+            <div className="min-w-0"><div className="break-words text-sm font-medium">{view === "fleet" ? "Model fleet" : build ? repoName(build.repo_url) : "Builds"}</div><div className="mt-0.5 flex flex-wrap items-center gap-1.5 font-mono text-[10px] text-muted-foreground"><span className={cn("size-1.5 rounded-[2px] bg-amber-500", stream.state === "live" && "bg-emerald-600")} />{stream.state === "live" && updatedAt ? `Live · updated ${updatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : stream.state}</div></div>
+          </div>
+          <Button variant="ghost" size="icon" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}<span className="sr-only">Toggle theme</span></Button>
+        </header>
+        <main className="mx-auto w-full max-w-[1400px] p-4 sm:p-6">
+          {view === "fleet" ? <Suspense fallback={<Skeleton className="h-[36rem]" />}><ModelFleet overview={overview} loading={overviewLoading} error={overviewError} onRefresh={() => void loadOverview()} /></Suspense> : build ? <BuildDetail build={build} trace={trace} approvals={approvals} inferenceCalls={stream.snapshot?.inference_calls || []} streamState={stream.state} streamError={stream.error || stream.snapshot?.stream_error || ""} onReload={async () => { await loadBuilds(); await loadSelected() }} /> : builds.length ? <Skeleton className="h-96" /> : <div className="grid min-h-[60vh] place-items-center text-center"><div><h1 className="text-lg font-semibold">No builds yet</h1><p className="mt-1 max-w-md text-sm text-muted-foreground">Submit a build and its planning, implementation, verification, and acceptance evidence will appear here.</p></div></div>}
+        </main>
       </div>
-    </TooltipProvider>
+    </div>
   )
 }
 

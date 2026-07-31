@@ -7,8 +7,10 @@ export type Build = {
   execution_id?: string
   phase_detail?: string
   elapsed_s?: number
+  stalled_s?: number
   pr_url?: string
   error?: string
+  gate_results?: Record<string, unknown>
 }
 
 export type TraceNode = {

@@ -11,9 +11,58 @@ from ctswarm.orchestrator import (
     BuildState,
     Orchestrator,
     hybrid_role_policy,
+    production_delivery_context,
     runtime_model_overrides,
     update_record_from_execution,
 )
+from ctswarm.ledger import Ledger
+
+
+def test_production_delivery_context_requires_testable_acceptance() -> None:
+    context = production_delivery_context("Ship a readable dashboard")
+
+    assert "Ship a readable dashboard" in context
+    assert "requirement-to-evidence matrix" in context
+    assert "production build" in context
+    assert "browser console errors" in context
+    assert "Report success only after all acceptance criteria pass" in context
+
+
+async def test_submit_sends_production_contract_to_planner(monkeypatch, tmp_path) -> None:
+    captured: dict = {}
+
+    class Response:
+        status_code = 202
+        text = ""
+
+        def json(self):
+            return {"execution_id": "exec-production"}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, json):
+            captured.update({"url": url, "json": json})
+            return Response()
+
+    orchestrator = Orchestrator(ledger=Ledger(tmp_path / "ledger.db"))
+    monkeypatch.setattr(orchestrator.capacity, "select", lambda **_kwargs: (Runtime.OPEN_CODE, "test"))
+    monkeypatch.setattr("ctswarm.orchestrator.httpx.AsyncClient", Client)
+
+    result = await orchestrator.submit(goal="Ship the complete app", repo_url="https://example.invalid/repo")
+
+    assert result.execution_id == "exec-production"
+    contract = captured["json"]["input"]["additional_context"]
+    assert "Ship the complete app" in contract
+    assert "Acceptance evidence required before success" in contract
+    assert captured["json"]["input"]["config"]["max_verify_fix_cycles"] == 3
 
 
 def test_open_code_uses_router_virtual_models() -> None:

@@ -174,6 +174,33 @@ def hybrid_role_policy(
     return providers, models
 
 
+def production_delivery_context(goal: str) -> str:
+    """Return the non-negotiable planning and acceptance contract for builds."""
+    return f"""PRODUCTION DELIVERY CONTRACT
+
+User goal:
+{goal}
+
+Planning requirements:
+1. Inspect repository instructions, current architecture, tests, and delivery tooling before proposing work. Preserve compatible behavior and avoid rewrites unless the plan documents why one is necessary.
+2. Turn the goal into explicit user flows, edge cases, failure states, accessibility and responsive requirements for UI work, and relevant security, performance, observability, migration, and rollback requirements.
+3. Every issue must name its dependencies, likely files or components, observable acceptance criteria, and verification evidence. Acceptance criteria must describe behavior that a reviewer can prove, not implementation activity.
+4. Plan integration and end-to-end acceptance as first-class work. Parallel issue completion is not evidence that the integrated application works.
+
+Implementation requirements:
+1. Produce complete, maintainable production code. Do not ship placeholders, mock-only paths, TODOs, disabled validation, silent exception handling, or log-only implementations.
+2. Preserve user data and compatibility. Validate inputs, handle empty/loading/error/success states, avoid secrets in source or logs, and add instrumentation where failures would otherwise be invisible.
+3. Add or update automated tests at the appropriate level. UI changes require keyboard/accessibility checks, responsive layouts, readable non-truncated content, and browser verification of the actual user flows.
+
+Acceptance evidence required before success:
+1. Provide a requirement-to-evidence matrix mapping every user requirement and edge case to a passing automated check or a concrete browser/manual artifact.
+2. Run the repository's lint, typecheck, unit/integration tests, and production build where those commands exist. Record exact commands and results; a command that did not run is not a pass.
+3. Verify the merged integration branch has the intended non-empty diff, no unresolved conflicts, no unintended files or secrets, no browser console errors, and no regressions in adjacent critical flows.
+4. Independent review must reject the build when evidence is missing, text or controls are unreadable, error states are unhandled, tests are bypassed, or the integrated application does not satisfy the goal end to end.
+5. Report success only after all acceptance criteria pass on the integrated result. Otherwise return a precise blocking failure and repair it within the configured fix cycles.
+"""
+
+
 class Orchestrator:
     """Drives one build from goal to gated result."""
 
@@ -294,6 +321,7 @@ class Orchestrator:
             "goal": goal,
             "repo_url": repo_url,
             "enable_github_pr": True,
+            "additional_context": production_delivery_context(goal),
             "config": config,
         }
 
@@ -419,8 +447,15 @@ class Orchestrator:
             diff = _read_diff(repo_path)
             result = await convene(
                 question=(
-                    "Does this change fully and correctly implement the stated "
-                    "goal, without introducing a defect or security issue? "
+                    "Act as a strict production acceptance board. Approve only "
+                    "when the integrated diff fully satisfies every stated user "
+                    "flow and acceptance criterion; deterministic lint, type, test, "
+                    "and build evidence is present; failure and empty states are "
+                    "handled; security, accessibility, responsive behavior, data "
+                    "compatibility, and operational risks relevant to the change "
+                    "are addressed; and there are no placeholders, bypassed checks, "
+                    "unreadable UI, or unverified claims. Any missing evidence or "
+                    "material doubt is a rejection. "
                     f"GOAL: {record.goal}"
                 ),
                 context=diff,
