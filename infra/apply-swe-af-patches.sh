@@ -16,6 +16,14 @@ patches=(
   "$repo_root/infra/patches/swe-af-issue-build-base.patch"
   "$repo_root/infra/patches/swe-af-autonomous-ui.patch"
   "$repo_root/infra/patches/swe-af-hybrid-runtime.patch"
+  "$repo_root/infra/patches/swe-af-plan-integrity.patch"
+  "$repo_root/infra/patches/swe-af-codex-wrapper.patch"
+  "$repo_root/infra/patches/swe-af-prd-artifact.patch"
+  "$repo_root/infra/patches/swe-af-codex-docker.patch"
+  "$repo_root/infra/patches/swe-af-architecture-artifact.patch"
+  "$repo_root/infra/patches/swe-af-planning-source-timeout.patch"
+  "$repo_root/infra/patches/swe-af-preserve-architecture.patch"
+  "$repo_root/infra/patches/swe-af-harness-availability.patch"
 )
 
 # Later patches can intentionally modify lines introduced by earlier patches.

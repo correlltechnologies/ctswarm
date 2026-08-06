@@ -1,0 +1,14 @@
+diff --git a/Dockerfile b/Dockerfile
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -23,8 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     curl -fsSL https://opencode.ai/install | bash && \
+     # Install Codex CLI for codex runtime provider
+     npm install -g @openai/codex agent-browser && \
+-    codex_path="$(command -v codex)" && \
+-    mv "${codex_path}" /usr/local/bin/codex-real && \
++    codex_target="$(readlink -f "$(command -v codex)")" && \
++    ln -s "${codex_target}" /usr/local/bin/codex-real && \
+     printf '%s\n' \
+     '#!/usr/bin/env bash' \
+     'set -euo pipefail' \

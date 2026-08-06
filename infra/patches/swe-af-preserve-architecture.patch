@@ -1,0 +1,106 @@
+diff --git a/swe_af/reasoners/pipeline.py b/swe_af/reasoners/pipeline.py
+--- a/swe_af/reasoners/pipeline.py
++++ b/swe_af/reasoners/pipeline.py
+@@ -309,14 +309,7 @@ def _ensure_architecture_artifact(
+         *(decision.decision for decision in architecture.decisions),
+         *(decision.rationale for decision in architecture.decisions),
+     ]
+-    generated = "<!-- ctswarm:structured-architecture -->" in content
+-    complete = (
+-        (generated or len(content.strip()) >= 1000)
+-        and "## Component Architecture" in content
+-        and "## Interfaces" in content
+-        and "## Decisions" in content
+-        and all(item in content for item in required if item.strip())
+-    )
++    complete = all(item in content for item in required if item.strip())
+     if complete:
+         return False
+ 
+@@ -352,6 +345,39 @@ def _ensure_architecture_artifact(
+     ) or "No explicit decisions declared."
+ 
+     path.parent.mkdir(parents=True, exist_ok=True)
++    if len(content.strip()) >= 1_000 and "architecture" in content.lower():
++        appendix = f"""
++
++<!-- ctswarm:structured-architecture-appendix -->
++
++## Structured Architecture Appendix
++
++The following validated schema is binding in addition to the authored design
++above. It is appended deterministically when structured result wording does not
++occur verbatim in the canonical document.
++
++### Schema Summary
++
++{architecture.summary}
++
++### Schema Components
++
++{''.join(component_sections)}
++### Schema Interfaces
++
++{interfaces}
++
++### Schema Decisions
++
++{decisions}
++
++### Schema File Changes Overview
++
++{architecture.file_changes_overview}
++"""
++        path.write_text(content.rstrip() + appendix, encoding="utf-8")
++        return True
++
+     path.write_text(
+         f"""<!-- ctswarm:structured-architecture -->
+ 
+diff --git a/tests/test_plan_artifact_integrity.py b/tests/test_plan_artifact_integrity.py
+--- a/tests/test_plan_artifact_integrity.py
++++ b/tests/test_plan_artifact_integrity.py
+@@ -279,3 +279,43 @@ def test_missing_architecture_document_is_recovered_from_schema(
+     assert "captureRequiredScenes()" in content
+     assert "Keep Canvas dependency-free" in content
+     assert not _ensure_architecture_artifact(architecture, str(path))
++
++
++def test_authored_architecture_is_augmented_without_replacing_detail(
++    tmp_path: Path,
++) -> None:
++    architecture = Architecture(
++        summary="Complete executable architecture.",
++        components=[
++            {
++                "name": "Browser Release Gate",
++                "responsibility": "Require reviewed screenshots and console checks.",
++            }
++        ],
++        interfaces=["captureRequiredScenes()"],
++        decisions=[
++            {
++                "decision": "Preserve authored contracts",
++                "rationale": "The detailed document is the implementation source.",
++            }
++        ],
++        file_changes_overview="Update runtime, tests, and evidence.",
++    )
++    path = tmp_path / "plan" / "architecture.md"
++    path.parent.mkdir(parents=True)
++    authored_detail = "Exact ItemUseResult and PendingAttackAnimation contracts."
++    path.write_text(
++        "# Technical Architecture\n\n"
++        + authored_detail
++        + "\n"
++        + ("Executable state transition and invariant.\n" * 50),
++        encoding="utf-8",
++    )
++
++    assert _ensure_architecture_artifact(architecture, str(path))
++    content = path.read_text(encoding="utf-8")
++    assert authored_detail in content
++    assert "## Structured Architecture Appendix" in content
++    assert "Browser Release Gate" in content
++    assert "captureRequiredScenes()" in content
++    assert not _ensure_architecture_artifact(architecture, str(path))

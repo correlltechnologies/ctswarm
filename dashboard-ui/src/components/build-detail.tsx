@@ -20,11 +20,19 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { api, formatDuration, formatMs, repoName } from "@/lib/api"
+import { cn } from "@/lib/utils"
 import type { Approval, Build, ExecutionDetail, InferenceCall, StreamState, Trace, TraceNode } from "@/types"
 import { LiveCoordination } from "./live-coordination"
 import { StatusBadge } from "./status-badge"
 
 const terminal = new Set(["complete", "failed", "stopped", "blocked"])
+
+type NarrativeTone = "complete" | "active" | "pending" | "attention"
+
+type NarrativeStage = {
+  label: string
+  tone: NarrativeTone
+}
 
 function friendlyModel(value: string) {
   if (value === "ctswarm/high" || value === "high") return "Planning and architecture"
@@ -41,6 +49,107 @@ function workClass(value: string) {
 
 function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
   return <div className="min-w-0 border-b p-4 last:border-b-0 sm:border-r sm:[&:nth-child(2n)]:border-r-0 xl:border-b-0 xl:border-r xl:[&:nth-child(2n)]:border-r xl:last:border-r-0"><div className="text-[11px] font-medium uppercase tracking-[.12em] text-muted-foreground">{label}</div><div className="mt-2 break-words text-lg font-semibold">{value}</div><div className="mt-1 break-words font-mono text-[11px] leading-5 text-muted-foreground">{detail}</div></div>
+}
+
+function OperatorNarrative({ build, nodes }: { build: Build; nodes: TraceNode[] }) {
+  const has = (ids: string[], statuses?: string[]) => nodes.some((node) => ids.includes(node.reasoner_id) && (!statuses || statuses.includes(node.status)))
+  const planningIds = ["plan", "run_product_manager", "run_environment_scout", "run_architect", "run_tech_lead", "run_sprint_planner", "run_issue_writer"]
+  const implementationIds = ["run_coder", "run_qa", "run_code_reviewer", "run_qa_synthesizer", "run_issue_advisor", "run_replanner"]
+  const integrationIds = ["run_merger", "run_integration_tester", "run_repo_finalize"]
+  const verificationIds = ["run_verifier", "run_ci_watcher", "run_ci_fixer", "run_pr_resolver"]
+  const hasImplementation = has(implementationIds)
+  const hasIntegration = has(integrationIds)
+  const hasVerification = has(verificationIds)
+  const planDone = has(["plan"], ["succeeded"]) || hasImplementation
+  const implementationDone = hasIntegration
+  const integrationDone = has(["run_integration_tester", "run_repo_finalize"], ["succeeded"]) || hasVerification
+  const verificationDone = has(["run_verifier"], ["succeeded"]) || !!build.pr_url
+  const attention = build.state === "failed" || build.state === "blocked"
+  const stopped = build.state === "stopped"
+
+  function stage(label: string, done: boolean, active: boolean): NarrativeStage {
+    if (done) return { label, tone: "complete" }
+    if (attention && active) return { label, tone: "attention" }
+    return { label, tone: active ? "active" : "pending" }
+  }
+
+  const stages = [
+    stage("Plan", planDone, has(planningIds, ["running"]) || (!hasImplementation && build.state === "executing")),
+    stage("Implement", implementationDone, hasImplementation && !hasIntegration),
+    stage("Integrate", integrationDone, hasIntegration && !hasVerification),
+    stage("Verify", verificationDone, hasVerification && !build.pr_url),
+    stage("Publish", !!build.pr_url, build.state === "complete" && !build.pr_url),
+  ]
+
+  let deliveryLabel = "Planning only"
+  let deliveryDetail = "No implementation work has started; no game code has reached an issue branch."
+  if (hasImplementation) {
+    deliveryLabel = "Isolated worktrees"
+    deliveryDetail = "Implementation agents ran in isolated worktrees. This does not prove they produced code, and your source checkout does not change until integration and publication."
+  }
+  if (hasIntegration) {
+    deliveryLabel = "Integration branch"
+    deliveryDetail = "Issue work has reached the build integration phase, but it is not on your main branch unless a pull request is merged."
+  }
+  if (build.pr_url) {
+    deliveryLabel = "Pull request open"
+    deliveryDetail = "Verified build work has been published for review. Your main branch still changes only when the pull request is merged."
+  }
+
+  let headline = "The swarm is waiting to start."
+  if (build.state === "queued") headline = "The build is queued and has not touched the repository."
+  else if (stopped) headline = hasIntegration
+    ? "An operator stopped the build after integration work began; remaining agents were cancelled."
+    : hasImplementation
+      ? "An operator stopped the build while implementation was still isolated; no integration merge is recorded."
+      : "An operator stopped the build during planning; no implementation changes were produced."
+  else if (attention) headline = `The build needs attention in ${build.phase_detail || nodes.at(-1)?.phase || "its current phase"}.`
+  else if (build.state === "complete" && build.pr_url) headline = "The swarm completed its gates and opened a pull request."
+  else if (hasVerification) headline = "Implementation is assembled and the swarm is checking product evidence."
+  else if (hasIntegration) headline = "Issue branches are being assembled and tested together."
+  else if (hasImplementation) headline = "Agents are implementing the approved issue plan in isolated worktrees."
+  else if (nodes.length) headline = "The product brief and implementation plan are being reviewed before coding starts."
+
+  const recent = nodes
+    .filter((node) => node.depth > 0 && !["Planning coordinator", "Build coordinator"].includes(node.role))
+    .slice(-4)
+    .reverse()
+
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader className="border-b bg-muted/20">
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div className="min-w-0">
+            <CardTitle>Operator summary</CardTitle>
+            <CardDescription className="mt-2 max-w-3xl text-sm leading-6">{headline}</CardDescription>
+          </div>
+          <div className="shrink-0 text-left md:text-right">
+            <p className="text-[10px] font-medium uppercase tracking-[.12em] text-muted-foreground">Delivery state</p>
+            <p className="mt-1 text-sm font-medium">{deliveryLabel}</p>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="grid grid-cols-5 border-b">
+          {stages.map((item) => <div key={item.label} className="min-w-0 border-r px-2 py-3 text-center last:border-r-0 sm:px-4"><span className={cn("mx-auto mb-2 block size-1.5 rounded-full bg-muted-foreground/30", item.tone === "complete" && "bg-emerald-600", item.tone === "active" && "bg-blue-600", item.tone === "attention" && "bg-destructive")} /><span className="text-[10px] font-medium sm:text-xs">{item.label}</span></div>)}
+        </div>
+        <div className="grid lg:grid-cols-[minmax(0,1.25fr)_minmax(280px,.75fr)]">
+          <div className="min-w-0 border-b p-4 sm:p-5 lg:border-b-0 lg:border-r">
+            <p className="text-[10px] font-medium uppercase tracking-[.12em] text-muted-foreground">What this means for your checkout</p>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">{deliveryDetail}</p>
+            {(build.error || stopped) && <div className="mt-4 border-l-2 border-destructive/70 pl-3"><p className="text-xs font-medium">{stopped ? "Why it stopped" : "Current blocker"}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{build.error || "Stopped by an operator. The scheduler cancelled the remaining execution tree and preserved completed build artifacts."}</p></div>}
+          </div>
+          <div className="min-w-0 p-4 sm:p-5">
+            <p className="text-[10px] font-medium uppercase tracking-[.12em] text-muted-foreground">Latest milestones</p>
+            <div className="mt-3 space-y-3">
+              {recent.map((node) => <div key={node.execution_id} className="grid grid-cols-[auto_minmax(0,1fr)] gap-2"><span className={cn("mt-1.5 size-1.5 rounded-full bg-muted-foreground/40", node.status === "running" && "bg-blue-600", node.status === "succeeded" && "bg-emerald-600", ["failed", "blocked"].includes(node.status) && "bg-destructive")} /><div className="min-w-0"><p className="break-words text-xs font-medium">{node.role}</p><p className="mt-0.5 break-words text-[11px] leading-4 text-muted-foreground">{node.status.replaceAll("_", " ")} · {node.phase}</p></div></div>)}
+              {!recent.length && <p className="text-xs leading-5 text-muted-foreground">No agent milestones yet.</p>}
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
 }
 
 export function BuildDetail({
@@ -116,6 +225,8 @@ export function BuildDetail({
 
       {(build.error || trace?.error) && <Alert variant="destructive"><AlertTitle>Build needs attention</AlertTitle><AlertDescription>{build.error || trace?.error}</AlertDescription></Alert>}
 
+      <OperatorNarrative build={build} nodes={nodes} />
+
       {(build.project_path || build.scm_provider || build.mcp_servers?.length) && <Card><CardHeader><CardTitle>Workflow context</CardTitle><CardDescription>The repository and existing tool configuration attached when this swarm was launched.</CardDescription></CardHeader><CardContent className="grid gap-px bg-border p-0 sm:grid-cols-2 xl:grid-cols-4">{[
         ["Project folder", build.project_path || build.repo_url],
         ["Git provider", (build.scm_provider || "other").replaceAll("_", " ")],
@@ -144,6 +255,7 @@ export function BuildDetail({
         </TabsContent>
         <TabsContent value="routing">
           <div className="space-y-4">
+            <Card><CardHeader><CardTitle>Launch assignments</CardTitle><CardDescription>Frozen when this build entered the queue. Later routing changes apply only to new builds.</CardDescription></CardHeader><CardContent><div className="border">{Object.entries(build.routing_policy || {}).map(([lane, assignment]) => <div key={lane} className="grid gap-1 border-b p-3 last:border-b-0 sm:grid-cols-[minmax(120px,.5fr)_1fr]"><span className="break-all font-mono text-xs">{lane}</span><span className="break-words text-xs text-muted-foreground">{assignment.target.replaceAll("_", " ")}{assignment.model ? ` · ${assignment.model}` : ""}</span></div>)}{!build.routing_policy && <p className="p-3 text-xs text-muted-foreground">This build predates per-build routing snapshots.</p>}</div></CardContent></Card>
             <Card><CardHeader><CardTitle>Role policy</CardTitle><CardDescription>Default worker runtime plus explicit planning and review overrides.</CardDescription></CardHeader><CardContent><div className="border">{Object.entries(trace?.provider_policy || { default: trace?.runtime || build.runtime || "pending" }).map(([role, runtime]) => <div key={role} className="grid gap-1 border-b p-3 last:border-b-0 sm:grid-cols-[minmax(120px,.5fr)_1fr]"><span className="break-all font-mono text-xs">{role}</span><span className="break-words text-xs text-muted-foreground">{runtime.replaceAll("_", " ")}</span></div>)}</div></CardContent></Card>
             <div className="grid gap-4 lg:grid-cols-3">{Object.values(trace?.routes || {}).map((route) => <Card key={route.alias}><CardHeader><CardDescription className="break-words">{workClass(route.alias)}</CardDescription><CardTitle className="break-all font-mono text-base">{friendlyModel(route.model) || "Not dispatched"}</CardTitle></CardHeader><CardContent><p className="break-words text-xs text-muted-foreground">Provider: {route.backend || "pending"}</p>{route.degraded_to && <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">Using the best available fallback</p>}</CardContent></Card>)}</div>
             <div className="grid gap-4 lg:grid-cols-2">{Object.entries(trace?.summary.models || {}).map(([model, count]) => { const assigned = nodes.filter((node) => node.model === model); return <Card key={model}><CardHeader><CardTitle className="break-all font-mono text-base">{friendlyModel(model)}</CardTitle><CardDescription className="break-words">{count} runs · {[...new Set(assigned.map((node) => node.harness))].join(", ")}</CardDescription></CardHeader><CardContent><p className="break-words text-xs leading-5 text-muted-foreground">{[...new Set(assigned.map((node) => node.role))].join(" · ") || "No role metadata"}</p></CardContent></Card> })}</div>

@@ -87,6 +87,9 @@ class BuildRequest(BaseModel):
     source_branch: str = Field(default="", max_length=255)
     create_pull_request: bool = True
     mcp_servers: list[str] = Field(default_factory=list, max_length=64)
+    # Snapshotted when the queue item is created. A later dashboard policy edit
+    # must never change a build that is already waiting for a scheduler slot.
+    routing_policy: dict[str, dict[str, str]] | None = None
 
 
 class SwarmLaunchRequest(BaseModel):
@@ -154,12 +157,26 @@ class BuildScheduler:
             else float(os.environ.get("CTSWARM_SCHEDULER_POLL_SECONDS", "10"))
         )
         self._tasks: dict[str, asyncio.Task] = {}
+        # ``load_build`` reconstructs durable state, but intentionally cannot
+        # recover volatile watchdog timestamps. Keep the live record while a
+        # task is running so dashboard snapshots report the same progress and
+        # stall age that the watchdog is actually using.
+        self._active_records: dict[str, BuildRecord] = {}
         self._closed = False
 
     def enqueue(self, request: BuildRequest, *, build_id: str | None = None) -> str:
         build_id = build_id or f"build-{uuid.uuid4().hex[:10]}"
         if self.snapshot(build_id) is not None:
             raise ValueError(f"build id already exists: {build_id}")
+        try:
+            routing_policy = normalize_routing_policy(
+                request.routing_policy
+                if request.routing_policy is not None
+                else load_routing_policy(self.ledger)
+            )
+        except RoutingPolicyError as exc:
+            raise ValueError(str(exc)) from exc
+        request = request.model_copy(update={"routing_policy": routing_policy})
         self.ledger.record_event(
             BUILD_ENQUEUED,
             request.model_dump(),
@@ -213,11 +230,14 @@ class BuildScheduler:
         metadata["create_pull_request"] = bool(
             request_detail.get("create_pull_request", True)
         )
+        metadata["routing_policy"] = request_detail.get("routing_policy") or {}
         terminal = self.ledger.events(kind=BUILD_TERMINAL, build_id=build_id)
         if terminal:
             return {**_event_detail(terminal[-1]), **metadata}
 
-        record = load_build(self.ledger, build_id)
+        record = self._active_records.get(build_id) or load_build(
+            self.ledger, build_id
+        )
         if record is not None:
             return {**record.to_dict(), **metadata}
 
@@ -297,6 +317,8 @@ class BuildScheduler:
     async def _run_request(self, build_id: str, request: BuildRequest) -> None:
         try:
             record = load_build(self.ledger, build_id)
+            if record is not None:
+                self._active_records[build_id] = record
             while True:
                 if record is None or not record.execution_id:
                     record = await self.orchestrator.submit(
@@ -315,8 +337,10 @@ class BuildScheduler:
                                 else None
                             ),
                         ),
+                        routing_policy=request.routing_policy,
                         build_id=build_id,
                     )
+                    self._active_records[build_id] = record
                 if not record.state.terminal:
                     await self.notifier.post(record)
                     record = await self.orchestrator.run_until_done(
@@ -358,6 +382,8 @@ class BuildScheduler:
                     error=f"scheduler failure: {type(exc).__name__}: {exc}",
                 )
             )
+        finally:
+            self._active_records.pop(build_id, None)
 
     def _record_terminal(self, record: BuildRecord) -> None:
         if self.ledger.events(kind=BUILD_TERMINAL, build_id=record.build_id):

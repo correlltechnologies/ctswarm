@@ -77,6 +77,57 @@ async def test_submit_sends_production_contract_to_planner(monkeypatch, tmp_path
     assert captured["json"]["input"]["config"]["github_pr_base"] == "develop"
 
 
+async def test_submit_uses_explicit_routing_snapshot(monkeypatch, tmp_path) -> None:
+    captured: dict = {}
+
+    class Response:
+        status_code = 202
+        text = ""
+
+        def json(self):
+            return {"execution_id": "exec-frozen"}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, json):
+            captured.update(json)
+            return Response()
+
+    ledger = Ledger(tmp_path / "ledger.db")
+    orchestrator = Orchestrator(ledger=ledger)
+    monkeypatch.setattr(
+        orchestrator.capacity,
+        "select",
+        lambda **_kwargs: (Runtime.CLAUDE_CODE, "test"),
+    )
+    monkeypatch.setattr("ctswarm.orchestrator.httpx.AsyncClient", Client)
+
+    await orchestrator.submit(
+        goal="Use frozen routing",
+        repo_url="https://example.invalid/repo.git",
+        routing_policy={
+            "planning": {"target": "codex", "model": ""},
+            "implementation": {"target": "ollama", "model": "qwen3.5:9b"},
+            "review": {"target": "codex", "model": ""},
+            "maintenance": {"target": "ollama", "model": "granite4.1:8b"},
+        },
+    )
+
+    config = captured["input"]["config"]
+    assert config["providers"]["pm"] == "codex"
+    assert config["models"]["pm"] == "gpt-5.5"
+    assert config["providers"]["coder"] == "open_code"
+    assert config["models"]["coder"] == "ctswarm/ollama:qwen3.5:9b"
+
+
 def test_open_code_uses_router_virtual_models() -> None:
     models = runtime_model_overrides(Runtime.OPEN_CODE)
 
@@ -246,6 +297,63 @@ async def test_deadline_cancels_agentfield_execution(monkeypatch) -> None:
     assert result.state is BuildState.FAILED
     assert cancellations == [
         ("exec-timeout", "exceeded the 1e-06h wall-clock limit")
+    ]
+
+
+async def test_cancel_execution_stops_the_complete_workflow_tree(
+    monkeypatch, tmp_path
+) -> None:
+    requests: list[tuple[str, str, dict | None]] = []
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict | None = None) -> None:
+            self.status_code = status_code
+            self.payload = payload or {}
+
+        def json(self) -> dict:
+            return self.payload
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url):
+            requests.append(("GET", url, None))
+            return Response(200, {"run_id": "run-complete-tree"})
+
+        async def post(self, url, json):
+            requests.append(("POST", url, json))
+            return Response(200)
+
+    orchestrator = Orchestrator(ledger=Ledger(tmp_path / "ledger.db"))
+    record = BuildRecord(
+        build_id="build-tree-cancel",
+        goal="test",
+        repo_url="https://example.invalid/repo",
+        runtime=Runtime.OPEN_CODE,
+        state=BuildState.EXECUTING,
+        execution_id="exec-root",
+    )
+    monkeypatch.setattr("ctswarm.orchestrator.httpx.AsyncClient", Client)
+
+    assert await orchestrator.cancel_execution(record, "owner requested stop")
+    assert requests == [
+        (
+            "GET",
+            "http://localhost:18080/api/v1/executions/exec-root",
+            None,
+        ),
+        (
+            "POST",
+            "http://localhost:18080/api/v1/workflows/run-complete-tree/cancel-tree",
+            {"reason": "owner requested stop"},
+        ),
     ]
 
 

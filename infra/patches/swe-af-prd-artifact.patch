@@ -1,0 +1,185 @@
+diff --git a/swe_af/reasoners/pipeline.py b/swe_af/reasoners/pipeline.py
+--- a/swe_af/reasoners/pipeline.py
++++ b/swe_af/reasoners/pipeline.py
+@@ -50,6 +50,91 @@ def _ensure_paths(base: str) -> dict[str, str]:
+     return paths
+ 
+ 
++def _ensure_prd_artifact(prd: PRD, prd_path: str) -> bool:
++    """Persist the structured PRD when a harness omits its markdown artifact.
++
++    The parsed schema is sufficient for the next in-memory call, but issue
++    artifacts and acceptance review cite ``prd.md`` as their source of truth.
++    Treat a missing or criterion-dropping document as incomplete and recover it
++    deterministically from the validated schema.
++    """
++    path = Path(prd_path)
++    content = path.read_text(encoding="utf-8") if path.is_file() else ""
++    required = [*prd.must_have, *prd.acceptance_criteria]
++    complete = all(item in content for item in required)
++    if complete:
++        return False
++
++    def bullets(values: list[str], *, checkboxes: bool = False) -> str:
++        prefix = "- [ ] " if checkboxes else "- "
++        return "\n".join(f"{prefix}{value}" for value in values) or "- None"
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if len(content.strip()) >= 1_000 and "PRD" in content and "Acceptance" in content:
++        missing_must_have = [item for item in prd.must_have if item not in content]
++        missing_acceptance = [
++            item for item in prd.acceptance_criteria if item not in content
++        ]
++        appendix = f"""
++
++## Structured Contract Appendix
++
++The following validated schema items are binding in addition to the authored
++requirements above. This appendix is added deterministically when the harness's
++structured summary uses wording that does not occur verbatim in the document.
++
++### Must Have
++
++{bullets(missing_must_have)}
++
++### Acceptance Criteria
++
++{bullets(missing_acceptance, checkboxes=True)}
++"""
++        path.write_text(content.rstrip() + appendix, encoding="utf-8")
++        return True
++
++    path.write_text(
++        f"""# Product Requirements Document
++
++## Validated Description
++
++{prd.validated_description.strip()}
++
++## Must Have
++
++{bullets(prd.must_have)}
++
++## Acceptance Criteria
++
++{bullets(prd.acceptance_criteria, checkboxes=True)}
++
++## Nice to Have
++
++{bullets(prd.nice_to_have)}
++
++## Out of Scope
++
++{bullets(prd.out_of_scope)}
++
++## Assumptions
++
++{bullets(prd.assumptions)}
++
++## Risks
++
++{bullets(prd.risks)}
++
++## Completion Contract
++
++- Every must-have is binding and must map to implementation and evidence.
++- Missing evidence, placeholders, or unreachable behavior are blocking failures.
++""",
++        encoding="utf-8",
++    )
++    return True
++
++
+ def _consolidate_architecture_artifacts(architecture_path: str) -> list[str]:
+     """Merge architect spill files into the canonical architecture document.
+ 
+@@ -386,6 +471,12 @@ async def run_product_manager(
+     if parsed is None:
+         raise RuntimeError("Product manager failed to produce a valid PRD")
+ 
++    if _ensure_prd_artifact(parsed, paths["prd"]):
++        router.note(
++            "Recovered canonical PRD artifact from validated schema",
++            tags=["pm", "recovered", "artifact"],
++        )
++
+     router.note("PM complete", tags=["pm", "complete"])
+     return parsed.model_dump()
+ 
+diff --git a/tests/test_plan_artifact_integrity.py b/tests/test_plan_artifact_integrity.py
+--- a/tests/test_plan_artifact_integrity.py
++++ b/tests/test_plan_artifact_integrity.py
+@@ -7,8 +7,10 @@ import pytest
+ from swe_af.app import _ensure_issue_artifacts, _validate_planned_issue_set
+ from swe_af.reasoners.pipeline import (
+     _consolidate_architecture_artifacts,
++    _ensure_prd_artifact,
+     _recover_architecture_from_document,
+ )
++from swe_af.reasoners.schemas import PRD
+ 
+ 
+ def issue(name: str, sequence: int, *, depends_on: list[str] | None = None) -> dict:
+@@ -87,6 +89,62 @@ def test_incomplete_issue_writer_output_is_replaced(tmp_path: Path) -> None:
+     assert "battle-items works through the real user flow" in content
+ 
+ 
++def test_missing_prd_artifact_is_recovered_from_validated_schema(
++    tmp_path: Path,
++) -> None:
++    prd = PRD(
++        validated_description="Deliver a complete town-to-guardian adventure.",
++        must_have=["Clinic healing is reusable", "Every move has detail data"],
++        acceptance_criteria=[
++            "The full world loop passes deterministically",
++            "Portrait browser evidence has no overflow",
++        ],
++        nice_to_have=["Ambient decoration variants"],
++        out_of_scope=["Online multiplayer"],
++        assumptions=["The existing Canvas runtime remains dependency-free"],
++        risks=["Route changes can make the shrine unreachable"],
++    )
++    path = tmp_path / "plan" / "prd.md"
++
++    assert _ensure_prd_artifact(prd, str(path))
++    content = path.read_text(encoding="utf-8")
++    assert "## Must Have" in content
++    assert "Clinic healing is reusable" in content
++    assert "The full world loop passes deterministically" in content
++    assert "Online multiplayer" in content
++    assert not _ensure_prd_artifact(prd, str(path))
++
++
++def test_authored_prd_is_augmented_without_replacing_its_detail(
++    tmp_path: Path,
++) -> None:
++    prd = PRD(
++        validated_description="Deliver the adventure.",
++        must_have=["Clinic healing is reusable"],
++        acceptance_criteria=["The complete loop passes"],
++        nice_to_have=[],
++        out_of_scope=[],
++    )
++    path = tmp_path / "plan" / "prd.md"
++    path.parent.mkdir(parents=True)
++    authored_detail = "Distinct authored issue PW-012 integration detail."
++    path.write_text(
++        "# Prism Wilds PRD\n\n## Acceptance Gates\n\n"
++        + authored_detail
++        + "\n"
++        + ("Detailed executable requirement.\n" * 50),
++        encoding="utf-8",
++    )
++
++    assert _ensure_prd_artifact(prd, str(path))
++    content = path.read_text(encoding="utf-8")
++    assert authored_detail in content
++    assert "## Structured Contract Appendix" in content
++    assert "Clinic healing is reusable" in content
++    assert "The complete loop passes" in content
++    assert not _ensure_prd_artifact(prd, str(path))
++
++
+ def test_architecture_continuations_are_consolidated_in_order(
+     tmp_path: Path,
+ ) -> None:

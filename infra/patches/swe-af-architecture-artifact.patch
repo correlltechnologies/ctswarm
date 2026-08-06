@@ -1,0 +1,180 @@
+diff --git a/swe_af/reasoners/pipeline.py b/swe_af/reasoners/pipeline.py
+--- a/swe_af/reasoners/pipeline.py
++++ b/swe_af/reasoners/pipeline.py
+@@ -268,6 +268,105 @@ def _recover_architecture_from_document(
+     )
+ 
+ 
++def _ensure_architecture_artifact(
++    architecture: Architecture,
++    architecture_path: str,
++) -> bool:
++    """Persist the validated architecture schema as the canonical document.
++
++    Harnesses are asked to write a richer document, but a valid structured
++    result must never advance to tech-lead review while ``architecture.md`` is
++    missing or drops components. The recovered document remains reviewable and
++    preserves every structured interface, decision, dependency, and file note.
++    """
++    path = Path(architecture_path)
++    content = path.read_text(encoding="utf-8") if path.is_file() else ""
++    required = [
++        architecture.summary,
++        architecture.file_changes_overview,
++        *(component.name for component in architecture.components),
++        *(component.responsibility for component in architecture.components),
++        *architecture.interfaces,
++        *(decision.decision for decision in architecture.decisions),
++        *(decision.rationale for decision in architecture.decisions),
++    ]
++    generated = "<!-- ctswarm:structured-architecture -->" in content
++    complete = (
++        (generated or len(content.strip()) >= 1000)
++        and "## Component Architecture" in content
++        and "## Interfaces" in content
++        and "## Decisions" in content
++        and all(item in content for item in required if item.strip())
++    )
++    if complete:
++        return False
++
++    component_sections = []
++    for index, component in enumerate(architecture.components, start=1):
++        files = (
++            "\n".join(f"- `{item}`" for item in component.touches_files)
++            or "- None declared"
++        )
++        dependencies = (
++            "\n".join(f"- {item}" for item in component.depends_on)
++            or "- None"
++        )
++        component_sections.append(
++            f"""### {index}. {component.name}
++
++{component.responsibility}
++
++**Touches files**
++{files}
++
++**Depends on**
++{dependencies}
++"""
++        )
++    interfaces = (
++        "\n".join(f"- `{item}`" for item in architecture.interfaces)
++        or "- None declared"
++    )
++    decisions = "\n\n".join(
++        f"### Decision: {item.decision}\n\n{item.rationale}"
++        for item in architecture.decisions
++    ) or "No explicit decisions declared."
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(
++        f"""<!-- ctswarm:structured-architecture -->
++
++# Technical Architecture
++
++## Executive Summary
++
++{architecture.summary}
++
++## Component Architecture
++
++{''.join(component_sections)}
++## Interfaces
++
++{interfaces}
++
++## Decisions
++
++{decisions}
++
++## File Changes Overview
++
++{architecture.file_changes_overview}
++
++## Review Contract
++
++- The tech lead must reject missing PRD coverage or non-executable evidence.
++- Canonical architecture content governs implementation, not a sidecar success claim.
++""",
++        encoding="utf-8",
++    )
++    return True
++
++
+ def _compute_levels(issues: list[dict]) -> list[list[str]]:
+     """Topological sort of issues into parallel execution levels (Kahn's algorithm).
+ 
+@@ -654,6 +753,11 @@ async def run_architect(
+             "Architect structured sidecar recovered from canonical architecture.md",
+             tags=["architect", "artifacts", "recovered"],
+         )
++    if _ensure_architecture_artifact(architecture, paths["architecture"]):
++        router.note(
++            "Recovered canonical architecture.md from validated schema",
++            tags=["architect", "artifacts", "recovered"],
++        )
+ 
+     router.note("Architect complete", tags=["architect", "complete"])
+     return architecture.model_dump()
+diff --git a/tests/test_plan_artifact_integrity.py b/tests/test_plan_artifact_integrity.py
+--- a/tests/test_plan_artifact_integrity.py
++++ b/tests/test_plan_artifact_integrity.py
+@@ -7,10 +7,11 @@ import pytest
+ from swe_af.app import _ensure_issue_artifacts, _validate_planned_issue_set
+ from swe_af.reasoners.pipeline import (
+     _consolidate_architecture_artifacts,
++    _ensure_architecture_artifact,
+     _ensure_prd_artifact,
+     _recover_architecture_from_document,
+ )
+-from swe_af.reasoners.schemas import PRD
++from swe_af.reasoners.schemas import Architecture, PRD
+ 
+ 
+ def issue(name: str, sequence: int, *, depends_on: list[str] | None = None) -> dict:
+@@ -195,3 +196,42 @@ def test_architecture_transport_recovery_rejects_trivial_documents(
+     canonical.write_text("# Architecture\nTODO", encoding="utf-8")
+ 
+     assert _recover_architecture_from_document(str(canonical)) is None
++
++
++def test_missing_architecture_document_is_recovered_from_schema(
++    tmp_path: Path,
++) -> None:
++    architecture = Architecture(
++        summary="Deliver the complete deterministic adventure architecture.",
++        components=[
++            {
++                "name": "Screenshot Automation",
++                "responsibility": "Capture every required browser state.",
++                "touches_files": ["scripts/capture.mjs"],
++                "depends_on": ["Deterministic Hooks"],
++            },
++            {
++                "name": "World Continuity",
++                "responsibility": "Preserve the town-to-guardian lifecycle.",
++                "touches_files": ["src/game.js"],
++                "depends_on": [],
++            },
++        ],
++        interfaces=["captureRequiredScenes()", "resetAtClinic()"],
++        decisions=[
++            {
++                "decision": "Keep Canvas dependency-free",
++                "rationale": "Preserves the verified runtime boundary.",
++            }
++        ],
++        file_changes_overview="Update game state, tests, and evidence scripts.",
++    )
++    path = tmp_path / "plan" / "architecture.md"
++
++    assert _ensure_architecture_artifact(architecture, str(path))
++    content = path.read_text(encoding="utf-8")
++    assert "Screenshot Automation" in content
++    assert "World Continuity" in content
++    assert "captureRequiredScenes()" in content
++    assert "Keep Canvas dependency-free" in content
++    assert not _ensure_architecture_artifact(architecture, str(path))

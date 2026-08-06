@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from ctswarm.capacity import Runtime
 from ctswarm.ledger import Ledger
 from ctswarm.orchestrator import BuildRecord, BuildState
+from ctswarm.routing_config import DEFAULT_ROUTING_POLICY, save_routing_policy
 from ctswarm.scheduler import BuildRequest, BuildScheduler
 
 
@@ -121,6 +123,28 @@ def test_queue_survives_a_new_scheduler_instance(tmp_path) -> None:
     assert [item[0] for item in second.pending_requests()] == [build_id]
 
 
+def test_enqueue_snapshots_routing_policy_before_dispatch(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    selected = {
+        **DEFAULT_ROUTING_POLICY,
+        "planning": {"target": "codex", "model": ""},
+        "implementation": {"target": "ollama", "model": "qwen3.5:9b"},
+    }
+    save_routing_policy(ledger, selected)
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=_ControlledOrchestrator(ledger),
+        notifier=_Notifier(),
+    )
+
+    build_id = scheduler.enqueue(_request("frozen"), build_id="build-frozen")
+    save_routing_policy(ledger, DEFAULT_ROUTING_POLICY)
+
+    pending = dict(scheduler.pending_requests())[build_id]
+    assert pending.routing_policy == selected
+    assert scheduler.snapshot(build_id)["routing_policy"] == selected
+
+
 async def test_inflight_execution_is_resumed_without_duplicate_submission(
     tmp_path,
 ) -> None:
@@ -159,6 +183,34 @@ async def test_inflight_execution_is_resumed_without_duplicate_submission(
     await asyncio.wait_for(scheduler._tasks[build_id], timeout=1)  # noqa: SLF001
     await scheduler.run_once()
     assert scheduler.snapshot(build_id)["state"] == "complete"
+    await scheduler.close()
+
+
+async def test_active_snapshot_uses_live_watchdog_progress(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    orchestrator = _ControlledOrchestrator(ledger)
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=orchestrator,
+        notifier=_Notifier(),
+        poll_interval_s=0.01,
+    )
+    build_id = scheduler.enqueue(_request("live"), build_id="build-live")
+
+    await scheduler.run_once()
+    await asyncio.sleep(0)
+    live = scheduler._active_records[build_id]  # noqa: SLF001
+    live.phase_detail = "architect is refining the implementation plan"
+    live.last_progress_at = time.time() - 12
+
+    snapshot = scheduler.snapshot(build_id)
+    assert snapshot["phase_detail"] == live.phase_detail
+    assert snapshot["stalled_s"] >= 11
+
+    orchestrator.release.set()
+    await asyncio.wait_for(scheduler._tasks[build_id], timeout=1)  # noqa: SLF001
+    await scheduler.run_once()
+    assert build_id not in scheduler._active_records  # noqa: SLF001
     await scheduler.close()
 
 

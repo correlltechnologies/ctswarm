@@ -38,7 +38,11 @@ import httpx
 
 from .capacity import CapacityManager, Runtime
 from .ledger import Ledger
-from .routing_config import apply_routing_policy, load_routing_policy
+from .routing_config import (
+    apply_routing_policy,
+    load_routing_policy,
+    normalize_routing_policy,
+)
 
 
 class BuildState(str, Enum):
@@ -300,6 +304,7 @@ class Orchestrator:
         source_branch: str = "",
         create_pull_request: bool = True,
         mcp_context: str = "",
+        routing_policy: dict[str, dict[str, str]] | None = None,
         build_id: str | None = None,
     ) -> BuildRecord:
         """Start a SWE-AF build with a capacity-chosen runtime."""
@@ -311,7 +316,11 @@ class Orchestrator:
         runtime = Runtime.OPEN_CODE
         providers, models = hybrid_role_policy(planning_runtime)
         providers, models = apply_routing_policy(
-            load_routing_policy(self.ledger),
+            (
+                normalize_routing_policy(routing_policy)
+                if routing_policy is not None
+                else load_routing_policy(self.ledger)
+            ),
             providers=providers,
             models=models,
             claude_model=runtime_model_overrides(Runtime.CLAUDE_CODE)["default"],
@@ -460,18 +469,44 @@ class Orchestrator:
         return update_record_from_execution(record, body)
 
     async def cancel_execution(self, record: BuildRecord, reason: str) -> bool:
-        """Cooperatively stop the AgentField reasoner behind a terminal build.
+        """Cooperatively stop the complete AgentField workflow tree.
 
         The scheduler owns the user-selected wall-clock deadline. AgentField's
         SDK watchdog is deliberately configured above the scheduler's maximum
-        so it cannot preempt valid work; this cancellation closes the other
-        half of that contract and prevents timed-out builds from running in the
-        background after the queue has released their slot.
+        so it cannot preempt valid work. Cancelling only the root execution does
+        not stop already-dispatched planners, coders, or reviewers, so resolve
+        the workflow id and use AgentField's bottom-up cancel-tree endpoint.
+        Fall back to per-execution cancellation for older control planes.
         """
         if not record.execution_id:
             return False
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
+                workflow_id = ""
+                try:
+                    detail = await client.get(
+                        f"{self.agentfield_url}/api/v1/executions/"
+                        f"{record.execution_id}"
+                    )
+                    if detail.status_code == 200:
+                        payload = detail.json()
+                        workflow_id = str(
+                            payload.get("run_id")
+                            or payload.get("workflow_id")
+                            or ""
+                        )
+                except (httpx.HTTPError, ValueError, TypeError):
+                    workflow_id = ""
+
+                if workflow_id:
+                    tree_response = await client.post(
+                        f"{self.agentfield_url}/api/v1/workflows/"
+                        f"{workflow_id}/cancel-tree",
+                        json={"reason": reason},
+                    )
+                    if tree_response.status_code < 400:
+                        return True
+
                 response = await client.post(
                     f"{self.agentfield_url}/api/v1/executions/"
                     f"{record.execution_id}/cancel",

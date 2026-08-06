@@ -54,3 +54,9 @@ worktrees/
 
 # Obsidian
 .obsidian/workspace*
+
+# Local agent skills and compatibility links. Skills are installed per-machine;
+# product context and project-owned agent instructions remain tracked elsewhere.
+.agents/skills/impeccable/
+.claude/skills/impeccable
+skills-lock.json

@@ -179,6 +179,10 @@ services:
     build:
       context: ./vendor/SWE-AF
       dockerfile: Dockerfile
+    command:
+      - /bin/sh
+      - -c
+      - cp /root/.claude.json.seed /root/.claude.json && exec python -m swe_af
     environment:
       # Route every tier through ctswarm. These ids are simultaneously valid
       # opencode provider/model references and ctswarm virtual models, which is
@@ -187,6 +191,11 @@ services:
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
       - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
+      # Codex runs inside this isolated Docker worker and checkout. Its nested
+      # bubblewrap namespaces are unavailable under Docker's security profile,
+      # so the wrapper removes the inner sandbox while retaining container,
+      # read-only credential, and read-only host-project boundaries.
+      - CTSWARM_CODEX_DOCKER_BYPASS=1
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # ctswarm's scheduler owns the per-build deadline (up to 72h) and sends a
@@ -213,9 +222,10 @@ services:
       # profile can contain thousands of skills and hundreds of MB of caches;
       # exposing it made every CLI invocation scan unrelated host state.
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
-      # Reuse the operator's existing MCP registrations and Codex login. These
-      # files remain read-only and are never copied into an image or the ledger.
-      - ${HOME}/.claude.json:/root/.claude.json:ro
+      # Claude CLI updates its config during normal startup. Mount the operator
+      # config as a read-only seed, then copy it to ephemeral container storage
+      # in the command above so neither the CLI nor agents can mutate the host.
+      - ${HOME}/.claude.json:/root/.claude.json.seed:ro
       - ${HOME}/.codex/config.toml:/root/.codex/config.toml:ro
       - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
       - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
@@ -229,17 +239,22 @@ services:
     build:
       context: ./vendor/SWE-AF
       dockerfile: Dockerfile
+    command:
+      - /bin/sh
+      - -c
+      - cp /root/.claude.json.seed /root/.claude.json && exec python -m swe_af.fast
     environment:
       - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-open_code}
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
       - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
+      - CTSWARM_CODEX_DOCKER_BYPASS=1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
-      - ${HOME}/.claude.json:/root/.claude.json:ro
+      - ${HOME}/.claude.json:/root/.claude.json.seed:ro
       - ${HOME}/.codex/config.toml:/root/.codex/config.toml:ro
       - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
       - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro

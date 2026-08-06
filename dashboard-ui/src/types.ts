@@ -18,6 +18,7 @@ export type Build = {
   create_pull_request?: boolean
   mcp_servers?: string[]
   delivery_notice?: string
+  routing_policy?: RoutingPolicy
 }
 
 export type ProjectSummary = {

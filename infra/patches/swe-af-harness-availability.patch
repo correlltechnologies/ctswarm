@@ -1,0 +1,49 @@
+diff --git a/Dockerfile b/Dockerfile
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -21,5 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     # Install OpenCode CLI v1.2+ for opencode provider (with run --model support)
+     curl -fsSL https://opencode.ai/install | bash && \
++    # Login shells can replace the image PATH. Keep every harness on a stable
++    # system path so the worker cannot advertise OpenCode while failing to run it.
++    ln -s /root/.opencode/bin/opencode /usr/local/bin/opencode && \
+     # Install Codex CLI for codex runtime provider
+     npm install -g @openai/codex agent-browser && \
+     codex_target="$(readlink -f "$(command -v codex)")" && \
+diff --git a/swe_af/execution/fatal_error.py b/swe_af/execution/fatal_error.py
+--- a/swe_af/execution/fatal_error.py
++++ b/swe_af/execution/fatal_error.py
+@@ -38,6 +38,11 @@ _FATAL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+         # default `-codex` model under ChatGPT-account auth (#82 Gap 3).
+         r"not supported when using codex with a chatgpt account",
+         r"requires a newer version of codex",
++        # A missing harness executable cannot recover inside a running worker.
++        # Fail the reasoner node instead of returning complete=false repeatedly
++        # and making the trace look successful while no code was produced.
++        r"harness provider .{0,40} is unavailable: binary .{0,80} was not found",
++        r"(?:you(?:'ve| have) )?hit your usage limit",
+     )
+ )
+ 
+diff --git a/tests/test_dockerfile.py b/tests/test_dockerfile.py
+--- a/tests/test_dockerfile.py
++++ b/tests/test_dockerfile.py
+@@ -65,5 +65,6 @@ def test_dockerfile_installs_codex_cli(dockerfile_content: str) -> None:
+ def test_dockerfile_preserves_opencode_install(dockerfile_content: str) -> None:
+     assert "https://opencode.ai/install" in dockerfile_content
++    assert "ln -s /root/.opencode/bin/opencode /usr/local/bin/opencode" in dockerfile_content
+     assert "OPENROUTER_API_KEY" in dockerfile_content
+ 
+ 
+diff --git a/tests/test_fatal_error.py b/tests/test_fatal_error.py
+--- a/tests/test_fatal_error.py
++++ b/tests/test_fatal_error.py
+@@ -53,6 +53,8 @@ class TestIsFatalError:
+             # Codex model/auth mismatches (#82 Gap 3) — non-retryable.
+             "The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
+             "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade.",
++            "Harness provider 'opencode' is unavailable: binary 'opencode' was not found.",
++            "You've hit your usage limit. Try again next week.",
+         ],
+     )
+     def test_fatal_patterns_detected(self, message: str) -> None:

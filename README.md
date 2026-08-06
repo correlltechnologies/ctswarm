@@ -66,6 +66,12 @@ shadcn operator dashboard. See
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for service endpoints, build
 controls, recovery, and log rotation.
 
+The next infrastructure expansion is operator-selectable local/VPS execution
+with independent control over runner placement, harnesses, model routes, and
+whether local models are preferred, fallback-only, or disabled. The product
+requirements and security boundary are recorded in
+[`docs/REMOTE_EXECUTION.md`](docs/REMOTE_EXECUTION.md).
+
 ## Verification committees
 
 Section 2 of the plan calls for committees rather than one model's judgment, and

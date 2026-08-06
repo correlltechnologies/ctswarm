@@ -1,0 +1,309 @@
+diff --git a/swe_af/app.py b/swe_af/app.py
+--- a/swe_af/app.py
++++ b/swe_af/app.py
+@@ -990,6 +990,7 @@ async def build(
+             ai_provider=cfg.ai_provider,
+             providers=cfg.providers,
+             workspace_manifest=manifest.model_dump() if manifest else None,
++            agent_timeout_seconds=cfg.agent_timeout_seconds,
+         )
+ 
+         # Git init with retry logic
+@@ -1887,6 +1888,7 @@ async def plan(
+     ai_provider: str | None = None,
+     providers: dict[str, str] | None = None,
+     workspace_manifest: dict | None = None,
++    agent_timeout_seconds: int = 1800,
+ ) -> dict:
+     """Run the full planning pipeline.
+ 
+@@ -1913,12 +1915,26 @@ async def plan(
+     sprint_planner_model = sprint_planner_model or default_model
+     issue_writer_model = issue_writer_model or default_model
+ 
++    async def planning_call(target: str, label: str, **kwargs):
++        """Bound each remote planning reasoner by the submitted agent timeout."""
++        try:
++            result = await asyncio.wait_for(
++                app.call(target, **kwargs),
++                timeout=max(1, agent_timeout_seconds),
++            )
++        except TimeoutError as exc:
++            raise RuntimeError(
++                f"{label} timed out after {agent_timeout_seconds}s"
++            ) from exc
++        return _unwrap(result, label)
++
+     app.note("Pipeline starting", tags=["pipeline", "start"])
+ 
+     # 1. PM scopes the goal into a PRD
+     app.note("Phase 1: Product Manager", tags=["pipeline", "pm"])
+-    prd = _unwrap(await app.call(
++    prd = await planning_call(
+         f"{NODE_ID}.run_product_manager",
++        "run_product_manager",
+         goal=goal,
+         repo_path=repo_path,
+         artifacts_dir=artifacts_dir,
+@@ -1927,7 +1943,7 @@ async def plan(
+         permission_mode=permission_mode,
+         ai_provider=provider_for("pm"),
+         workspace_manifest=workspace_manifest,
+-    ), "run_product_manager")
++    )
+ 
+     # 1.5. Environment Scout — negotiate scoped credentials with the user
+     # before architecture begins. Only engages when HAX is enabled (auto-
+@@ -1937,8 +1953,9 @@ async def plan(
+     # No-op when HAX is disabled.
+     if os.environ.get("HAX_API_KEY", "").strip():
+         app.note("Phase 1.5: Environment Scout", tags=["pipeline", "scout"])
+-        _unwrap(await app.call(
++        await planning_call(
+             f"{NODE_ID}.run_environment_scout",
++            "run_environment_scout",
+             prd=prd,
+             repo_path=repo_path,
+             artifacts_dir=artifacts_dir,
+@@ -1946,12 +1963,13 @@ async def plan(
+             permission_mode=permission_mode,
+             ai_provider=provider_for("pm"),
+             workspace_manifest=workspace_manifest,
+-        ), "run_environment_scout")
++        )
+ 
+     # 2. Architect designs the solution
+     app.note("Phase 2: Architect", tags=["pipeline", "architect"])
+-    arch = _unwrap(await app.call(
++    arch = await planning_call(
+         f"{NODE_ID}.run_architect",
++        "run_architect",
+         prd=prd,
+         repo_path=repo_path,
+         artifacts_dir=artifacts_dir,
+@@ -1959,14 +1977,16 @@ async def plan(
+         permission_mode=permission_mode,
+         ai_provider=provider_for("architect"),
+         workspace_manifest=workspace_manifest,
+-    ), "run_architect")
++    )
+ 
+     # 3. Tech Lead review loop
+     review = None
+     for i in range(max_review_iterations + 1):
+         app.note(f"Phase 3: Tech Lead review (iteration {i})", tags=["pipeline", "tech_lead"])
+-        review = _unwrap(await app.call(
++        review = await planning_call(
+             f"{NODE_ID}.run_tech_lead",
++            "run_tech_lead",
++            goal=goal,
+             prd=prd,
+             repo_path=repo_path,
+             artifacts_dir=artifacts_dir,
+@@ -1975,13 +1995,14 @@ async def plan(
+             permission_mode=permission_mode,
+             ai_provider=provider_for("tech_lead"),
+             workspace_manifest=workspace_manifest,
+-        ), "run_tech_lead")
++        )
+         if review["approved"]:
+             break
+         if i < max_review_iterations:
+             app.note(f"Architecture revision {i + 1}", tags=["pipeline", "revision"])
+-            arch = _unwrap(await app.call(
++            arch = await planning_call(
+                 f"{NODE_ID}.run_architect",
++                "run_architect (revision)",
+                 prd=prd,
+                 repo_path=repo_path,
+                 artifacts_dir=artifacts_dir,
+@@ -1990,7 +2011,7 @@ async def plan(
+                 permission_mode=permission_mode,
+                 ai_provider=provider_for("architect"),
+                 workspace_manifest=workspace_manifest,
+-            ), "run_architect (revision)")
++            )
+ 
+     # Planning is a quality gate. Exhausting review iterations is a blocking
+     # failure, not permission to silently turn a rejection into approval.
+@@ -2004,8 +2025,9 @@ async def plan(
+ 
+     # 4. Sprint planner decomposes into issues
+     app.note("Phase 4: Sprint Planner", tags=["pipeline", "sprint_planner"])
+-    sprint_result = _unwrap(await app.call(
++    sprint_result = await planning_call(
+         f"{NODE_ID}.run_sprint_planner",
++        "run_sprint_planner",
+         prd=prd,
+         architecture=arch,
+         repo_path=repo_path,
+@@ -2014,7 +2036,7 @@ async def plan(
+         permission_mode=permission_mode,
+         ai_provider=provider_for("sprint_planner"),
+         workspace_manifest=workspace_manifest,
+-    ), "run_sprint_planner")
++    )
+     issues = sprint_result["issues"]
+     rationale = sprint_result["rationale"]
+ 
+@@ -2046,8 +2068,9 @@ async def plan(
+             {"name": i["name"], "title": i.get("title", ""), "provides": i.get("provides", [])}
+             for i in issues if i["name"] != issue["name"]
+         ]
+-        writer_tasks.append(app.call(
++        writer_tasks.append(planning_call(
+             f"{NODE_ID}.run_issue_writer",
++            f"run_issue_writer ({issue['name']})",
+             issue=issue,
+             prd_summary=prd_summary_str,
+             architecture_summary=arch.get("summary", ""),
+diff --git a/swe_af/reasoners/pipeline.py b/swe_af/reasoners/pipeline.py
+--- a/swe_af/reasoners/pipeline.py
++++ b/swe_af/reasoners/pipeline.py
+@@ -784,6 +784,7 @@ async def run_architect(
+ 
+ @router.reasoner()
+ async def run_tech_lead(
++    goal: str,
+     prd: dict,
+     repo_path: str,
+     artifacts_dir: str = ".artifacts",
+@@ -804,6 +805,7 @@ async def run_tech_lead(
+     from swe_af.execution.schemas import WorkspaceManifest  # noqa: PLC0415
+ 
+     system_prompt, _ = tech_lead_prompts(
++        goal=goal,
+         prd_path=paths["prd"],
+         architecture_path=paths["architecture"],
+         revision_number=revision_number,
+@@ -812,6 +814,7 @@ async def run_tech_lead(
+         WorkspaceManifest(**workspace_manifest) if workspace_manifest else None
+     )
+     task_prompt = tech_lead_task_prompt(
++        goal=goal,
+         prd_path=paths["prd"],
+         architecture_path=paths["architecture"],
+         revision_number=revision_number,
+diff --git a/swe_af/prompts/tech_lead.py b/swe_af/prompts/tech_lead.py
+--- a/swe_af/prompts/tech_lead.py
++++ b/swe_af/prompts/tech_lead.py
+@@ -61,6 +61,9 @@ contradiction you surface.
+   and failure-path evidence required by the PRD must have an explicit execution
+   path and artifact location. A claim that verification will happen is not a
+   verification design.
++- **Original-goal fidelity**: The user's original goal is authoritative over the
++  PRD. Reject when the PRD drops, weakens, defers, or contradicts an original
++  requirement, even if the architecture faithfully implements the weakened PRD.
+ 
+ ## Your Decision Framework
+ 
+@@ -80,6 +83,7 @@ Notes and minor concerns go in your feedback regardless of approval status.\
+ 
+ def tech_lead_prompts(
+     *,
++    goal: str,
+     prd_path: str,
+     architecture_path: str,
+     revision_number: int = 0,
+@@ -97,32 +101,40 @@ previous feedback. Check whether the concerns were addressed.
+ """
+ 
+     task = f"""\
++## Original User Goal
++
++{goal}
++
+ ## Your Mission
+ 
+-Review the proposed architecture against the product requirements.
++Review the PRD and proposed architecture against the original user goal.
+ 
+ The PRD is at: {prd_path}
+ The architecture is at: {architecture_path}
+ {revision_block}
+ Read both documents thoroughly, then assess:
+ 
+-1. **Requirements coverage**: For each acceptance criterion in the PRD, identify
++1. **Original-goal fidelity**: Compare every explicit original requirement with
++   the PRD. Reject any omission, deferral, placeholder, future-work substitute,
++   weakened threshold, or conflicting assumption before reviewing architecture.
++
++2. **Requirements coverage**: For each acceptance criterion in the PRD, identify
+    the specific architecture component and interface that satisfies it. Flag any
+    criterion without a clear implementation path.
+ 
+-2. **Interface precision**: Are types, signatures, error cases, and edge behaviors
++3. **Interface precision**: Are types, signatures, error cases, and edge behaviors
+    defined precisely enough that an autonomous agent could implement them without
+    guessing? Flag anything ambiguous.
+ 
+-3. **Internal consistency**: Do all sections of the architecture agree with each
++4. **Internal consistency**: Do all sections of the architecture agree with each
+    other? Check that interfaces used in data flow examples match their definitions,
+    that error types referenced in components match the error module, and that
+    component dependencies form a valid DAG.
+ 
+-4. **Complexity calibration**: Is the design appropriately complex — neither more
++5. **Complexity calibration**: Is the design appropriately complex — neither more
+    nor less than the problem demands?
+ 
+-5. **Scope alignment**: Does the architecture solve exactly what the PM specified?
++6. **Scope alignment**: Does the architecture solve exactly what the user specified?
+    Flag additions, omissions, deferrals, and weaker substitutes. Quote any
+    must-have that the architecture turns into placeholder behavior or future work.
+ 
+@@ -134,6 +146,7 @@ Your rejection means proceeding would cause rework or integration failures.
+ 
+ def tech_lead_task_prompt(
+     *,
++    goal: str,
+     prd_path: str,
+     architecture_path: str,
+     revision_number: int = 0,
+@@ -142,6 +155,7 @@ def tech_lead_task_prompt(
+     """Build the task prompt for the tech lead agent with optional workspace context.
+ 
+     Args:
++        goal: Original user goal, authoritative over derived planning artifacts.
+         prd_path: Path to the PRD document.
+         architecture_path: Path to the architecture document.
+         revision_number: Architecture revision number (0 = first review).
+@@ -151,6 +165,7 @@ def tech_lead_task_prompt(
+         Task prompt string.
+     """
+     _, task = tech_lead_prompts(
++        goal=goal,
+         prd_path=prd_path,
+         architecture_path=architecture_path,
+         revision_number=revision_number,
+diff --git a/tests/test_plan_artifact_integrity.py b/tests/test_plan_artifact_integrity.py
+--- a/tests/test_plan_artifact_integrity.py
++++ b/tests/test_plan_artifact_integrity.py
+@@ -5,6 +5,7 @@ from pathlib import Path
+ import pytest
+ 
+ from swe_af.app import _ensure_issue_artifacts, _validate_planned_issue_set
++from swe_af.prompts.tech_lead import tech_lead_prompts
+ from swe_af.reasoners.pipeline import (
+     _consolidate_architecture_artifacts,
+     _ensure_architecture_artifact,
+@@ -146,6 +147,19 @@ def test_authored_prd_is_augmented_without_replacing_its_detail(
+     assert not _ensure_prd_artifact(prd, str(path))
+ 
+ 
++def test_tech_lead_receives_original_goal_as_authoritative_source() -> None:
++    goal = "The shop must supply items; future-work placeholders are forbidden."
++    _, task = tech_lead_prompts(
++        goal=goal,
++        prd_path="plan/prd.md",
++        architecture_path="plan/architecture.md",
++    )
++
++    assert goal in task
++    assert "Original-goal fidelity" in task
++    assert "future-work substitute" in task
++
++
+ def test_architecture_continuations_are_consolidated_in_order(
+     tmp_path: Path,
+ ) -> None:

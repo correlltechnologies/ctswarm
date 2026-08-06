@@ -1,0 +1,22 @@
+diff --git a/Dockerfile b/Dockerfile
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -49,6 +49,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     '    ;;' \
+     'esac' \
+     '' \
++    'if [[ "${CTSWARM_CODEX_DOCKER_BYPASS:-0}" == "1" && "${1:-}" == "exec" ]]; then' \
++    '  shift' \
++    '  codex_args=(exec --dangerously-bypass-approvals-and-sandbox)' \
++    '  while (( $# )); do' \
++    '    case "$1" in' \
++    '      --sandbox) shift; (( $# )) && shift ;;' \
++    '      *) codex_args+=("$1"); shift ;;' \
++    '    esac' \
++    '  done' \
++    '  exec /usr/local/bin/codex-real "${codex_args[@]}"' \
++    'fi' \
++    '' \
+     'exec /usr/local/bin/codex-real "$@"' \
+     > /usr/local/bin/codex && \
+     chmod +x /usr/local/bin/codex && \

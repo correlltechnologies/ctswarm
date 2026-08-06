@@ -1,0 +1,825 @@
+diff --git a/swe_af/app.py b/swe_af/app.py
+index c83e00b..5536b7f 100644
+--- a/swe_af/app.py
++++ b/swe_af/app.py
+@@ -23,7 +23,7 @@ load_dotenv()  # surface HAX_API_KEY (and friends) before Agent() is constructed
+ from swe_af.issue import issue_router
+ from swe_af.reasoners import router
+ from swe_af.reasoners.pipeline import _assign_sequence_numbers, _compute_levels, _validate_file_conflicts
+-from swe_af.reasoners.schemas import PlanResult, ReviewResult
++from swe_af.reasoners.schemas import PlanResult
+ 
+ from agentfield import Agent
+ 
+@@ -118,6 +118,167 @@ async def _harness_with_scoped_credentials(*args, env=None, **kwargs):
+ app.harness = _harness_with_scoped_credentials
+ 
+ 
++def _validate_planned_issue_set(issues: list[dict]) -> None:
++    """Reject incomplete or ambiguous sprint plans before execution starts."""
++    if not issues:
++        raise RuntimeError("Sprint planner produced no executable issues")
++
++    names: list[str] = []
++    for issue in issues:
++        name = str(issue.get("name") or "").strip()
++        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
++            raise RuntimeError(f"Sprint planner produced an invalid issue name: {name!r}")
++        names.append(name)
++
++        criteria = issue.get("acceptance_criteria")
++        if not isinstance(criteria, list) or not any(
++            str(criterion).strip() for criterion in criteria
++        ):
++            raise RuntimeError(f"Planned issue {name!r} has no acceptance criteria")
++
++    duplicates = sorted({name for name in names if names.count(name) > 1})
++    if duplicates:
++        raise RuntimeError(
++            "Sprint planner produced duplicate issue names: " + ", ".join(duplicates)
++        )
++
++    known = set(names)
++    for issue in issues:
++        name = str(issue["name"])
++        dependencies = {
++            str(dependency).strip()
++            for dependency in issue.get("depends_on", [])
++            if str(dependency).strip()
++        }
++        unknown = sorted(dependencies - known)
++        if unknown:
++            raise RuntimeError(
++                f"Planned issue {name!r} has unknown dependencies: "
++                + ", ".join(unknown)
++            )
++        if name in dependencies:
++            raise RuntimeError(f"Planned issue {name!r} depends on itself")
++
++
++def _render_issue_artifact(
++    issue: dict,
++    *,
++    prd_path: str,
++    architecture_path: str,
++) -> str:
++    """Render a deterministic issue document from the validated plan stub."""
++    sequence = str(issue.get("sequence_number") or 0).zfill(2)
++    name = str(issue["name"])
++    title = str(issue.get("title") or name.replace("-", " ").title())
++    description = str(issue.get("description") or "").strip()
++    dependencies = [str(item) for item in issue.get("depends_on", [])]
++    provides = [str(item) for item in issue.get("provides", [])]
++    files_create = [str(item) for item in issue.get("files_to_create", [])]
++    files_modify = [str(item) for item in issue.get("files_to_modify", [])]
++    criteria = [
++        str(item).strip()
++        for item in issue.get("acceptance_criteria", [])
++        if str(item).strip()
++    ]
++    testing = str(issue.get("testing_strategy") or "").strip()
++
++    def bullets(values: list[str], empty: str) -> str:
++        return "\n".join(f"- {value}" for value in values) or f"- {empty}"
++
++    files = [f"Create: `{path}`" for path in files_create]
++    files.extend(f"Modify: `{path}`" for path in files_modify)
++    return f"""# issue-{sequence}-{name}: {title}
++
++## Description
++{description}
++
++## Source of Truth
++- PRD: `{prd_path}`
++- Architecture: `{architecture_path}`
++
++## Files
++{bullets(files, "Confirm exact files from the architecture before editing")}
++
++## Dependencies
++{bullets(dependencies, "None")}
++
++## Provides
++{bullets(provides, "The behavior described by this issue")}
++
++## Acceptance Criteria
++{bullets([f"[ ] {criterion}" for criterion in criteria], "No criteria supplied")}
++
++## Testing Strategy
++{testing or "Run the repository's relevant deterministic, integration, and acceptance checks."}
++
++## Completion Contract
++- Implement production behavior, not placeholders, TODOs, log-only paths, or disabled checks.
++- Record the exact commands and evidence proving every acceptance criterion.
++"""
++
++
++def _ensure_issue_artifacts(
++    issues: list[dict],
++    *,
++    issues_dir: str,
++    prd_path: str,
++    architecture_path: str,
++) -> list[str]:
++    """Guarantee one complete issue file for every structured plan entry.
++
++    Issue writers are useful for richer prose, but their success claim is not
++    evidence that a file exists. Missing, empty, or criterion-dropping outputs
++    are deterministically regenerated from the validated sprint-plan schema.
++    """
++    root = Path(issues_dir).resolve()
++    root.mkdir(parents=True, exist_ok=True)
++    recovered: list[str] = []
++
++    for issue in issues:
++        sequence = str(issue.get("sequence_number") or 0).zfill(2)
++        name = str(issue["name"])
++        expected = root / f"issue-{sequence}-{name}.md"
++        content = ""
++        if expected.is_file():
++            content = expected.read_text(encoding="utf-8")
++        criteria = [
++            str(item).strip()
++            for item in issue.get("acceptance_criteria", [])
++            if str(item).strip()
++        ]
++        complete = (
++            len(content.strip()) >= 200
++            and "## Acceptance Criteria" in content
++            and "## Testing Strategy" in content
++            and all(criterion in content for criterion in criteria)
++        )
++        if not complete:
++            expected.write_text(
++                _render_issue_artifact(
++                    issue,
++                    prd_path=prd_path,
++                    architecture_path=architecture_path,
++                ),
++                encoding="utf-8",
++            )
++            recovered.append(name)
++
++    missing = [
++        str(issue["name"])
++        for issue in issues
++        if not (
++            root
++            / f"issue-{str(issue.get('sequence_number') or 0).zfill(2)}-"
++            f"{issue['name']}.md"
++        ).is_file()
++    ]
++    if missing:
++        raise RuntimeError(
++            "Planning artifact recovery failed for issues: " + ", ".join(missing)
++        )
++    return recovered
++
++
+ async def _clone_repos(
+     cfg: BuildConfig,
+     artifacts_dir: str,
+@@ -1086,13 +1247,11 @@ async def build(
+                             ), "run_architect (tech lead revision)")
+ 
+                     if review and not review["approved"]:
+-                        review = ReviewResult(
+-                            approved=True,
+-                            feedback=review["feedback"],
+-                            scope_issues=review.get("scope_issues", []),
+-                            complexity_assessment=review.get("complexity_assessment", "appropriate"),
+-                            summary=review["summary"] + " [auto-approved after max iterations]",
+-                        ).model_dump()
++                        raise RuntimeError(
++                            "Revised architecture remained rejected after "
++                            f"{cfg.max_review_iterations} revision iteration(s): "
++                            f"{review.get('summary') or review.get('feedback') or 'no summary'}"
++                        )
+ 
+                     sprint_result = _unwrap(await app.call(
+                         f"{NODE_ID}.run_sprint_planner",
+@@ -1106,11 +1265,40 @@ async def build(
+                         workspace_manifest=manifest.model_dump() if manifest else None,
+                     ), "run_sprint_planner (revision)")
+ 
++                    revised_issues = sprint_result["issues"]
++                    revised_levels = _compute_levels(revised_issues)
++                    revised_issues = _assign_sequence_numbers(
++                        revised_issues, revised_levels
++                    )
++                    _validate_planned_issue_set(revised_issues)
++                    revised_conflicts = _validate_file_conflicts(
++                        revised_issues, revised_levels
++                    )
++                    revised_base = os.path.join(
++                        os.path.abspath(repo_path), artifacts_dir
++                    )
++                    recovered = _ensure_issue_artifacts(
++                        revised_issues,
++                        issues_dir=os.path.join(revised_base, "plan", "issues"),
++                        prd_path=os.path.join(revised_base, "plan", "prd.md"),
++                        architecture_path=os.path.join(
++                            revised_base, "plan", "architecture.md"
++                        ),
++                    )
++                    if recovered:
++                        app.note(
++                            "Recovered revised issue artifacts: "
++                            + ", ".join(recovered),
++                            tags=["build", "plan", "recovered"],
++                        )
++
+                     plan_result = {
+                         **plan_result,
+                         "architecture": arch,
+                         "review": review,
+-                        "issues": sprint_result["issues"],
++                        "issues": revised_issues,
++                        "levels": revised_levels,
++                        "file_conflicts": revised_conflicts,
+                         "rationale": sprint_result["rationale"],
+                     }
+                     continue
+@@ -1804,16 +1992,15 @@ async def plan(
+                 workspace_manifest=workspace_manifest,
+             ), "run_architect (revision)")
+ 
+-    # Force-approve if we exhausted iterations
++    # Planning is a quality gate. Exhausting review iterations is a blocking
++    # failure, not permission to silently turn a rejection into approval.
+     assert review is not None
+     if not review["approved"]:
+-        review = ReviewResult(
+-            approved=True,
+-            feedback=review["feedback"],
+-            scope_issues=review.get("scope_issues", []),
+-            complexity_assessment=review.get("complexity_assessment", "appropriate"),
+-            summary=review["summary"] + " [auto-approved after max iterations]",
+-        ).model_dump()
++        raise RuntimeError(
++            "Architecture review remained rejected after "
++            f"{max_review_iterations} revision iteration(s): "
++            f"{review.get('summary') or review.get('feedback') or 'no summary'}"
++        )
+ 
+     # 4. Sprint planner decomposes into issues
+     app.note("Phase 4: Sprint Planner", tags=["pipeline", "sprint_planner"])
+@@ -1834,6 +2021,7 @@ async def plan(
+     # 5. Compute parallel execution levels & assign sequence numbers BEFORE issue writing
+     levels = _compute_levels(issues)
+     issues = _assign_sequence_numbers(issues, levels)
++    _validate_planned_issue_set(issues)
+     file_conflicts = _validate_file_conflicts(issues, levels)
+ 
+     # 4b. Parallel issue writing (issues now have sequence_number set)
+@@ -1882,6 +2070,23 @@ async def plan(
+         tags=["pipeline", "issue_writers", "complete"],
+     )
+ 
++    recovered = _ensure_issue_artifacts(
++        issues,
++        issues_dir=issues_dir,
++        prd_path=prd_path,
++        architecture_path=architecture_path,
++    )
++    if recovered:
++        app.note(
++            "Deterministically recovered missing or incomplete issue files: "
++            + ", ".join(recovered),
++            tags=["pipeline", "issue_writers", "recovered"],
++        )
++    app.note(
++        f"Planning artifact gate passed: {len(issues)}/{len(issues)} issue files",
++        tags=["pipeline", "issue_writers", "verified"],
++    )
++
+     # 6. Write rationale to disk
+     rationale_path = os.path.join(base, "rationale.md")
+     with open(rationale_path, "w", encoding="utf-8") as f:
+diff --git a/swe_af/prompts/architect.py b/swe_af/prompts/architect.py
+index c675997..8048025 100644
+--- a/swe_af/prompts/architect.py
++++ b/swe_af/prompts/architect.py
+@@ -55,6 +55,20 @@ obvious alternatives.
+ - **Dependency justification**: Every external dependency earns its inclusion.
+   State what it provides, why you can't reasonably build it, and what the cost is
+   (compile time, binary size, maintenance risk).
++- **Acceptance evidence is architecture**: When the PRD requires browser flows,
++  screenshots, responsive checks, accessibility evidence, or generated
++  artifacts, define the concrete producer script, command, deterministic state
++  hooks, exact artifact paths, and quality assertions. "Verify later" is not an
++  implementation path.
++- **Lifecycle continuity is explicit**: Specify initialization, transitions,
++  success, failure, retry/respawn, and terminal behavior for every required user
++  flow. Do not scatter a required end-to-end loop across components without one
++  canonical flow contract.
++- **Requirements traceability**: End the document with a compact matrix mapping
++  every must-have to its component, key interfaces, executable checks, and
++  evidence artifacts. Group related acceptance criteria under their must-have;
++  explicitly list only criteria that need distinct evidence. Missing must-have
++  rows mean the architecture is incomplete.
+ 
+ ## Parallel Agent Execution Constraints
+ 
+@@ -126,6 +140,11 @@ should feel like a natural extension of what already exists.
+ 
+ Write your architecture document to: {architecture_path}
+ 
++Write the complete document to that exact canonical path. Do not create
++`architecture_continuation.md` or any alternate architecture file. If the
++document needs multiple tool calls, append subsequent sections to the exact same
++path and verify the finished file contains every section before returning.
++
+ The bar: this document is the single source of truth. Every interface you define
+ will be copied verbatim into code. Every type signature becomes a real type. Every
+ component boundary becomes a real module. Two engineers working independently from
+diff --git a/swe_af/prompts/tech_lead.py b/swe_af/prompts/tech_lead.py
+index 77d6149..eca2da0 100644
+--- a/swe_af/prompts/tech_lead.py
++++ b/swe_af/prompts/tech_lead.py
+@@ -52,6 +52,15 @@ contradiction you surface.
+ - **Scope discipline**: Did the architect add capabilities the PM didn't ask for?
+   Did they silently expand scope? Architecture should solve the stated problem,
+   not the architect's preferred problem.
++- **No requirement substitution**: The PRD's must-haves are authoritative. Reject
++  any architecture that replaces required behavior with a placeholder, message,
++  mock-only path, TODO, future-work note, locked or unreachable control, or a
++  merely similar feature. For example, a required enterable interior is not
++  satisfied by dialogue saying the location is closed.
++- **Executable acceptance**: Browser, integration, accessibility, responsive,
++  and failure-path evidence required by the PRD must have an explicit execution
++  path and artifact location. A claim that verification will happen is not a
++  verification design.
+ 
+ ## Your Decision Framework
+ 
+@@ -114,7 +123,8 @@ Read both documents thoroughly, then assess:
+    nor less than the problem demands?
+ 
+ 5. **Scope alignment**: Does the architecture solve exactly what the PM specified?
+-   Flag additions or omissions.
++   Flag additions, omissions, deferrals, and weaker substitutes. Quote any
++   must-have that the architecture turns into placeholder behavior or future work.
+ 
+ Be decisive. Your approval means autonomous agents can implement this safely.
+ Your rejection means proceeding would cause rework or integration failures.
+diff --git a/swe_af/reasoners/pipeline.py b/swe_af/reasoners/pipeline.py
+index c0d87ca..ce1f25d 100644
+--- a/swe_af/reasoners/pipeline.py
++++ b/swe_af/reasoners/pipeline.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import re
+ from collections import defaultdict, deque
+ from pathlib import Path
+ 
+@@ -49,6 +50,158 @@ def _ensure_paths(base: str) -> dict[str, str]:
+     return paths
+ 
+ 
++def _consolidate_architecture_artifacts(architecture_path: str) -> list[str]:
++    """Merge architect spill files into the canonical architecture document.
++
++    Long architecture turns can exceed a single harness write and produce
++    ``architecture_continuation*.md`` files. Downstream reviewers and writers
++    intentionally consume ``architecture.md`` as the single source of truth,
++    so leaving those continuations separate silently drops requirements from
++    review. Consolidate them in lexical order and remove the now-redundant
++    generated fragments. The operation is idempotent.
++    """
++    canonical = Path(architecture_path)
++    continuations = sorted(
++        canonical.parent.glob("architecture_continuation*.md")
++    )
++    if not continuations:
++        return []
++
++    canonical_text = (
++        canonical.read_text(encoding="utf-8") if canonical.exists() else ""
++    )
++    merged: list[str] = []
++    for continuation in continuations:
++        continuation_text = continuation.read_text(encoding="utf-8").strip()
++        if continuation_text and continuation_text not in canonical_text:
++            marker = f"<!-- Consolidated from {continuation.name} -->"
++            canonical_text = (
++                f"{canonical_text.rstrip()}\n\n{marker}\n\n"
++                f"{continuation_text}\n"
++            )
++            merged.append(continuation.name)
++        continuation.unlink()
++
++    canonical.write_text(canonical_text, encoding="utf-8")
++    return merged
++
++
++def _recover_architecture_from_document(
++    architecture_path: str,
++) -> Architecture | None:
++    """Recover the transport schema from a substantial canonical document.
++
++    The canonical markdown is the reviewed source of truth. Some long harness
++    turns successfully write that document but omit the small structured
++    sidecar, leaving ``result.parsed`` empty. Recover only enough metadata to
++    route the document to the sprint planner; the tech lead still reviews the
++    complete markdown and remains the quality gate.
++    """
++    path = Path(architecture_path)
++    if not path.exists():
++        return None
++    content = path.read_text(encoding="utf-8").strip()
++    if len(content) < 2000 or "##" not in content:
++        return None
++
++    component_block_match = re.search(
++        r"^##\s+\d*\.?\s*Component Architecture\s*$"
++        r"(?P<body>.*?)(?=^##\s+\S|\Z)",
++        content,
++        flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
++    )
++    component_block = (
++        component_block_match.group("body")
++        if component_block_match
++        else content
++    )
++    component_matches = list(
++        re.finditer(
++            r"^###\s+(?:\d+(?:\.\d+)*\s+)?(?P<name>.+?)\s*$",
++            component_block,
++            flags=re.MULTILINE,
++        )
++    )
++    components = []
++    for index, match in enumerate(component_matches[:32]):
++        name = match.group("name").strip()
++        if name.lower().startswith(("decision:", "example ")):
++            continue
++        end = (
++            component_matches[index + 1].start()
++            if index + 1 < len(component_matches)
++            else len(component_block)
++        )
++        section = component_block[match.end():end].strip()
++        paragraph = next(
++            (
++                line.strip("* ")
++                for line in section.splitlines()
++                if line.strip() and not line.lstrip().startswith(("#", "```"))
++            ),
++            "Implementation contract is defined in architecture.md.",
++        )
++        components.append(
++            {
++                "name": name,
++                "responsibility": paragraph[:500],
++                "touches_files": [],
++                "depends_on": [],
++            }
++        )
++    if not components:
++        return None
++
++    decisions = []
++    for match in re.finditer(
++        r"^###\s+Decision:\s*(?P<name>.+?)\s*$",
++        content,
++        flags=re.MULTILINE,
++    ):
++        following = content[match.end():]
++        rationale = next(
++            (
++                line.strip("* ")
++                for line in following.splitlines()
++                if line.strip() and not line.lstrip().startswith("#")
++            ),
++            "Rationale is defined in the canonical architecture document.",
++        )
++        decisions.append(
++            {"decision": match.group("name").strip(), "rationale": rationale[:500]}
++        )
++
++    interfaces = list(
++        dict.fromkeys(
++            re.findall(
++                r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(",
++                content,
++            )
++        )
++    )[:100]
++    summary_match = re.search(
++        r"^##\s+(?:Executive\s+)?Summary\s*$"
++        r"(?P<body>.*?)(?=^##\s+\S|\Z)",
++        content,
++        flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
++    )
++    summary = (
++        summary_match.group("body").strip()
++        if summary_match
++        else "Canonical architecture recovered from architecture.md."
++    )
++    return Architecture(
++        summary=summary[:2000],
++        components=components,
++        interfaces=interfaces,
++        decisions=decisions,
++        file_changes_overview=(
++            "The canonical file-change plan and exact interfaces are defined in "
++            f"{architecture_path}."
++        ),
++    )
++
++
+ def _compute_levels(issues: list[dict]) -> list[list[str]]:
+     """Topological sort of issues into parallel execution levels (Kahn's algorithm).
+ 
+@@ -371,6 +524,10 @@ async def run_architect(
+ 
+     base = os.path.join(os.path.abspath(repo_path), artifacts_dir)
+     paths = _ensure_paths(base)
++    # A prior architecture turn may have spilled into continuation files.
++    # Make the complete prior revision visible before asking the architect to
++    # revise it, then consolidate any new spill files again after the harness.
++    _consolidate_architecture_artifacts(paths["architecture"])
+ 
+     prd_obj = PRD(**prd)
+     from swe_af.prompts.architect import architect_prompts, architect_task_prompt  # noqa: PLC0415
+@@ -407,11 +564,27 @@ async def run_architect(
+         cwd=repo_path,
+     )
+     check_fatal_harness_error(result)
+-    if result.parsed is None:
++    merged = _consolidate_architecture_artifacts(paths["architecture"])
++    if merged:
++        router.note(
++            "Architect continuation artifacts consolidated into architecture.md: "
++            + ", ".join(merged),
++            tags=["architect", "artifacts", "consolidated"],
++        )
++
++    architecture = result.parsed or _recover_architecture_from_document(
++        paths["architecture"]
++    )
++    if architecture is None:
+         raise RuntimeError("Architect failed to produce a valid architecture")
++    if result.parsed is None:
++        router.note(
++            "Architect structured sidecar recovered from canonical architecture.md",
++            tags=["architect", "artifacts", "recovered"],
++        )
+ 
+     router.note("Architect complete", tags=["architect", "complete"])
+-    return result.parsed.model_dump()
++    return architecture.model_dump()
+ 
+ 
+ @router.reasoner()
+diff --git a/tests/test_plan_artifact_integrity.py b/tests/test_plan_artifact_integrity.py
+new file mode 100644
+index 0000000..cdb67fc
+--- /dev/null
++++ b/tests/test_plan_artifact_integrity.py
+@@ -0,0 +1,169 @@
++"""Planning integrity gates for autonomous builds."""
++
++from pathlib import Path
++
++import pytest
++
++from swe_af.app import _ensure_issue_artifacts, _validate_planned_issue_set
++from swe_af.reasoners.pipeline import (
++    _consolidate_architecture_artifacts,
++    _recover_architecture_from_document,
++)
++
++
++def issue(name: str, sequence: int, *, depends_on: list[str] | None = None) -> dict:
++    return {
++        "name": name,
++        "title": name.replace("-", " ").title(),
++        "description": f"Deliver the complete {name} behavior.",
++        "acceptance_criteria": [f"{name} works through the real user flow"],
++        "depends_on": depends_on or [],
++        "provides": [f"{name} capability"],
++        "files_to_create": [],
++        "files_to_modify": ["src/app.ts"],
++        "testing_strategy": f"Run tests/{name}.test.ts with the repository test runner.",
++        "sequence_number": sequence,
++    }
++
++
++def test_planned_issue_set_rejects_duplicates_and_unknown_dependencies() -> None:
++    with pytest.raises(RuntimeError, match="duplicate issue names"):
++        _validate_planned_issue_set([issue("town", 1), issue("town", 2)])
++
++    with pytest.raises(RuntimeError, match="unknown dependencies"):
++        _validate_planned_issue_set(
++            [issue("clinic", 1, depends_on=["missing-town"])]
++        )
++
++
++def test_planned_issue_set_requires_acceptance_criteria() -> None:
++    planned = issue("inventory", 1)
++    planned["acceptance_criteria"] = []
++
++    with pytest.raises(RuntimeError, match="has no acceptance criteria"):
++        _validate_planned_issue_set([planned])
++
++
++def test_missing_issue_writer_outputs_are_recovered_deterministically(
++    tmp_path: Path,
++) -> None:
++    planned = [issue("town", 1), issue("clinic", 2, depends_on=["town"])]
++    _validate_planned_issue_set(planned)
++
++    recovered = _ensure_issue_artifacts(
++        planned,
++        issues_dir=str(tmp_path / "plan" / "issues"),
++        prd_path=str(tmp_path / "plan" / "prd.md"),
++        architecture_path=str(tmp_path / "plan" / "architecture.md"),
++    )
++
++    assert recovered == ["town", "clinic"]
++    files = sorted((tmp_path / "plan" / "issues").glob("issue-*.md"))
++    assert [path.name for path in files] == [
++        "issue-01-town.md",
++        "issue-02-clinic.md",
++    ]
++    assert "town works through the real user flow" in files[0].read_text()
++    assert "clinic works through the real user flow" in files[1].read_text()
++
++
++def test_incomplete_issue_writer_output_is_replaced(tmp_path: Path) -> None:
++    planned = issue("battle-items", 3)
++    issues_dir = tmp_path / "plan" / "issues"
++    issues_dir.mkdir(parents=True)
++    path = issues_dir / "issue-03-battle-items.md"
++    path.write_text("claimed success", encoding="utf-8")
++
++    recovered = _ensure_issue_artifacts(
++        [planned],
++        issues_dir=str(issues_dir),
++        prd_path="plan/prd.md",
++        architecture_path="plan/architecture.md",
++    )
++
++    assert recovered == ["battle-items"]
++    content = path.read_text(encoding="utf-8")
++    assert "## Acceptance Criteria" in content
++    assert "battle-items works through the real user flow" in content
++
++
++def test_architecture_continuations_are_consolidated_in_order(
++    tmp_path: Path,
++) -> None:
++    plan_dir = tmp_path / "plan"
++    plan_dir.mkdir()
++    canonical = plan_dir / "architecture.md"
++    canonical.write_text("# Architecture\n\n## Component 1\n", encoding="utf-8")
++    first = plan_dir / "architecture_continuation.md"
++    second = plan_dir / "architecture_continuation_02.md"
++    first.write_text("## Component 2\nScreenshot producer.\n", encoding="utf-8")
++    second.write_text("## Component 3\nFull-loop contract.\n", encoding="utf-8")
++
++    merged = _consolidate_architecture_artifacts(str(canonical))
++
++    assert merged == [first.name, second.name]
++    content = canonical.read_text(encoding="utf-8")
++    assert content.index("## Component 1") < content.index("## Component 2")
++    assert content.index("## Component 2") < content.index("## Component 3")
++    assert not first.exists()
++    assert not second.exists()
++    assert _consolidate_architecture_artifacts(str(canonical)) == []
++
++
++def test_architecture_transport_schema_recovers_from_canonical_document(
++    tmp_path: Path,
++) -> None:
++    canonical = tmp_path / "architecture.md"
++    canonical.write_text(
++        """# Architecture
++
++## Executive Summary
++
++Deliver the complete user workflow with executable browser evidence.
++
++## 1. Core Architecture Decisions
++
++### Decision: Keep the existing runtime
++
++It preserves the proven integration boundary.
++
++## 2. Component Architecture
++
++### 2.1 Screenshot Automation
++
++Produces every required screenshot from deterministic dev hooks.
++
++```javascript
++function captureRequiredScenes() {}
++```
++
++### 2.2 World Continuity
++
++Defines initialization, encounter, respawn, guardian, and restart behavior.
++
++## 3. Requirements Traceability
++
++Every must-have maps to a component, check, and evidence artifact.
++"""
++        + ("Evidence and interface detail.\n" * 100),
++        encoding="utf-8",
++    )
++
++    recovered = _recover_architecture_from_document(str(canonical))
++
++    assert recovered is not None
++    assert [component.name for component in recovered.components] == [
++        "Screenshot Automation",
++        "World Continuity",
++    ]
++    assert recovered.interfaces == ["captureRequiredScenes"]
++    assert recovered.decisions[0].decision == "Keep the existing runtime"
++
++
++def test_architecture_transport_recovery_rejects_trivial_documents(
++    tmp_path: Path,
++) -> None:
++    canonical = tmp_path / "architecture.md"
++    canonical.write_text("# Architecture\nTODO", encoding="utf-8")
++
++    assert _recover_architecture_from_document(str(canonical)) is None
+diff --git a/tests/test_planner_pipeline.py b/tests/test_planner_pipeline.py
+index 94bd156..b288fb1 100644
+--- a/tests/test_planner_pipeline.py
++++ b/tests/test_planner_pipeline.py
+@@ -3,8 +3,8 @@
+ Covers:
+ - test_plan_happy_path: valid full pipeline returns PlanResult with all keys (AC-7, AC-8)
+ - test_plan_pm_parsed_none: PM returns invalid dict → error path (AC-7)
+-- test_plan_tech_lead_rejects_with_max_iterations_one: tech lead always rejects but
+-  auto-approval kicks in after max_review_iterations=1 (AC-7, AC-18)
++- test_plan_tech_lead_rejects_with_max_iterations_one: tech lead rejection remains
++  blocking after max_review_iterations=1 (AC-7, AC-18)
+ - test_plan_returns_dict_with_levels: result dict contains 'levels' key (AC-7)
+ 
+ All tests run under 30 seconds (AC-18) and make no real API calls (AC-16).
+@@ -217,49 +217,38 @@ async def test_plan_pm_parsed_none(mock_agent_ai, tmp_path):
+ 
+ @pytest.mark.asyncio
+ async def test_plan_tech_lead_rejects_with_max_iterations_one(mock_agent_ai, tmp_path):
+-    """Tech lead always rejects; with max_review_iterations=1 auto-approval kicks in.
++    """Tech lead rejection remains blocking after revisions are exhausted.
+ 
+     The plan() loop runs max_review_iterations+1 times total:
+       - iteration 0: run_architect → arch, run_tech_lead → rejected
+       - i < max_review_iterations (0 < 1): run_architect (revision)
+       - iteration 1: run_tech_lead → rejected
+-      - loop exhausted: force-approve
++      - loop exhausted: fail before sprint decomposition
+ 
+-    Result must still be a valid dict, and review['approved'] must be True
+-    (auto-approved).  The test must complete within 30 seconds (AC-18).
+-    (AC-7, AC-18)
++    A review rejection cannot become approval merely because the revision budget
++    was spent. The test must complete within 30 seconds. (AC-7, AC-18)
+     """
+     prd = _make_prd_dict()
+     arch = _make_architecture_dict()
+     rejected = _make_review_rejected_dict()
+-    sprint = _make_sprint_result_dict()
+-    issue_writer = _make_issue_writer_result_dict()
+-
+     # Sequence with max_review_iterations=1:
+     #  1. PM → prd
+     #  2. Architect → arch (initial)
+     #  3. TechLead (i=0) → rejected
+     #  4. Architect (revision, i=0 < 1) → arch
+-    #  5. TechLead (i=1) → rejected  (loop ends, force-approve)
+-    #  6. SprintPlanner → sprint
+-    #  7. IssueWriter → issue_writer
++    #  5. TechLead (i=1) → rejected; planning stops fail-closed
+     mock_agent_ai.side_effect = [
+         prd,        # run_product_manager
+         arch,       # run_architect (initial)
+         rejected,   # run_tech_lead (i=0)
+         arch,       # run_architect (revision)
+         rejected,   # run_tech_lead (i=1)
+-        sprint,     # run_sprint_planner
+-        issue_writer,  # run_issue_writer
+     ]
+ 
+-    result = await _call_plan(str(tmp_path), max_review_iterations=1)
++    with pytest.raises(RuntimeError, match="Architecture review remained rejected"):
++        await _call_plan(str(tmp_path), max_review_iterations=1)
+ 
+-    assert isinstance(result, dict)
+-    assert result["review"]["approved"] is True, "Auto-approval must set approved=True"
+-    assert "auto-approved" in result["review"]["summary"].lower(), (
+-        "Auto-approved review summary must mention 'auto-approved'"
+-    )
++    assert mock_agent_ai.await_count == 5
+ 
+ 
+ @pytest.mark.asyncio
