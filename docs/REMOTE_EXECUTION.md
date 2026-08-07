@@ -1,6 +1,8 @@
 # Remote execution and full routing control
 
-Status: product requirement; not yet implemented.
+Status: product requirement. Immutable per-build model/harness routing snapshots
+and their Mission Control display are implemented; VPS enrollment and remote
+runner placement are not yet implemented.
 
 ## Requested outcome
 

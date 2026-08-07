@@ -62,7 +62,9 @@ shared-resource concurrency limit and resumes monitoring the same AgentField
 execution after a restart. The same endpoint serves Mission Control, combining
 build state, per-agent traces, exact model and harness assignments, timeline
 history, approvals, build controls, and a fleet-wide model usage graph in one
-shadcn operator dashboard. See
+shadcn operator dashboard. Each build detail page also generates an operator
+summary that explains the delivery stage, checkout impact, recent milestones,
+and the specific reason a build stopped or is blocked. See
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for service endpoints, build
 controls, recovery, and log rotation.
 

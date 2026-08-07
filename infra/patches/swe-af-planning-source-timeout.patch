@@ -1,6 +1,20 @@
 diff --git a/swe_af/app.py b/swe_af/app.py
 --- a/swe_af/app.py
 +++ b/swe_af/app.py
+@@ -21,7 +21,12 @@ load_dotenv()  # surface HAX_API_KEY (and friends) before Agent() is constructed
+ 
+ from swe_af.issue import issue_router
+ from swe_af.reasoners import router
+-from swe_af.reasoners.pipeline import _assign_sequence_numbers, _compute_levels, _validate_file_conflicts
++from swe_af.reasoners.pipeline import (
++    _assign_sequence_numbers,
++    _compute_levels,
++    _recover_architecture_from_document,
++    _validate_file_conflicts,
++)
+ from swe_af.reasoners.schemas import PlanResult
+ 
+ from agentfield import Agent
 @@ -990,6 +990,7 @@ async def build(
              ai_provider=cfg.ai_provider,
              providers=cfg.providers,
@@ -17,7 +31,7 @@ diff --git a/swe_af/app.py b/swe_af/app.py
  ) -> dict:
      """Run the full planning pipeline.
  
-@@ -1913,12 +1915,26 @@ async def plan(
+@@ -1913,12 +1915,41 @@ async def plan(
      sprint_planner_model = sprint_planner_model or default_model
      issue_writer_model = issue_writer_model or default_model
  
@@ -29,6 +43,21 @@ diff --git a/swe_af/app.py b/swe_af/app.py
 +                timeout=max(1, agent_timeout_seconds),
 +            )
 +        except TimeoutError as exc:
++            if label.startswith("run_architect"):
++                architecture_path = os.path.join(
++                    os.path.abspath(repo_path),
++                    artifacts_dir,
++                    "plan",
++                    "architecture.md",
++                )
++                recovered = _recover_architecture_from_document(architecture_path)
++                if recovered is not None:
++                    app.note(
++                        f"{label} timed out after {agent_timeout_seconds}s; "
++                        "recovered transport schema from canonical architecture.md",
++                        tags=["pipeline", "architect", "timeout", "recovered"],
++                    )
++                    return recovered.model_dump()
 +            raise RuntimeError(
 +                f"{label} timed out after {agent_timeout_seconds}s"
 +            ) from exc
@@ -307,3 +336,89 @@ diff --git a/tests/test_plan_artifact_integrity.py b/tests/test_plan_artifact_in
  def test_architecture_continuations_are_consolidated_in_order(
      tmp_path: Path,
  ) -> None:
+diff --git a/tests/test_planner_pipeline.py b/tests/test_planner_pipeline.py
+--- a/tests/test_planner_pipeline.py
++++ b/tests/test_planner_pipeline.py
+@@ -248,6 +248,82 @@ async def test_plan_tech_lead_rejects_with_max_iterations_one(mock_agent_ai, tm
+         await _call_plan(str(tmp_path), max_review_iterations=1)
+ 
+     assert mock_agent_ai.await_count == 5
++
++
++@pytest.mark.asyncio
++async def test_plan_recovers_timed_out_architect_revision_from_canonical_document(
++    mock_agent_ai,
++    tmp_path,
++):
++    """A persisted substantial revision survives a structured-return timeout."""
++    architect_calls = 0
++    review_calls = 0
++
++    async def call_side_effect(target: str, **kwargs):
++        nonlocal architect_calls, review_calls
++        if target.endswith("run_product_manager"):
++            return _make_prd_dict()
++        if target.endswith("run_architect"):
++            architect_calls += 1
++            if architect_calls == 1:
++                return _make_architecture_dict()
++            architecture_path = (
++                tmp_path / ".artifacts" / "plan" / "architecture.md"
++            )
++            architecture_path.parent.mkdir(parents=True, exist_ok=True)
++            architecture_path.write_text(
++                """# Technical Architecture
++
++## Executive Summary
++
++The revised architecture preserves the complete product contract.
++
++## 2. Component Architecture
++
++### 2.1 Revised Browser Gate
++
++Produces deterministic browser evidence for every required player flow.
++
++```javascript
++function captureRequiredScenes() {}
++```
++
++## 3. Interfaces
++
++The canonical interfaces and exact state transitions follow.
++
++"""
++                + ("Executable invariant and acceptance evidence.\n" * 80),
++                encoding="utf-8",
++            )
++            await asyncio.sleep(5)
++            raise AssertionError("the timeout should cancel this call")
++        if target.endswith("run_tech_lead"):
++            review_calls += 1
++            return (
++                _make_review_rejected_dict()
++                if review_calls == 1
++                else _make_review_approved_dict()
++            )
++        if target.endswith("run_sprint_planner"):
++            return _make_sprint_result_dict()
++        if target.endswith("run_issue_writer"):
++            return _make_issue_writer_result_dict()
++        raise AssertionError(f"unexpected target: {target}")
++
++    mock_agent_ai.side_effect = call_side_effect
++
++    result = await _call_plan(
++        str(tmp_path),
++        max_review_iterations=1,
++        agent_timeout_seconds=1,
++    )
++
++    assert result["review"]["approved"] is True
++    assert result["architecture"]["components"][0]["name"] == (
++        "Revised Browser Gate"
++    )
++    assert "captureRequiredScenes" in result["architecture"]["interfaces"]
+ 
+ 
+ @pytest.mark.asyncio

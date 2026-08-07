@@ -191,6 +191,37 @@ exposed and corrected two orchestration-adjacent presentation problems—the
 finalizer's artifact sweep and draft-state flip—rather than accepting the top
 level success label without inspecting the PR.
 
+## Closure verification (2026-08-06)
+
+This pass used the Pokémon-style `Prism Wilds` repository as a production-sized
+acceptance target rather than treating a scheduler success label as proof that
+the product changed.
+
+| Fact | Method | Result |
+|---|---|---|
+| Mission Control operator narrative | Live browser review of a stopped build at desktop and 390×844 | Build detail explains delivery stage, checkout impact, recent milestones, and the concrete stop/block reason; no horizontal overflow or browser errors |
+| Immutable launch routing | Scheduler/orchestrator regression tests plus live builds with defaults changed immediately after enqueue | Planning, implementation, review, and maintenance assignments remain the policy captured at enqueue time and are shown on build detail |
+| Cross-workflow cancellation | Orchestrator regression tests and stopped Pokémon runs | Stop resolves workflow/run identity, cancels the workflow tree, and retains a per-execution fallback for historical records |
+| Truthful stalled duration | Scheduler regression test plus live long-form planning calls | Polling no longer resets inactivity; the timer resets only when observable execution progress arrives |
+| OpenCode available in production worker | Rebuilt worker and direct OpenCode shell task routed through `ctswarm/low` | OpenCode 1.18.14 created and read back the exact expected file through the local model route |
+| Harness/quota failures fail closed | Focused SWE-AF suite | 76/76 tests passed, including missing harness binary, hosted usage-limit detection, planning artifact recovery, and browser acceptance gates |
+| Root closure suite | `.venv/bin/pytest -q`; `.venv/bin/ruff check ctswarm tests` | 95/95 passed; lint clean |
+| Mission Control source checks | `npm --prefix dashboard-ui run lint`; `npm --prefix dashboard-ui run typecheck`; `npm --prefix dashboard-ui run build` | All passed; production static assets regenerated |
+| Planning source preservation | Live Pokémon runs | Authored PRD and architecture documents survived transport and remained the source for downstream review instead of being replaced by small schema summaries |
+| Codex capacity classification | Direct Codex smoke plus scheduler capacity ledger | The account returned an authoritative usage-limit response; Codex was marked temporarily unavailable instead of repeatedly launching doomed work |
+
+The earlier short Pokémon builds were deliberately stopped or failed after they
+provided conclusive evidence of a defect: a routing policy captured too late, a
+missing OpenCode executable on the worker login path, and an exhausted Codex
+quota. None produced integrated game code, so there was no safe game branch to
+push from those runs. Their isolated planning/worktree activity could not and
+did not mutate the user's main checkout.
+
+The remote-execution request is recorded in `docs/REMOTE_EXECUTION.md`. The
+immutable per-build model/harness routing foundation is implemented; VPS runner
+enrollment, remote placement, and authenticated VPS-to-local model routing are
+explicitly not claimed as implemented.
+
 ## Assumptions not yet verified
 
 | Assumption | Why it is not yet verified | What breaks if wrong |

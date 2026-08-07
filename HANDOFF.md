@@ -1,9 +1,11 @@
 # ctswarm handoff
 
-**As of 2026-07-30, 16:16 EDT.** The seven-service stack is running, the
-always-on scheduler is healthy, both Claude and the local OpenCode/Qwen path are
-proven under the real harness, and a post-fix multi-issue build completed with a
-clean draft pull request.
+**As of 2026-08-06.** The seven-service stack is running, Mission Control is
+available at `http://127.0.0.1:8092/dashboard`, and the scheduler now preserves
+an immutable model/harness policy at enqueue time. A final Pokémon-game closure
+build is exercising Claude planning/review with local OpenCode/Ollama
+implementation; its terminal outcome is recorded in the 2026-08-06 section of
+`docs/VERIFIED.md`.
 
 This document is the operational handoff. `docs/VERIFIED.md` contains the
 evidence history and `docs/OPERATIONS.md` contains the runbook.
@@ -20,6 +22,16 @@ The core branch-and-PR factory works end to end:
   (`10m`, five files by default).
 - The scheduler owns all submissions. Its SQLite-backed queue, controls,
   execution IDs, and terminal results survive container restarts.
+- Routing policy is captured when a request is enqueued, so changing global
+  defaults cannot race with or rewrite a queued build's launch assignments.
+- Stop cancels the complete AgentField workflow tree when a workflow/run ID is
+  available and falls back to per-execution cancellation for older records.
+- Live build records retain a truthful inactivity timer rather than resetting
+  the displayed stalled duration during scheduler polling.
+- Mission Control generates a plain-language operator narrative for every build:
+  delivery stage, checkout impact, recent milestones, and stop/block reason.
+- Build details display the immutable planning, implementation, review, and
+  maintenance harness/model assignments used at launch.
 - Default concurrency is one build, matching the shared AgentField database and
   local GPU. A queued build cannot bypass that limit.
 - Claude and local OpenCode both produced committed, tested, independently
@@ -239,6 +251,7 @@ browser evidence; the API-only sandbox proof does not.
 | `README.md` | Architecture and design principles |
 | `docs/OPERATIONS.md` | Always-on runbook, recovery, controls, logs |
 | `docs/VERIFIED.md` | Verified facts, live evidence, assumptions |
+| `docs/REMOTE_EXECUTION.md` | VPS/local/hybrid execution and routing requirement |
 | `docs/SLACK.md` | Optional Slack approval setup |
 | `docs/OPENROUTER.md` | Hosted overflow setup and cost reasoning |
 | `sandbox/README.md` | Local verification target and contract trap |
