@@ -59,23 +59,38 @@ accept that only small targets will build, or to run the Pi as scheduler and
 dashboard with a remote runner doing the work (`docs/REMOTE_EXECUTION.md`).
 More tuning will not create memory that is not there.
 
-### 1. Enable cgroup memory accounting (mandatory)
+### 1. Run the host prep script
+
+Steps 2 through 6 below are all things ctswarm cannot do for itself, and all of
+them are in one idempotent script. Read it first, then:
+
+```bash
+sudo bash infra/pi-host-prep.sh
+```
+
+It repairs DNS if Tailscale broke it, replaces the Docker snap with the
+official packages, bounds the container and journal logs, enables cgroup memory
+accounting, switches swap to zram, and installs the systemd unit with your
+username and repository path filled in. It does not enable that unit; do that
+after the first successful `./stack.sh up`.
+
+The rest of this section explains what each step is for, because when one of
+them fails the symptom is rarely obvious.
+
+### 2. cgroup memory accounting (mandatory)
 
 Raspberry Pi OS ships with this off, and **every `mem_limit` in the compose
-file is silently ignored until it is on.** Append to `/boot/firmware/cmdline.txt`
-— one single line, do not add a newline:
-
-```
-cgroup_enable=memory cgroup_memory=1
-```
-
-Reboot, then verify. If this prints a warning, the limits are not being applied:
+file is silently ignored until it is on.** No warning, no error: the container
+simply grows until the OOM killer takes something else. The script appends
+`cgroup_enable=memory cgroup_memory=1` to `/boot/firmware/cmdline.txt`, which
+must stay a single line. **This one needs a reboot.** Verify afterwards; if
+this prints a warning, the limits are not being applied:
 
 ```bash
 docker info 2>&1 | grep -i "no memory limit" && echo "NOT APPLIED" || echo "ok"
 ```
 
-### 2. Boot from a USB SSD, not the SD card
+### 3. Boot from a USB SSD, not the SD card
 
 This is the highest-value hardware decision here. A 24/7 factory running
 Postgres, Docker layer writes, git checkouts and `npm ci` will wear out an SD
@@ -91,38 +106,18 @@ sudo ln -s /mnt/ssd/docker /var/lib/docker
 sudo systemctl start docker
 ```
 
-### 3. zram instead of SD swap
+### 4. zram instead of SD swap
 
-Compressed RAM swap is cheap; swapping to an SD card is not. `swappiness=100`
-is correct **only** in combination with zram.
+Compressed RAM swap is cheap; swapping to an SD card is not, and it is the
+fastest way to wear one out. `swappiness=100` is correct **only** in
+combination with zram, which is why the script sets both together.
 
-```bash
-sudo systemctl disable --now dphys-swapfile
-sudo apt install -y zram-tools
-```
-
-`/etc/default/zramswap`:
-
-```
-ALGO=zstd
-PERCENT=50
-PRIORITY=100
-```
-
-`/etc/sysctl.d/99-ctswarm.conf`:
-
-```
-vm.swappiness=100
-vm.vfs_cache_pressure=50
-vm.page-cluster=0
-```
-
-### 4. Do not use the Docker snap
+### 5. Do not use the Docker snap
 
 Check what you have:
 
 ```bash
-which docker            # /snap/bin/docker means the snap
+readlink -f "$(command -v docker)"    # a /snap/ path means the snap
 ```
 
 Canonical's Docker snap is strictly confined. Bind mounts only work from `$HOME`
@@ -131,25 +126,15 @@ credential file must live under your home directory or the containers start
 with empty mounts. Its socket is also `root:root` rather than group-owned, so
 the usual `usermod -aG docker` does nothing and every command needs `sudo`.
 
-Prefer the official packages:
+The script removes it and installs the official packages. **Export anything you
+care about first** — `snap remove docker` takes its containers and volumes with
+it, and if this box is also your Pi-hole, that means your network loses DNS
+until you bring it back. Bind-mounted data under `$HOME` survives; named
+volumes do not.
 
-```bash
-sudo snap remove docker              # exports first if you have data in it
-curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker "$USER"      # log out and back in
-docker compose version               # must be >= 2.24 for the Pi overlay
-```
+The Pi overlay needs `docker compose` >= 2.24 for `!reset` and `!override`.
 
-If you must keep the snap, at minimum connect the home interface and keep
-everything under `$HOME`:
-
-```bash
-sudo snap connect docker:home
-sudo addgroup --system docker && sudo adduser "$USER" docker
-sudo snap disable docker && sudo snap enable docker
-```
-
-### 5. Tailscale and Pi-hole on the same box
+### 6. Tailscale and Pi-hole on the same box
 
 If this Pi is *also* your tailnet DNS server, do not let it accept Tailscale
 DNS. Tailscale rewrites `/etc/resolv.conf` to point at MagicDNS on
@@ -168,30 +153,41 @@ to `resolvectl`, so Tailscale's resolvconf call fails with
 sudo tailscale set --accept-dns=false
 ```
 
-That restores the pre-Tailscale `resolv.conf` (`nameserver 127.0.0.1`, i.e.
-Pi-hole). The cost is that this node stops resolving `*.ts.net` names; it can
-still reach tailnet peers by IP, and every other device keeps using Pi-hole
-normally.
+That is *supposed* to restore the pre-Tailscale `resolv.conf`. When resolvconf
+is the broken symlink above it cannot, and you are left with a machine that
+still cannot resolve anything even though you ran the documented fix. The
+script therefore writes `/etc/resolv.conf` directly:
 
-### 6. Bound the logs
-
-`/etc/docker/daemon.json`:
-
-```json
-{
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "5m", "max-file": "3"},
-  "storage-driver": "overlay2"
-}
+```
+nameserver 127.0.0.1
+nameserver 1.1.1.1
+nameserver 8.8.8.8
 ```
 
-And in `/etc/systemd/journald.conf`: `SystemMaxUse=100M`.
+The ordering is the point. `127.0.0.1` is Pi-hole, so normal resolution stays
+filtered. When Pi-hole is down the kernel refuses the connection *immediately*
+rather than timing out, so glibc reaches the public fallback in well under a
+second. Without that fallback, stopping Pi-hole for thirty seconds also stops
+this host from resolving, which is how a routine container restart turns into
+an outage you cannot debug because `apt`, `git`, and `curl` have all gone dark
+at the same moment.
+
+The cost of `--accept-dns=false` is that this node stops resolving `*.ts.net`
+names. It still reaches tailnet peers by IP, and every other device keeps using
+Pi-hole normally.
+
+### 7. Bound the logs
+
+Container logs are capped at 5MB × 3 in `/etc/docker/daemon.json` and the
+journal at 100M in `/etc/systemd/journald.conf`. A factory running for weeks
+fills a disk with logs long before it fills one with anything useful.
 
 ## Install
 
 ```bash
 git clone git@github.com:correlltechnologies/ctswarm.git ~/ctswarm
 cd ~/ctswarm
+sudo bash infra/pi-host-prep.sh    # see "Host preparation" above; may ask for a reboot
 ./bootstrap.sh
 ```
 
@@ -243,9 +239,12 @@ docker buildx build --platform linux/arm64 -f infra/Dockerfile.router -t <regist
 
 ### Boot on power-up
 
+`infra/pi-host-prep.sh` already installed the unit with your username and
+repository path substituted in. It deliberately left it disabled, because a
+unit that starts a stack you have never successfully started by hand turns a
+first-boot problem into a reboot loop. Once `./stack.sh up` has worked once:
+
 ```bash
-sudo cp infra/ctswarm.service /etc/systemd/system/
-sudo systemctl daemon-reload
 sudo systemctl enable --now ctswarm
 ```
 

@@ -1,11 +1,13 @@
 # Bring the ctswarm stack up at boot and keep it up.
 #
-#   sudo cp infra/ctswarm.service /etc/systemd/system/ctswarm.service
-#   sudo systemctl daemon-reload
+# `infra/pi-host-prep.sh` installs this file with User, WorkingDirectory,
+# ExecStart, and ExecStop rewritten to match the host, and leaves it disabled.
+# Enable it only after `./stack.sh up` has succeeded once by hand:
+#
 #   sudo systemctl enable --now ctswarm
 #
-# Edit WorkingDirectory, User, and Environment to match the host. The defaults
-# assume a Raspberry Pi OS install with the repository at /home/CHANGEME/ctswarm.
+# To install it manually instead, copy it to /etc/systemd/system/ and replace
+# every CHANGEME with your username and repository path.
 #
 # Individual containers already carry `restart: unless-stopped`, so Docker
 # restarts a service that crashes. This unit exists for the case Docker cannot
