@@ -27,15 +27,26 @@ source infra/versions.env
 REVENDOR=0
 SKIP_MODELS=0
 CHECK_ONLY=0
+SUBSCRIPTION_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --revendor)   REVENDOR=1 ;;
     --no-models)  SKIP_MODELS=1 ;;
     --check)      CHECK_ONLY=1 ;;
+    --subscription-only) SUBSCRIPTION_ONLY=1 ;;
     -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
+
+# A host with no accelerator has no usable local path, so probing for one and
+# then downloading a model it cannot serve wastes an hour and several GB. Infer
+# the mode rather than making the operator remember a flag, and let an explicit
+# environment setting win over the guess either way.
+case "${CTSWARM_EXECUTION_MODE:-}" in
+  subscription_only) SUBSCRIPTION_ONLY=1 ;;
+  hybrid)            SUBSCRIPTION_ONLY=0 ;;
+esac
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
 YELLOW=$'\033[33m'; RESET=$'\033[0m'
@@ -69,8 +80,25 @@ elif have nvidia-smi; then
   MEM_GB=$(( VRAM_MB / 1024 ))
   ok "${GPU_NAME}, ${MEM_GB}GB VRAM"
 else
-  warn "no GPU detected; local inference will run on CPU and be slow"
   MEM_GB=4
+  # A GPU-less arm64 box is a single-board computer or a small VPS, not a
+  # workstation someone forgot to plug a card into. Default it to the mode that
+  # actually works there instead of warning about slow inference it will never
+  # be asked to do.
+  if [[ "$ARCH" == "aarch64" || "$ARCH" == "armv7l" ]]; then
+    [[ "${CTSWARM_EXECUTION_MODE:-}" == "hybrid" ]] || SUBSCRIPTION_ONLY=1
+    ok "arm64 host with no accelerator; using subscriptions-only execution"
+  else
+    warn "no GPU detected; local inference will run on CPU and be slow"
+    note "run with --subscription-only to skip local models entirely"
+  fi
+fi
+
+if [[ $SUBSCRIPTION_ONLY -eq 1 ]]; then
+  say "Subscriptions-only mode"
+  note "every agent role runs on the Claude Code and Codex CLIs"
+  note "no local model server, no API keys, no router service"
+  SKIP_MODELS=1
 fi
 
 # ---------------------------------------------------------------------------
@@ -106,7 +134,9 @@ say "Checking local inference backend"
 # ---------------------------------------------------------------------------
 LOCAL_BACKEND="none"
 
-if [[ "$ACCEL" == "metal" ]] && python3 -c 'import mlx_lm' 2>/dev/null; then
+if [[ $SUBSCRIPTION_ONLY -eq 1 ]]; then
+  note "not required in subscriptions-only mode"
+elif [[ "$ACCEL" == "metal" ]] && python3 -c 'import mlx_lm' 2>/dev/null; then
   LOCAL_BACKEND="mlx"
   ok "mlx-lm available"
 elif have ollama; then
@@ -249,24 +279,77 @@ else
       ok "GH_TOKEN from gh cli"
     fi
   fi
+  if [[ $SUBSCRIPTION_ONLY -eq 1 ]]; then
+    sed -i.bak "s|^# *CTSWARM_EXECUTION_MODE=.*|CTSWARM_EXECUTION_MODE=subscription_only|" .env && rm -f .env.bak
+    grep -q '^CTSWARM_EXECUTION_MODE=' .env \
+      || printf '\nCTSWARM_EXECUTION_MODE=subscription_only\n' >> .env
+    ok "pinned CTSWARM_EXECUTION_MODE=subscription_only"
+  fi
   ok "created .env from .env.example"
+fi
+
+# Docker turns a bind mount of a missing host file into a *directory*, silently.
+# The agent containers mount four credential files individually, so on a host
+# where a login has not happened yet, starting the stack first leaves the CLI
+# facing a directory where its config should be and failing in a way that looks
+# like a broken image rather than a missing login.
+if [[ $CHECK_ONLY -eq 0 ]]; then
+  CODEX_HOME="${CTSWARM_CODEX_HOME:-$HOME/.codex}"
+  CLAUDE_CREDENTIALS="${CTSWARM_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+  CLAUDE_CONFIG="${CTSWARM_CLAUDE_CONFIG:-$HOME/.claude.json}"
+  created_placeholder=0
+  mkdir -p "$CODEX_HOME" "$(dirname "$CLAUDE_CREDENTIALS")"
+  for f in "$CLAUDE_CONFIG" "$CODEX_HOME/config.toml"; do
+    if [[ ! -e "$f" ]]; then
+      : > "$f"; chmod 600 "$f"; created_placeholder=1
+    fi
+  done
+  # The credentials file needs a placeholder too, and specifically an empty JSON
+  # object rather than an empty file. `claude setup-token` hands you a token for
+  # .env and does not write this path, and on macOS the CLI uses the Keychain
+  # and never writes it at all -- so without this the mount source is missing
+  # and the container gets a directory where its credentials should be. An
+  # unreadable directory is a hard failure; `{}` is simply "no stored
+  # credentials", which falls through to CLAUDE_CODE_OAUTH_TOKEN as intended.
+  if [[ ! -e "$CLAUDE_CREDENTIALS" ]]; then
+    printf '{}\n' > "$CLAUDE_CREDENTIALS"; chmod 600 "$CLAUDE_CREDENTIALS"
+    created_placeholder=1
+  fi
+  (( created_placeholder )) && note "created config placeholders so bind mounts stay files, not directories"
 fi
 
 # Credentials are reported, never auto-acquired: both of these open an
 # interactive browser flow that must not run unattended from a setup script.
-if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=sk-' .env 2>/dev/null; then
+HEADLESS=0
+if [[ "$OS" == "Linux" && -z "${DISPLAY:-}" && -n "${SSH_CONNECTION:-}" ]]; then
+  HEADLESS=1
+fi
+
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] \
+   || grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=sk-' .env 2>/dev/null \
+   || [[ -f "${CTSWARM_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}" ]]; then
   ok "claude_code runtime configured"
 else
   warn "claude_code runtime not configured"
+  # setup-token prints a token rather than waiting on a browser redirect, so
+  # this one works over plain SSH with nothing else set up.
   note "run: claude setup-token    then put the value in .env"
   todo "configure CLAUDE_CODE_OAUTH_TOKEN"
 fi
 
-if [[ -f "$HOME/.codex/auth.json" ]]; then
+if [[ -f "${CTSWARM_CODEX_HOME:-$HOME/.codex}/auth.json" ]]; then
   ok "codex runtime configured (ChatGPT login found)"
 else
   warn "codex runtime not configured"
-  note "run: codex login"
+  if [[ $HEADLESS -eq 1 ]]; then
+    # codex login completes against a loopback callback, which a headless box
+    # cannot open. Forward the port from the machine that has a browser.
+    note "codex login needs a browser callback this host cannot open."
+    note "from your laptop:  ssh -L 1455:localhost:1455 ${USER}@$(hostname)"
+    note "then, in that session:  codex login"
+  else
+    note "run: codex login"
+  fi
   todo "run codex login"
 fi
 
@@ -305,7 +388,11 @@ say "Summary"
 # ---------------------------------------------------------------------------
 echo
 printf '  platform        %s / %s / %s\n' "$OS" "$ARCH" "$ACCEL"
-printf '  local backend   %s\n' "$LOCAL_BACKEND"
+if [[ $SUBSCRIPTION_ONLY -eq 1 ]]; then
+  printf '  execution       subscriptions only (claude_code + codex)\n'
+else
+  printf '  local backend   %s\n' "$LOCAL_BACKEND"
+fi
 printf '  swe-af pin      %s\n' "${SWE_AF_COMMIT:0:8}"
 echo
 
@@ -315,7 +402,21 @@ if (( ${#TODO[@]} )); then
   echo
 fi
 
-cat <<'NEXT'
+# `bootstrap.sh` has never started the stack, despite README claiming it does.
+# Print the command rather than fixing the claim by surprising anyone.
+if [[ $SUBSCRIPTION_ONLY -eq 1 ]]; then
+  cat <<'NEXT'
+  Next:
+    ./.venv/bin/ctswarm doctor              inventory of what is wired up
+    CTSWARM_PROFILE=pi ./stack.sh up        build and start the stack
+    ./.venv/bin/ctswarm status              queue and build state
+
+  Bench and the router are not used in this mode; every role runs on the
+  Claude Code and Codex CLIs. See docs/RASPBERRY_PI.md for host setup.
+
+NEXT
+else
+  cat <<'NEXT'
   Next:
     ./.venv/bin/ctswarm doctor    full inventory of what is wired up
     ./.venv/bin/ctswarm bench     qualify local models, write the routing table
@@ -323,3 +424,4 @@ cat <<'NEXT'
     ./.venv/bin/ctswarm verify    run the self-verification probe suite
 
 NEXT
+fi

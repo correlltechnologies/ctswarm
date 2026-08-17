@@ -1,0 +1,165 @@
+# ctswarm overlay for a small always-on host (Raspberry Pi 4, 4GB, arm64).
+#
+# Composed as a THIRD file, after the SWE-AF compose and the ctswarm overlay:
+#
+#   docker compose --project-directory . \
+#                  -f vendor/SWE-AF/docker-compose.yml \
+#                  -f infra/docker-compose.ctswarm.yml \
+#                  -f infra/docker-compose.pi.yml up -d
+#
+# Use `CTSWARM_PROFILE=pi ./stack.sh up` rather than typing that out.
+#
+# What this overlay changes, and why each one is load-bearing rather than tuning:
+#
+#   1. The router is moved behind a Compose profile and every `depends_on` that
+#      waited on it is reset. Without both, a host with no local models either
+#      runs a service that can serve nothing, or hangs at boot waiting for a
+#      service that was deliberately excluded.
+#   2. API keys are blanked. Both CLIs prefer an API key over a subscription
+#      login when one is present, so merely passing the variables through is a
+#      live paid path on a host whose entire point is that it bills to a
+#      subscription.
+#   3. Memory limits on every service. The Pi has no accelerator, so nothing
+#      here is doing inference -- but the target repository's own install and
+#      test cycle runs locally, and that is what exhausts a 4GB box.
+#
+# Merge semantics verified against Compose v5.1.4 rather than assumed:
+# list-form `environment` entries in a later file override the same key from an
+# earlier one while leaving unrelated keys intact, `!reset []` removes an
+# inherited `depends_on`, and a `profiles:` entry excludes the service from the
+# merged configuration entirely. Check with `CTSWARM_PROFILE=pi ./stack.sh config`
+# after any change here.
+
+x-pi-logging: &pi-logging
+  driver: json-file
+  options:
+    # Tighter than the default 10m x 5. Logs land on the SD card or SSD that
+    # everything else is competing for.
+    max-size: "${CTSWARM_LOG_MAX_SIZE:-5m}"
+    max-file: "${CTSWARM_LOG_MAX_FILES:-3}"
+
+# Subscriptions-only credentials. Applied to every service that can invoke a
+# harness. An empty value is not the same as an unset one: it overrides an
+# inherited key rather than letting the base overlay's `${VAR:-}` fall through.
+x-subscription-credentials: &subscription-credentials
+  - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
+  - ANTHROPIC_API_KEY=
+  - OPENAI_API_KEY=
+  - OPENROUTER_API_KEY=
+  - SWE_CODEX_AUTH_MODE=chatgpt
+
+services:
+  # Excluded unless the `local-models` profile is requested. The service is not
+  # deleted, so the same repository still runs the hybrid stack on a host that
+  # has an accelerator.
+  ctswarm-router:
+    profiles: ["local-models"]
+
+  control-plane:
+    # Already parameterised in infra/versions.env but never referenced by the
+    # base overlay. Wiring it here is the escape hatch if the published image
+    # ever stops shipping a linux/arm64 manifest: build from source and point
+    # this at the result.
+    image: ${AGENTFIELD_CONTROL_PLANE_IMAGE:-agentfield/control-plane:latest}
+    mem_limit: ${CTSWARM_PI_CONTROL_PLANE_MEM:-512m}
+    logging: *pi-logging
+
+  build-db:
+    mem_limit: ${CTSWARM_PI_DB_MEM:-384m}
+    # Postgres sizes itself for a server, not for a quarter of a Pi. These are
+    # the settings that stop it reserving memory the agents need.
+    command: >
+      postgres
+      -c shared_buffers=96MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c max_connections=20
+      -c effective_cache_size=256MB
+      -c wal_compression=on
+      -c checkpoint_timeout=15min
+      -c max_wal_size=512MB
+      -c synchronous_commit=off
+      -c random_page_cost=1.1
+    logging: *pi-logging
+
+  ctswarm-approvals:
+    mem_limit: ${CTSWARM_PI_APPROVALS_MEM:-192m}
+    environment: *subscription-credentials
+    logging: *pi-logging
+
+  ctswarm-scheduler:
+    mem_limit: ${CTSWARM_PI_SCHEDULER_MEM:-384m}
+    environment:
+      - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
+      - ANTHROPIC_API_KEY=
+      - OPENAI_API_KEY=
+      - OPENROUTER_API_KEY=
+      - SWE_CODEX_AUTH_MODE=chatgpt
+      # The base overlay hardcodes a macOS-shaped path. A Pi keeps its
+      # checkouts wherever the operator put them.
+      - CTSWARM_PROJECTS_ROOT=${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}
+      # A healthy build on a Pi can sit inside a dependency install for far
+      # longer than on a desktop. Killing it as stalled is the failure that
+      # looks like a bug in the factory.
+      - CTSWARM_NO_PROGRESS_TIMEOUT_S=${CTSWARM_NO_PROGRESS_TIMEOUT_S:-5400}
+      - CTSWARM_AGENT_TIMEOUT_SECONDS=${CTSWARM_AGENT_TIMEOUT_SECONDS:-2700}
+      - CTSWARM_MAX_CONCURRENT_BUILDS=${CTSWARM_MAX_CONCURRENT_BUILDS:-1}
+      - CTSWARM_BIND_MODE=${CTSWARM_BIND_MODE:-loopback}
+    volumes: !override
+      - ctswarm-state:/state
+      - ./bench/results:/bench-results:ro
+      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}:/home/ctswarm/.codex:ro
+      - ${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:ro
+    depends_on: !override
+      swe-agent:
+        condition: service_healthy
+      ctswarm-approvals:
+        condition: service_started
+    logging: *pi-logging
+
+  swe-agent:
+    mem_limit: ${CTSWARM_PI_AGENT_MEM:-1600m}
+    # Chromium maps its renderer heap through /dev/shm. Docker's 64MB default
+    # crashes it on real pages; --disable-dev-shm-usage instead pushes that
+    # traffic onto disk, which is worse on an SD card than giving it the RAM.
+    shm_size: ${CTSWARM_PI_AGENT_SHM:-256m}
+    pids_limit: 512
+    environment:
+      - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
+      - ANTHROPIC_API_KEY=
+      - OPENAI_API_KEY=
+      - OPENROUTER_API_KEY=
+      - SWE_CODEX_AUTH_MODE=chatgpt
+      # No local runtime exists here, so the base runtime must be a harness.
+      # Leaving this at open_code would send every unmapped role to a provider
+      # that is not running.
+      - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-claude_code}
+      - CHROMIUM_FLAGS=--headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --js-flags=--max-old-space-size=384 --window-size=1280,800
+      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+      - AGENTFIELD_HARNESS_IDLE_SECONDS=${CTSWARM_HARNESS_IDLE_SECONDS:-1800}
+    volumes: !override
+      - ${CTSWARM_CLAUDE_CREDENTIALS:-${HOME}/.claude/.credentials.json}:/root/.claude/.credentials.json:ro
+      - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json.seed:ro
+      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
+      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/auth.json:/root/.codex/auth.json:ro
+      - ${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:ro
+    depends_on: !reset []
+    logging: *pi-logging
+
+  swe-fast:
+    mem_limit: ${CTSWARM_PI_FAST_MEM:-384m}
+    environment:
+      - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
+      - ANTHROPIC_API_KEY=
+      - OPENAI_API_KEY=
+      - OPENROUTER_API_KEY=
+      - SWE_CODEX_AUTH_MODE=chatgpt
+      - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-claude_code}
+    volumes: !override
+      - ${CTSWARM_CLAUDE_CREDENTIALS:-${HOME}/.claude/.credentials.json}:/root/.claude/.credentials.json:ro
+      - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json.seed:ro
+      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
+      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/auth.json:/root/.codex/auth.json:ro
+      - ${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:ro
+    depends_on: !reset []
+    logging: *pi-logging

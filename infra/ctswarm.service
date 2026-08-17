@@ -1,0 +1,49 @@
+# Bring the ctswarm stack up at boot and keep it up.
+#
+#   sudo cp infra/ctswarm.service /etc/systemd/system/ctswarm.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ctswarm
+#
+# Edit WorkingDirectory, User, and Environment to match the host. The defaults
+# assume a Raspberry Pi OS install with the repository at /home/pi/ctswarm.
+#
+# Individual containers already carry `restart: unless-stopped`, so Docker
+# restarts a service that crashes. This unit exists for the case Docker cannot
+# handle on its own: the whole machine rebooting.
+
+[Unit]
+Description=ctswarm autonomous build factory
+# tailscaled matters here because `tailscale serve` is how the dashboard is
+# reachable; starting the stack before the tailnet is up leaves it running but
+# unreachable until something restarts it.
+After=docker.service tailscaled.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=pi
+WorkingDirectory=/home/pi/ctswarm
+
+Environment=CTSWARM_PROFILE=pi
+Environment=CTSWARM_EXECUTION_MODE=subscription_only
+# Cold start on a Pi pulls images, starts Postgres, and waits on the control
+# plane. The 120s default is a workstation number.
+Environment=CTSWARM_HEALTH_TIMEOUT_S=600
+
+# `start`, not `up`: `up` rebuilds, and a rebuild at boot turns a power cut into
+# a 45-minute outage, or into no factory at all if the network is flaky while
+# it runs. Images are built deliberately with `./stack.sh up`.
+ExecStart=/home/pi/ctswarm/stack.sh start
+ExecStop=/home/pi/ctswarm/stack.sh down
+
+# A first boot that has to pull images takes far longer than the systemd
+# default of 90 seconds, and being killed midway leaves a half-started stack.
+TimeoutStartSec=1800
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -217,6 +217,45 @@ def test_a_subscription_login_file_counts_as_a_credential(tmp_path, monkeypatch)
     assert manager.configured(Runtime.CLAUDE_CODE) is True
 
 
+def test_an_empty_placeholder_is_not_a_login(tmp_path, monkeypatch, no_claude_login) -> None:
+    """bootstrap.sh writes `{}` here so the container bind mount stays a file.
+
+    Treating that as a credential would launch a build against a harness that
+    refuses on its first call, which is the failure this whole mode exists to
+    make impossible.
+    """
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text("{}", encoding="utf-8")
+    codex = tmp_path / ".codex"
+    codex.mkdir()
+    (codex / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    manager = CapacityManager(
+        ledger=Ledger(tmp_path / "ledger.db"),
+        env={"CTSWARM_EXECUTION_MODE": "subscription_only"},
+    )
+    assert manager.configured(Runtime.CLAUDE_CODE) is False
+    assert manager.configured(Runtime.CODEX) is False
+
+    credentials.write_text('{"accessToken": "real"}', encoding="utf-8")
+    assert manager.configured(Runtime.CLAUDE_CODE) is True
+
+
+def test_a_credentials_directory_is_not_a_login(tmp_path, monkeypatch, no_claude_login) -> None:
+    """Docker creates a directory when a bind-mount source is missing."""
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    manager = CapacityManager(
+        ledger=Ledger(tmp_path / "ledger.db"),
+        env={"CTSWARM_EXECUTION_MODE": "subscription_only"},
+    )
+    assert manager.configured(Runtime.CLAUDE_CODE) is False
+
+
 def test_local_runtime_reports_a_truthful_reason(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     manager = CapacityManager(

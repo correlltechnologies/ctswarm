@@ -27,6 +27,7 @@ small prompt" is not a reason to expect a small bill.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -101,6 +102,17 @@ def default_budgets(env: dict | None = None) -> dict[Runtime, WindowBudget]:
     }
 
 
+def _has_credentials(path) -> bool:
+    """Whether a credentials file holds anything, rather than merely existing."""
+    try:
+        if not path.is_file():
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError):
+        return False
+    return isinstance(payload, dict) and bool(payload)
+
+
 def _claude_login_present(env: dict) -> bool:
     """Whether a Claude Code subscription login exists on this host.
 
@@ -122,7 +134,15 @@ def _claude_login_present(env: dict) -> bool:
 
     from pathlib import Path
 
-    if (Path.home() / ".claude" / ".credentials.json").exists():
+    credentials = Path(
+        env.get("CTSWARM_CLAUDE_CREDENTIALS")
+        or Path.home() / ".claude" / ".credentials.json"
+    )
+    # Existence is not enough. `bootstrap.sh` writes an empty `{}` at this path
+    # so the container bind mount resolves to a file rather than a directory,
+    # so a bare `.exists()` would report a login on a host that has none -- and
+    # a build would launch against a harness that refuses on its first call.
+    if _has_credentials(credentials):
         return True
 
     if sys.platform != "darwin":
@@ -232,7 +252,13 @@ class CapacityManager:
                 return has_login
             return has_login or bool(self.env.get("ANTHROPIC_API_KEY"))
         if runtime is Runtime.CODEX:
-            has_login = (Path.home() / ".codex" / "auth.json").exists()
+            has_login = _has_credentials(
+                Path(
+                    self.env.get("CTSWARM_CODEX_HOME")
+                    or Path.home() / ".codex"
+                )
+                / "auth.json"
+            )
             if subscriptions_only:
                 return has_login
             return has_login or bool(self.env.get("OPENAI_API_KEY"))
