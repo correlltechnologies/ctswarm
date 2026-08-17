@@ -74,8 +74,8 @@ than merely degrade output.
 | `qwen3.5:4b` | 100% | 50% | 100% | 100% | 141 | no: schema |
 | `qwen3.6` | 75% | 50% | 100% | 100% | 19 | no: too slow to be reliable |
 | `qwen2.5-coder:7b` | **25%** | 100% | 100% | 100% | 2 | no: answers in prose instead of calling tools |
-| `ornith:9b` | — | — | — | — | — | **QUARANTINED** |
-| `granite4.1:3b` | — | — | — | — | — | unmeasured (blocked by ornith's wedge) |
+| `ornith:9b` | n/a | n/a | n/a | n/a | n/a | **QUARANTINED** |
+| `granite4.1:3b` | n/a | n/a | n/a | n/a | n/a | unmeasured (blocked by ornith's wedge) |
 
 Notes that matter more than the numbers:
 
@@ -115,7 +115,7 @@ Notes that matter more than the numbers:
 | Build ran to completion | 23 min, 112 model calls, **100% success** |
 | Live multi-backend routing | high -> deepseek-v4-pro (OpenRouter), med/low -> qwen3.5:9b (local), failover to minimax-m2.5 inside the high tier |
 | **Code actually written** | **NO.** All worktrees clean at the initial commit; no `healthz`, no branches, no commits |
-| Build outcome | `success: False` — 4/4 issues reported complete, Verifier failed, no PR opened |
+| Build outcome | `success: False`: 4/4 issues reported complete, Verifier failed, no PR opened |
 
 The final verifier prevented a false PR, but deeper inspection found unsafe inner
 gates: git init returned a false success with an empty SHA, workspace setup
@@ -187,8 +187,8 @@ A fresh checkout of the resulting six-file, 141-addition PR passed:
 - deterministic secret, anti-slop, dependency, and test scanners.
 
 This closes the previously unverified integration/PR boundary. The proof also
-exposed and corrected two orchestration-adjacent presentation problems—the
-finalizer's artifact sweep and draft-state flip—rather than accepting the top
+exposed and corrected two orchestration-adjacent presentation problems (the
+finalizer's artifact sweep and draft-state flip) rather than accepting the top
 level success label without inspecting the PR.
 
 ## Closure verification (2026-08-06)

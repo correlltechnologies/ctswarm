@@ -4,15 +4,15 @@ These are not general capability benchmarks. Each task targets a specific way a
 model breaks an autonomous build, chosen because the failure stalls the DAG
 rather than merely producing weaker output:
 
-- **tool_call** — SWE-AF's 22 agents are defined by tool sets. A malformed call
+- **tool_call**: SWE-AF's 22 agents are defined by tool sets. A malformed call
   is not degraded output, it is a stuck agent.
-- **schema** — agent results are parsed into typed schemas. Unparseable output
+- **schema**: agent results are parsed into typed schemas. Unparseable output
   fails the same way a crash does.
-- **long_context** — agents read repo-scale context. A model that silently loses
+- **long_context**: agents read repo-scale context. A model that silently loses
   the middle of its window produces confidently wrong work.
-- **instruction** — a model that invents a plausible answer rather than admitting
+- **instruction**: a model that invents a plausible answer rather than admitting
   it lacks information injects defects that survive review.
-- **cancellation** — bounded retries and replanning require aborting in-flight
+- **cancellation**: bounded retries and replanning require aborting in-flight
   work. A model that wedges on cancel breaks the control loop.
 
 Every task is checkable programmatically. Nothing here is graded by another model.

@@ -349,7 +349,7 @@ class Router:
             # not a measured failure boundary. The default suite runs one
             # 20k-token needle test, so treating that successful sample as a
             # hard ceiling rejects every later tool turn once its transcript
-            # grows past 20k—even when the backend advertises 128k+ and the
+            # grows past 20k, even when the backend advertises 128k+ and the
             # long-context probe passed. The catalog's context limit above is
             # the actual hard capacity gate; this value remains useful evidence
             # in telemetry without inventing a ceiling the bench never tested.

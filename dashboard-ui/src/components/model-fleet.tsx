@@ -413,8 +413,8 @@ function ModelPerformance({ overview }: { overview: ModelOverview }) {
           {[
             ["Live", model.live_jobs.toLocaleString()],
             ["Calls", model.calls.toLocaleString()],
-            ["Success", model.call_success_rate == null ? "—" : `${Math.round(model.call_success_rate * 100)}%`],
-            ["Latency", model.avg_latency_ms ? formatMs(model.avg_latency_ms) : "—"],
+            ["Success", model.call_success_rate == null ? "-" : `${Math.round(model.call_success_rate * 100)}%`],
+            ["Latency", model.avg_latency_ms ? formatMs(model.avg_latency_ms) : "-"],
             ["Tokens", compactNumber(model.tokens)],
           ].map(([label, value]) => <div key={label} className="min-w-0"><p className="text-[10px] uppercase tracking-[.1em] text-muted-foreground lg:hidden">{label}</p><p className="mt-1 break-words font-mono text-xs lg:mt-0">{value}</p></div>)}
         </article>

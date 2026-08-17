@@ -256,6 +256,6 @@ browser evidence; the API-only sandbox proof does not.
 | `docs/OPENROUTER.md` | Hosted overflow setup and cost reasoning |
 | `sandbox/README.md` | Local verification target and contract trap |
 
-Future expansion items—not blockers for the current scope—are branch protection
+Future expansion items (not blockers for the current scope) are branch protection
 on plans that support it, Slack delivery if desired, and browser evidence when a
 target includes a user interface.

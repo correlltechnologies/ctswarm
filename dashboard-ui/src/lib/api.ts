@@ -29,7 +29,7 @@ export function formatMs(ms?: number, started?: string, completed?: string) {
   const end = completed ? Date.parse(completed) : Date.now()
   return Number.isFinite(start) && Number.isFinite(end)
     ? formatDuration((end - start) / 1000)
-    : "—"
+    : "-"
 }
 
 export function compactNumber(value: number) {
