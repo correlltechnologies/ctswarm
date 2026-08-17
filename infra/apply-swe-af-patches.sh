@@ -24,6 +24,8 @@ patches=(
   "$repo_root/infra/patches/swe-af-planning-source-timeout.patch"
   "$repo_root/infra/patches/swe-af-preserve-architecture.patch"
   "$repo_root/infra/patches/swe-af-harness-availability.patch"
+  # Applies after swe-af-autonomous-ui.patch, which owns the same npm line.
+  "$repo_root/infra/patches/swe-af-claude-cli.patch"
 )
 
 # Later patches can intentionally modify lines introduced by earlier patches.

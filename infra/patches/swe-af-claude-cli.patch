@@ -1,0 +1,16 @@
+diff --git a/Dockerfile b/Dockerfile
+index a997c58..b05c9e3 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -22,7 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     # Install OpenCode CLI v1.2+ for opencode provider (with run --model support)
+     curl -fsSL https://opencode.ai/install | bash && \
+     # Install Codex CLI for codex runtime provider
+-    npm install -g @openai/codex agent-browser && \
++    # Claude Code CLI for the claude_code runtime provider. The upstream
++    # image installs opencode and codex but not claude, so without this a
++    # host running subscriptions-only mode has no Claude harness at all.
++    npm install -g @openai/codex agent-browser @anthropic-ai/claude-code && \
+     codex_path="$(command -v codex)" && \
+     mv "${codex_path}" /usr/local/bin/codex-real && \
+     printf '%s\n' \
