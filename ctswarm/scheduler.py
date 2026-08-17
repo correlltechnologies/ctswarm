@@ -31,6 +31,18 @@ from .approvals.store import ApprovalStore
 from .capacity import Runtime
 from .execution_mode import subscription_only
 from .ledger import Ledger
+from .mcp_registry import (
+    McpRegistryError,
+    delete_server,
+    ensure_seeded,
+    import_discovered,
+    load_registry,
+    materialize,
+    secret_status,
+    selected_context,
+    set_secrets,
+    upsert_server,
+)
 from .observability import AgentFieldTraceClient, harness_label, model_overview
 from .orchestrator import BuildRecord, BuildState, Orchestrator, load_build
 from .project_workspace import (
@@ -40,7 +52,6 @@ from .project_workspace import (
     discover_projects,
     project_details,
     resolve_project,
-    selected_mcp_context,
     validate_remote,
 )
 from .routing_config import (
@@ -137,6 +148,20 @@ class SettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     changes: dict[str, Any] = Field(default_factory=dict)
+
+
+class McpSecretsRequest(BaseModel):
+    """Credential values for one MCP server.
+
+    Write-only by construction: there is no route that reads these back, and an
+    empty string clears a value so a form can remove a credential without a
+    separate delete affordance.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: dict[str, str] | None = None
+    headers: dict[str, str] | None = None
 
 
 def _event_detail(event: dict) -> dict:
@@ -356,13 +381,8 @@ class BuildScheduler:
                         scm_provider=request.scm_provider,
                         source_branch=request.source_branch,
                         create_pull_request=request.create_pull_request,
-                        mcp_context=selected_mcp_context(
-                            request.mcp_servers,
-                            discover_mcp_servers(
-                                Path(request.project_path)
-                                if request.project_path
-                                else None
-                            ),
+                        mcp_context=selected_context(
+                            request.mcp_servers, load_registry(self.ledger)
                         ),
                         routing_policy=request.routing_policy,
                         build_id=build_id,
@@ -526,6 +546,12 @@ def _enrich_trace_routes(trace: dict, routes: dict[str, dict[str, Any]]) -> dict
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Adopt the host's existing MCP servers on the very first start. The
+    # rendered configuration replaces the inherited one, so without this an
+    # upgrade would quietly take away every server the operator already had.
+    # It runs once; after that the registry is authoritative.
+    await asyncio.to_thread(ensure_seeded, scheduler.ledger)
+    await asyncio.to_thread(_refresh_mcp_config)
     worker = asyncio.create_task(scheduler.run_forever(), name="ctswarm-scheduler")
     try:
         yield
@@ -586,20 +612,135 @@ async def get_project(project_id: str, history_limit: int = 30) -> dict:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+MCP_PRIVACY_NOTE = (
+    "Server names, transports, and which credential names are set are exposed. "
+    "Credential values are stored outside the database and are never returned."
+)
+
+
+def _registry_payload() -> dict:
+    servers = load_registry(scheduler.ledger)
+    status_by_id = secret_status(scheduler.ledger, servers)
+    entries = []
+    for server in servers:
+        item = server.to_dict()
+        item["secrets"] = status_by_id.get(server.id, {})
+        # The launcher offers only what a build could actually reach, so it
+        # needs to know that "enabled for Codex" and "reachable from Codex"
+        # are different questions for an SSE server.
+        item["effective_runtimes"] = [
+            runtime for runtime in server.runtimes if server.supports(runtime)
+        ]
+        entries.append(item)
+    return {"servers": entries, "privacy": MCP_PRIVACY_NOTE}
+
+
+def _refresh_mcp_config() -> dict:
+    """Re-render the harness configuration after a registry change.
+
+    Rendering on write rather than on read means the file the containers mount
+    is always the committed state, and a container that restarts on its own
+    picks up the current registry without the scheduler being involved.
+    """
+    return materialize(scheduler.ledger, mcp_config_dir())
+
+
+def mcp_config_dir() -> Path:
+    configured = os.environ.get("CTSWARM_MCP_CONFIG_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return scheduler.ledger.path.parent / "mcp"
+
+
 @app.get("/api/mcp-servers")
-async def list_mcp_servers(project_id: str = "") -> dict:
+async def list_mcp_servers() -> dict:
+    return await asyncio.to_thread(_registry_payload)
+
+
+@app.get("/api/mcp-servers/discovered")
+async def discovered_mcp_servers(project_id: str = "") -> dict:
+    """What the host has configured, as an import source rather than the truth.
+
+    Discovery used to *be* the registry, which is why nothing could be added or
+    removed. It survives as a way to adopt what is already on the box.
+    """
     try:
         project_path = resolve_project(project_id) if project_id else None
         servers = await asyncio.to_thread(discover_mcp_servers, project_path)
     except ProjectWorkspaceError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {
-        "servers": servers,
-        "privacy": (
-            "Only server names, source runtimes, transport types, and readiness "
-            "are exposed. Configuration values and credentials remain hidden."
-        ),
-    }
+    known = {server.id for server in load_registry(scheduler.ledger)}
+    for server in servers:
+        server["in_registry"] = server["id"] in known
+    return {"servers": servers, "privacy": MCP_PRIVACY_NOTE}
+
+
+@app.post("/api/mcp-servers", status_code=status.HTTP_201_CREATED)
+async def create_mcp_server(payload: dict) -> dict:
+    try:
+        await asyncio.to_thread(upsert_server, scheduler.ledger, payload)
+    except McpRegistryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await asyncio.to_thread(_refresh_mcp_config)
+    return await asyncio.to_thread(_registry_payload)
+
+
+@app.put("/api/mcp-servers/{server_id}")
+async def update_mcp_server(server_id: str, payload: dict) -> dict:
+    try:
+        await asyncio.to_thread(
+            upsert_server, scheduler.ledger, payload, server_id=server_id
+        )
+    except McpRegistryError as exc:
+        code = 404 if "no MCP server" in str(exc) else 422
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+    await asyncio.to_thread(_refresh_mcp_config)
+    return await asyncio.to_thread(_registry_payload)
+
+
+@app.delete("/api/mcp-servers/{server_id}")
+async def remove_mcp_server(server_id: str) -> dict:
+    try:
+        await asyncio.to_thread(delete_server, scheduler.ledger, server_id)
+    except McpRegistryError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await asyncio.to_thread(_refresh_mcp_config)
+    return await asyncio.to_thread(_registry_payload)
+
+
+@app.put("/api/mcp-servers/{server_id}/secrets")
+async def update_mcp_secrets(server_id: str, payload: McpSecretsRequest) -> dict:
+    """Write-only. There is no endpoint that reads a credential back."""
+    if not any(server.id == server_id for server in load_registry(scheduler.ledger)):
+        raise HTTPException(status_code=404, detail=f"no MCP server with id {server_id!r}")
+    await asyncio.to_thread(
+        set_secrets,
+        scheduler.ledger,
+        server_id,
+        env=payload.env,
+        headers=payload.headers,
+    )
+    await asyncio.to_thread(_refresh_mcp_config)
+    return await asyncio.to_thread(_registry_payload)
+
+
+@app.post("/api/mcp-servers/import")
+async def import_mcp_servers() -> dict:
+    result = await asyncio.to_thread(import_discovered, scheduler.ledger)
+    await asyncio.to_thread(_refresh_mcp_config)
+    payload = await asyncio.to_thread(_registry_payload)
+    return {**payload, "imported": result}
+
+
+@app.get("/api/mcp-servers/materialized")
+async def mcp_materialized() -> dict:
+    """What the harnesses will actually see, and what could not be given to one.
+
+    An operator who enables a header-authenticated server for Codex and never
+    sees it should be told the format cannot carry it, rather than being left
+    to infer it from a build where the tool is simply absent.
+    """
+    return await asyncio.to_thread(_refresh_mcp_config)
 
 
 @app.post("/api/swarms", status_code=status.HTTP_202_ACCEPTED)
@@ -623,14 +764,12 @@ async def launch_swarm(request: SwarmLaunchRequest, response: Response) -> dict:
             if project
             else ""
         )
-        inventory = discover_mcp_servers(Path(project_path) if project_path else None)
-        known_servers = {item["id"] for item in inventory}
+        registry = load_registry(scheduler.ledger)
+        known_servers = {server.id for server in registry}
         if not request.inherit_mcp:
             selected_servers: list[str] = []
         elif request.mcp_servers is None:
-            selected_servers = [
-                item["id"] for item in inventory if item.get("available")
-            ]
+            selected_servers = [server.id for server in registry if server.enabled]
         else:
             unknown = sorted(set(request.mcp_servers) - known_servers)
             if unknown:

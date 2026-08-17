@@ -68,6 +68,13 @@ and the specific reason a build stopped or is blocked. See
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for service endpoints, build
 controls, recovery, and log rotation.
 
+Which MCP servers a build can reach is an operator decision rather than
+whatever happens to be installed on the host. ctswarm keeps its own registry,
+stores credentials outside the database, and renders the enabled entries into
+the two configuration formats the Claude Code and Codex CLIs actually read. See
+[`docs/MCP.md`](docs/MCP.md), which also records where those two formats
+disagree and what ctswarm does about it.
+
 The next infrastructure expansion is operator-selectable local/VPS execution
 with independent control over runner placement, harnesses, model routes, and
 whether local models are preferred, fallback-only, or disabled. The product
@@ -156,12 +163,12 @@ DAG, not merely degrade it. Parameter count and benchmark scores do not predict 
 
 `ctswarm bench` therefore measures what actually matters for this workload:
 
-- **Tool-call fidelity** — well-formed calls, correct argument types, no hallucinated tools
-- **Schema adherence** — output parses against the typed schema SWE-AF expects
-- **Long-context recall** — retrieval from a repo-sized context
-- **Instruction-following under constraint** — refusing to invent, admitting incompleteness
-- **Cancellation and timeout behavior** — clean abort, no wedged generations
-- **Latency and throughput** — under real concurrency, not single-shot
+- **Tool-call fidelity**: well-formed calls, correct argument types, no hallucinated tools
+- **Schema adherence**: output parses against the typed schema SWE-AF expects
+- **Long-context recall**: retrieval from a repo-sized context
+- **Instruction-following under constraint**: refusing to invent, admitting incompleteness
+- **Cancellation and timeout behavior**: clean abort, no wedged generations
+- **Latency and throughput**: under real concurrency, not single-shot
 
 Results land in `bench/results/` and generate `routing.toml`. A model that fails the
 tool-call gate is not eligible for agent roles regardless of how good it looks otherwise.
@@ -197,15 +204,15 @@ interface.
 The point of `ctswarm verify` is to test the *system*, not the generated code. It runs a
 real build against `sandbox/` and asserts six probes:
 
-1. **Anti-slop trap** — sandbox ships a test a lazy implementation breaks; weakening or
+1. **Anti-slop trap**: sandbox ships a test a lazy implementation breaks; weakening or
    deleting it must fail the build
-2. **Provider failover** — kill the local backend mid-build; the router must fail over and
+2. **Provider failover**: kill the local backend mid-build; the router must fail over and
    the build must continue
-3. **Approval trigger** — a high-risk action in the goal must produce exactly one approval
+3. **Approval trigger**: a high-risk action in the goal must produce exactly one approval
    card and pause
-4. **Denial handling** — denying it must pause or redirect cleanly with no repeat pings
-5. **Crash resume** — restart the stack mid-build; checkpoint recovery must resume
-6. **Worktree isolation** — `main` never pushed to, PR exists, worktree count equals issue
+4. **Denial handling**: denying it must pause or redirect cleanly with no repeat pings
+5. **Crash resume**: restart the stack mid-build; checkpoint recovery must resume
+6. **Worktree isolation**: `main` never pushed to, PR exists, worktree count equals issue
    count, no cross-worktree contamination
 
 `ctswarm verify` prints a pass/fail scoreboard asserted against git history, the GitHub

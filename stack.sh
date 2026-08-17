@@ -102,6 +102,17 @@ refresh_mcp_inventory() {
     --write-inventory bench/results/mcp-inventory.json
 }
 
+ensure_mcp_config() {
+  # The agent services bind-mount these two files individually. Docker creates
+  # a *directory* in place of a missing bind source, and a directory mounted
+  # where the CLI expects a config file is a failure that surfaces much later
+  # as "the MCP server is not there". Create valid empty configs first; the
+  # scheduler overwrites both from the registry as soon as it starts.
+  mkdir -p var/mcp
+  [[ -f var/mcp/claude.json ]] || echo '{"mcpServers": {}}' > var/mcp/claude.json
+  [[ -f var/mcp/codex.toml  ]] || : > var/mcp/codex.toml
+}
+
 # The set of services started before the agents. The router belongs here only
 # when it is actually part of this configuration.
 infrastructure_services() {
@@ -112,6 +123,7 @@ infrastructure_services() {
 
 bring_up() {
   local -a up_flags=("$@")
+  ensure_mcp_config
   refresh_mcp_inventory
   # Infrastructure first so a slow agent image build does not hide a broken
   # control plane behind it.
@@ -139,6 +151,10 @@ case "${1:-up}" in
   logs)    shift; "${COMPOSE[@]}" logs -f "$@" ;;
   ps)      "${COMPOSE[@]}" ps ;;
   restart)
+    # Also the way an MCP registry change reaches Claude Code. Codex re-reads
+    # its config on every invocation; the Claude CLI rewrites its own config at
+    # startup, so the agent containers copy it once and keep that copy.
+    ensure_mcp_config
     refresh_mcp_inventory
     "${COMPOSE[@]}" restart swe-agent swe-fast
     ;;

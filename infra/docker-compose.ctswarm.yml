@@ -136,6 +136,16 @@ services:
       - CTSWARM_PROJECTS_ROOT=${HOME}/Desktop/Projects
       - CTSWARM_PROJECT_SCAN_DEPTH=${CTSWARM_PROJECT_SCAN_DEPTH:-3}
       - CTSWARM_MCP_INVENTORY=/bench-results/mcp-inventory.json
+      # Where the scheduler renders the operator's MCP registry into the two
+      # formats the CLIs read. The agent services mount those files, so this
+      # directory is the seam between "what the operator configured" and "what
+      # a build can actually reach".
+      - CTSWARM_MCP_CONFIG_DIR=/mcp-config
+      - CTSWARM_MCP_SECRETS=/state/mcp-secrets.json
+      # Read for the one-time import that adopts the host's existing servers
+      # into the registry. After that the registry is authoritative.
+      - CTSWARM_CLAUDE_CONFIG=/host-config/claude.json
+      - CTSWARM_CODEX_CONFIG=/host-config/codex.toml
       - CTSWARM_MAX_CONCURRENT_BUILDS=${CTSWARM_MAX_CONCURRENT_BUILDS:-1}
       - CTSWARM_SCHEDULER_POLL_SECONDS=${CTSWARM_SCHEDULER_POLL_SECONDS:-10}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
@@ -152,6 +162,12 @@ services:
       - ctswarm-state:/state
       - ./bench/results:/bench-results:ro
       - ${HOME}/.codex:/home/ctswarm/.codex:ro
+      # The rendered MCP configuration. Writable here and read-only in the
+      # agents: exactly one process decides what the harnesses can reach.
+      - ./var/mcp:/mcp-config
+      # Read-only sources for the one-time import.
+      - ${HOME}/.claude.json:/host-config/claude.json:ro
+      - ${HOME}/.codex/config.toml:/host-config/codex.toml:ro
       # Repository inspection is read-only. Builds still clone into isolated
       # AgentField workspaces before making changes.
       - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
@@ -222,11 +238,20 @@ services:
       # profile can contain thousands of skills and hundreds of MB of caches;
       # exposing it made every CLI invocation scan unrelated host state.
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
-      # Claude CLI updates its config during normal startup. Mount the operator
-      # config as a read-only seed, then copy it to ephemeral container storage
-      # in the command above so neither the CLI nor agents can mutate the host.
-      - ${HOME}/.claude.json:/root/.claude.json.seed:ro
-      - ${HOME}/.codex/config.toml:/root/.codex/config.toml:ro
+      # MCP configuration comes from the ctswarm registry, not from the host
+      # profile. Mounting ${HOME}/.claude.json here gave every build every MCP
+      # server on the box, with no way to add, remove, or scope one. These two
+      # files are rendered by the scheduler from the registry the operator
+      # controls, so what a build can reach is a decision rather than an
+      # accident of what happens to be installed.
+      #
+      # The Claude CLI rewrites its config during normal startup, so it is
+      # mounted as a read-only seed and copied to ephemeral container storage
+      # by the command above. Codex reads its config fresh on every
+      # invocation, so a registry change reaches Codex immediately and reaches
+      # Claude when the agent containers next restart.
+      - ./var/mcp/claude.json:/root/.claude.json.seed:ro
+      - ./var/mcp/codex.toml:/root/.codex/config.toml:ro
       - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
       - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
     depends_on:
@@ -254,8 +279,9 @@ services:
     volumes:
       - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
-      - ${HOME}/.claude.json:/root/.claude.json.seed:ro
-      - ${HOME}/.codex/config.toml:/root/.codex/config.toml:ro
+      # Rendered from the ctswarm MCP registry; see swe-agent above.
+      - ./var/mcp/claude.json:/root/.claude.json.seed:ro
+      - ./var/mcp/codex.toml:/root/.codex/config.toml:ro
       - ${HOME}/.codex/auth.json:/root/.codex/auth.json:ro
       - ${HOME}/Desktop/Projects:${HOME}/Desktop/Projects:ro
     depends_on:

@@ -127,7 +127,7 @@ with empty mounts. Its socket is also `root:root` rather than group-owned, so
 the usual `usermod -aG docker` does nothing and every command needs `sudo`.
 
 The script removes it and installs the official packages. **Export anything you
-care about first** — `snap remove docker` takes its containers and volumes with
+care about first**: `snap remove docker` takes its containers and volumes with
 it, and if this box is also your Pi-hole, that means your network loses DNS
 until you bring it back. Bind-mounted data under `$HOME` survives; named
 volumes do not.
@@ -147,7 +147,7 @@ On Raspberry Pi OS the usual cause is that `/usr/sbin/resolvconf` is a symlink
 to `resolvectl`, so Tailscale's resolvconf call fails with
 `Failed to resolve interface "tailscale": No such device` and leaves a
 `resolv.conf` pointing at a resolver that never answers. Check with
-`tailscale status` — the health section reports it.
+`tailscale status`, whose health section reports it.
 
 ```bash
 sudo tailscale set --accept-dns=false
@@ -202,9 +202,9 @@ Nothing is acquired automatically; each of these is an interactive login.
 
 | Credential | Command | Headless? |
 |---|---|---|
-| Claude | `claude setup-token`, paste into `.env` as `CLAUDE_CODE_OAUTH_TOKEN` | **Yes** — prints a token, no browser redirect |
-| GitHub | `gh auth login --web` | **Yes** — device-code flow, prints a code |
-| Codex | `codex login` | **No** — needs a loopback browser callback |
+| Claude | `claude setup-token`, paste into `.env` as `CLAUDE_CODE_OAUTH_TOKEN` | **Yes**, prints a token with no browser redirect |
+| GitHub | `gh auth login --web` | **Yes**, device-code flow that prints a code |
+| Codex | `codex login` | **No**, needs a loopback browser callback |
 
 `codex login` cannot complete over plain SSH. Forward the port from a machine
 that has a browser, then run the login inside that session:
@@ -226,7 +226,7 @@ CTSWARM_PROFILE=pi ./stack.sh up      # first run: builds images, slow
 ```
 
 `doctor` should report both harnesses available and local backends
-*disabled by subscriptions-only mode* — which is a different thing from
+*disabled by subscriptions-only mode*, which is a different thing from
 "none detected", and the wording is deliberate.
 
 Building the images natively on a Pi takes a while. If you would rather not

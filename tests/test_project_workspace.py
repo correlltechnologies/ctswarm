@@ -10,6 +10,8 @@ import pytest
 from fastapi import Response
 
 import ctswarm.scheduler as scheduler_module
+from ctswarm.ledger import Ledger
+from ctswarm.mcp_registry import ensure_seeded
 from ctswarm.project_workspace import (
     ProjectWorkspaceError,
     detect_scm,
@@ -18,7 +20,6 @@ from ctswarm.project_workspace import (
     project_details,
     resolve_project,
     sanitize_remote,
-    selected_mcp_context,
     validate_remote,
     write_mcp_inventory,
 )
@@ -128,9 +129,6 @@ def test_mcp_inventory_exposes_metadata_without_configuration_secrets(
     assert "secret-value" not in serialized
     assert "private-package" not in serialized
     assert "mcp.example.invalid" not in serialized
-    context = selected_mcp_context(["claude:vercel", "codex:review"], inventory)
-    assert "vercel via Claude Code" in context
-    assert "review via Codex" in context
 
 
 def test_generated_mcp_inventory_is_safe_and_project_aware(
@@ -181,6 +179,9 @@ def test_generated_mcp_inventory_is_safe_and_project_aware(
 async def test_launch_resolves_project_and_inherits_configured_mcps(
     monkeypatch, tmp_path
 ) -> None:
+    """The selection now comes from the operator's registry, not from whatever
+    happens to be in the host's config files. Discovery seeds that registry
+    once, which is why an unmodified host still gets its servers."""
     root = tmp_path / "projects"
     _repository(root)
     claude = tmp_path / "claude.json"
@@ -192,6 +193,12 @@ async def test_launch_resolves_project_and_inherits_configured_mcps(
     monkeypatch.setenv("CTSWARM_PROJECTS_ROOT", str(root))
     monkeypatch.setenv("CTSWARM_CLAUDE_CONFIG", str(claude))
     monkeypatch.setenv("CTSWARM_CODEX_CONFIG", str(codex))
+    monkeypatch.setattr(
+        scheduler_module.scheduler, "ledger", Ledger(tmp_path / "ledger.db")
+    )
+    ensure_seeded(
+        scheduler_module.scheduler.ledger, claude_path=claude, codex_path=codex
+    )
     project = discover_projects()[0]
     captured = {}
 
@@ -214,4 +221,4 @@ async def test_launch_resolves_project_and_inherits_configured_mcps(
     assert request.scm_provider == "github"
     assert request.source_branch == "main"
     assert request.create_pull_request is True
-    assert request.mcp_servers == ["claude:vercel"]
+    assert request.mcp_servers == ["vercel"]

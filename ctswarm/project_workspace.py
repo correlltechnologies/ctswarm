@@ -5,9 +5,12 @@ by opaque ids derived from paths beneath one configured root, then resolved and
 validated again on every request. Git commands are fixed argument lists; no
 user-provided value is interpreted by a shell.
 
-MCP inventory intentionally returns metadata only. Commands, arguments, URLs,
-environment variables, and credentials stay in the host configuration files
-that are mounted read-only into the agent runtimes.
+MCP discovery here is an *import source*, not the configuration itself. It reads
+the host's Claude and Codex files and returns metadata only: commands,
+arguments, URLs, environment variables, and credentials never leave them. What a
+build actually gets is decided by ``ctswarm.mcp_registry``, which the operator
+controls; discovery exists so that what is already on the box can be adopted
+into it rather than retyped.
 """
 
 from __future__ import annotations
@@ -305,6 +308,26 @@ def _config_path(env_name: str, mounted: str, fallback: Path) -> Path:
     return mounted_path if mounted_path.is_file() else fallback
 
 
+def claude_config_path() -> Path:
+    """Where this process should look for the host's Claude configuration.
+
+    Public because the MCP registry imports from the same files. Two modules
+    each guessing the location is how you get a registry that finds nothing in
+    a container while discovery on the same box finds everything.
+    """
+    return _config_path(
+        "CTSWARM_CLAUDE_CONFIG", "/host-config/claude.json", Path.home() / ".claude.json"
+    )
+
+
+def codex_config_path() -> Path:
+    return _config_path(
+        "CTSWARM_CODEX_CONFIG",
+        "/host-config/codex.toml",
+        Path.home() / ".codex" / "config.toml",
+    )
+
+
 def _mcp_entry(
     name: str, config: dict[str, Any], *, source: str, runtime: str
 ) -> dict[str, Any]:
@@ -345,16 +368,8 @@ def discover_mcp_servers(project_path: Path | None = None) -> list[dict[str, Any
             key=lambda item: (str(item.get("name", "")).lower(), str(item.get("source", ""))),
         )
 
-    claude_path = _config_path(
-        "CTSWARM_CLAUDE_CONFIG",
-        "/host-config/claude.json",
-        Path.home() / ".claude.json",
-    )
-    codex_path = _config_path(
-        "CTSWARM_CODEX_CONFIG",
-        "/host-config/codex.toml",
-        Path.home() / ".codex" / "config.toml",
-    )
+    claude_path = claude_config_path()
+    codex_path = codex_config_path()
     claude = _read_json(claude_path)
     entries: list[dict[str, Any]] = []
     for name, config in (claude.get("mcpServers") or {}).items():
@@ -423,22 +438,6 @@ def write_mcp_inventory(
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.chmod(0o644)
     temporary.replace(destination)
-
-
-def selected_mcp_context(selected: list[str], inventory: list[dict[str, Any]]) -> str:
-    by_id = {item["id"]: item for item in inventory}
-    chosen = [by_id[item_id] for item_id in selected if item_id in by_id]
-    if not chosen:
-        return "No inherited MCP servers were selected for this build."
-    lines = [
-        "Inherited MCP context:",
-        "The operator selected these already-configured MCP servers. Use them only "
-        "when relevant; do not ask the operator to configure them again:",
-    ]
-    lines.extend(
-        f"- {item['name']} via {item['runtime']} ({item['transport']})" for item in chosen
-    )
-    return "\n".join(lines)
 
 
 if __name__ == "__main__":

@@ -105,10 +105,19 @@ services:
       - CTSWARM_AGENT_TIMEOUT_SECONDS=${CTSWARM_AGENT_TIMEOUT_SECONDS:-2700}
       - CTSWARM_MAX_CONCURRENT_BUILDS=${CTSWARM_MAX_CONCURRENT_BUILDS:-1}
       - CTSWARM_BIND_MODE=${CTSWARM_BIND_MODE:-loopback}
+    # `!override` replaces the base list rather than merging into it, so a
+    # mount added to docker-compose.ctswarm.yml does not appear here unless it
+    # is added here too. That is the cost of overriding, and it is worth
+    # re-reading the base service after changing either file.
     volumes: !override
       - ctswarm-state:/state
       - ./bench/results:/bench-results:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}:/home/ctswarm/.codex:ro
+      # Rendered MCP configuration: writable here, read-only in the agents.
+      - ./var/mcp:/mcp-config
+      # Read-only sources for the one-time import of the host's own servers.
+      - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/host-config/claude.json:ro
+      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/host-config/codex.toml:ro
       - ${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:ro
     depends_on: !override
       swe-agent:
@@ -139,8 +148,11 @@ services:
       - AGENTFIELD_HARNESS_IDLE_SECONDS=${CTSWARM_HARNESS_IDLE_SECONDS:-1800}
     volumes: !override
       - ${CTSWARM_CLAUDE_CREDENTIALS:-${HOME}/.claude/.credentials.json}:/root/.claude/.credentials.json:ro
-      - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json.seed:ro
-      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
+      # MCP configuration comes from the ctswarm registry, rendered by the
+      # scheduler. Mounting the host profile here would give every build every
+      # server on the box, with no way to scope one.
+      - ./var/mcp/claude.json:/root/.claude.json.seed:ro
+      - ./var/mcp/codex.toml:/root/.codex/config.toml:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/auth.json:/root/.codex/auth.json:ro
       - ${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:ro
     depends_on: !reset []
@@ -157,8 +169,11 @@ services:
       - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-claude_code}
     volumes: !override
       - ${CTSWARM_CLAUDE_CREDENTIALS:-${HOME}/.claude/.credentials.json}:/root/.claude/.credentials.json:ro
-      - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json.seed:ro
-      - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
+      # MCP configuration comes from the ctswarm registry, rendered by the
+      # scheduler. Mounting the host profile here would give every build every
+      # server on the box, with no way to scope one.
+      - ./var/mcp/claude.json:/root/.claude.json.seed:ro
+      - ./var/mcp/codex.toml:/root/.codex/config.toml:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/auth.json:/root/.codex/auth.json:ro
       - ${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:ro
     depends_on: !reset []
