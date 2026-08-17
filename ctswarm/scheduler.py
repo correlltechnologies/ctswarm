@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .approvals.status import StatusNotifier
 from .approvals.store import ApprovalStore
 from .capacity import Runtime
+from .execution_mode import subscription_only
 from .ledger import Ledger
 from .observability import AgentFieldTraceClient, harness_label, model_overview
 from .orchestrator import BuildRecord, BuildState, Orchestrator, load_build
@@ -44,6 +45,7 @@ from .project_workspace import (
 )
 from .routing_config import (
     RoutingPolicyError,
+    allowed_targets,
     load_routing_policy,
     normalize_routing_policy,
     save_routing_policy,
@@ -168,11 +170,15 @@ class BuildScheduler:
         build_id = build_id or f"build-{uuid.uuid4().hex[:10]}"
         if self.snapshot(build_id) is not None:
             raise ValueError(f"build id already exists: {build_id}")
+        subscriptions_only = subscription_only(self.ledger)
         try:
             routing_policy = normalize_routing_policy(
                 request.routing_policy
                 if request.routing_policy is not None
-                else load_routing_policy(self.ledger)
+                else load_routing_policy(
+                    self.ledger, subscriptions_only=subscriptions_only
+                ),
+                subscriptions_only=subscriptions_only,
             )
         except RoutingPolicyError as exc:
             raise ValueError(str(exc)) from exc
@@ -423,6 +429,13 @@ trace_client = AgentFieldTraceClient(scheduler.orchestrator.agentfield_url)
 
 async def _live_routes() -> dict[str, dict[str, Any]]:
     """Resolve virtual tiers to the concrete model the router would use now."""
+    # The router is not running in subscriptions-only mode, so each of these
+    # three calls would spend its full 5s timeout failing to connect. The
+    # dashboard polls this endpoint every 20 seconds, which on a small host
+    # means the event loop is never idle. There is nothing to ask.
+    if subscription_only(scheduler.ledger):
+        return {}
+
     base_url = os.environ.get("CTSWARM_ROUTER_URL", "http://ctswarm-router:8090")
     routes: dict[str, dict[str, Any]] = {}
     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -456,6 +469,12 @@ async def _live_routes() -> dict[str, dict[str, Any]]:
 
 async def _model_catalog() -> dict[str, Any]:
     """Fetch the router's curated availability catalog for the operator UI."""
+    if subscription_only(scheduler.ledger):
+        return {
+            "models": [],
+            "disabled": "local model routing is off in subscriptions-only mode",
+        }
+
     base_url = os.environ.get("CTSWARM_ROUTER_URL", "http://ctswarm-router:8090")
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -735,21 +754,34 @@ async def get_model_overview(window_hours: float = 168.0) -> dict:
 @app.get("/api/dashboard/routing-policy")
 async def get_routing_policy() -> dict:
     """Return the operator policy applied when the next build is submitted."""
-    return {"policy": load_routing_policy(scheduler.ledger)}
+    subscriptions_only = subscription_only(scheduler.ledger)
+    return {
+        "policy": load_routing_policy(
+            scheduler.ledger, subscriptions_only=subscriptions_only
+        ),
+        "subscription_only": subscriptions_only,
+        "targets": sorted(allowed_targets(subscriptions_only=subscriptions_only)),
+    }
 
 
 @app.put("/api/dashboard/routing-policy")
 async def put_routing_policy(request: RoutingPolicyRequest) -> dict:
     """Validate and persist concrete work-to-provider assignments."""
+    subscriptions_only = subscription_only(scheduler.ledger)
     try:
-        policy = normalize_routing_policy(request.policy)
+        policy = normalize_routing_policy(
+            request.policy, subscriptions_only=subscriptions_only
+        )
         catalog = await _model_catalog()
         validate_policy_availability(
             policy,
             catalog=list(catalog.get("models") or []),
             capacity=scheduler.orchestrator.capacity.report(),
+            subscriptions_only=subscriptions_only,
         )
-        saved = save_routing_policy(scheduler.ledger, policy)
+        saved = save_routing_policy(
+            scheduler.ledger, policy, subscriptions_only=subscriptions_only
+        )
     except RoutingPolicyError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {

@@ -28,6 +28,8 @@ small prompt" is not a reason to expect a small bill.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -99,6 +101,59 @@ def default_budgets(env: dict | None = None) -> dict[Runtime, WindowBudget]:
     }
 
 
+def _claude_login_present(env: dict) -> bool:
+    """Whether a Claude Code subscription login exists on this host.
+
+    Three storage locations, because the CLI does not use one:
+
+    - ``CLAUDE_CODE_OAUTH_TOKEN`` from ``claude setup-token``, which is what the
+      containers are given.
+    - ``~/.claude/.credentials.json`` on Linux, which is what
+      ``infra/docker-compose.ctswarm.yml`` mounts into the agent containers.
+    - the login Keychain on macOS, where the CLI stores credentials instead of
+      writing a file at all.
+
+    Checking only the file makes a logged-in Mac look unauthenticated, and since
+    a subscriptions-only build now refuses to launch without a harness, that
+    false negative would block every local build.
+    """
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return True
+
+    from pathlib import Path
+
+    if (Path.home() / ".claude" / ".credentials.json").exists():
+        return True
+
+    if sys.platform != "darwin":
+        return False
+
+    cached = _KEYCHAIN_CACHE.get("claude")
+    if cached is not None and time.time() - cached[0] < _KEYCHAIN_TTL_S:
+        return cached[1]
+    try:
+        found = (
+            subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
+        found = False
+    _KEYCHAIN_CACHE["claude"] = (time.time(), found)
+    return found
+
+
+# The Keychain lookup shells out, and `report()` asks about three runtimes at
+# once. A short TTL keeps a dashboard poll from spawning a process per request
+# while still noticing a logout within the minute.
+_KEYCHAIN_CACHE: dict[str, tuple[float, bool]] = {}
+_KEYCHAIN_TTL_S = 60.0
+
+
 @dataclass(frozen=True)
 class Headroom:
     """How much of a runtime's window remains."""
@@ -143,6 +198,18 @@ class CapacityManager:
         self.budgets = budgets or default_budgets(env)
         self.env = env if env is not None else dict(os.environ)
 
+    @property
+    def subscriptions_only(self) -> bool:
+        """Whether this host is restricted to CLI subscription harnesses.
+
+        Read on demand rather than cached at construction: the scheduler is a
+        long-lived process and an operator can change the mode from Mission
+        Control between builds.
+        """
+        from .execution_mode import subscription_only
+
+        return subscription_only(self.ledger, self.env)
+
     # -- availability ------------------------------------------------------
 
     def configured(self, runtime: Runtime) -> bool:
@@ -150,18 +217,27 @@ class CapacityManager:
 
         Checked against real artifacts rather than trusting an environment
         variable that may name an expired token.
-        """
-        if runtime is Runtime.CLAUDE_CODE:
-            return bool(
-                self.env.get("CLAUDE_CODE_OAUTH_TOKEN")
-                or self.env.get("ANTHROPIC_API_KEY")
-            )
-        if runtime is Runtime.CODEX:
-            from pathlib import Path
 
-            return (
-                Path.home() / ".codex" / "auth.json"
-            ).exists() or bool(self.env.get("OPENAI_API_KEY"))
+        In subscriptions-only mode an API key is deliberately *not* a
+        credential. The whole point of the mode is that work is billed to a
+        subscription; accepting a key here would let a stray `ANTHROPIC_API_KEY`
+        in the environment start metered spend the operator never agreed to.
+        """
+        from pathlib import Path
+
+        subscriptions_only = self.subscriptions_only
+        if runtime is Runtime.CLAUDE_CODE:
+            has_login = _claude_login_present(self.env)
+            if subscriptions_only:
+                return has_login
+            return has_login or bool(self.env.get("ANTHROPIC_API_KEY"))
+        if runtime is Runtime.CODEX:
+            has_login = (Path.home() / ".codex" / "auth.json").exists()
+            if subscriptions_only:
+                return has_login
+            return has_login or bool(self.env.get("OPENAI_API_KEY"))
+        if subscriptions_only:
+            return False  # no local backend is registered in this mode
         return True  # open_code needs only a reachable backend
 
     def record_usage(
@@ -210,9 +286,16 @@ class CapacityManager:
         now = time.time()
 
         if not self.configured(runtime):
-            return Headroom(
-                runtime, False, 0.0, 0.0, 0, 0.0, "no credentials configured"
-            )
+            if runtime is Runtime.OPEN_CODE and self.subscriptions_only:
+                reason = "disabled by subscriptions-only mode"
+            elif self.subscriptions_only:
+                reason = (
+                    "no subscription login found; run "
+                    + ("`claude setup-token`" if runtime is Runtime.CLAUDE_CODE else "`codex login`")
+                )
+            else:
+                reason = "no credentials configured"
+            return Headroom(runtime, False, 0.0, 0.0, 0, 0.0, reason)
 
         if runtime is Runtime.OPEN_CODE:
             return Headroom(runtime, True, 1.0, 0.0, 0, 0.0, "local, unmetered")
@@ -308,6 +391,31 @@ class CapacityManager:
         deliberate escape hatch for planning and final-verification work where
         errors propagate across every issue.
         """
+        if self.subscriptions_only:
+            # No local runtime exists to prefer, and a privacy class that
+            # demands one cannot be honoured -- say so rather than silently
+            # sending the work to a subscription.
+            if privacy_local_only:
+                return Runtime.CLAUDE_CODE, (
+                    "privacy class requires local-only inference, which "
+                    "subscriptions-only mode cannot provide"
+                )
+            for runtime in (Runtime.CLAUDE_CODE, Runtime.CODEX):
+                head = self.headroom(runtime)
+                if head.available:
+                    return runtime, (
+                        f"subscriptions-only mode; {runtime.value} has "
+                        f"{head.fraction_remaining:.0%} of its window left"
+                    )
+            blocked = "; ".join(
+                f"{r.value}: {self.headroom(r).reason}"
+                for r in (Runtime.CLAUDE_CODE, Runtime.CODEX)
+            )
+            return Runtime.CLAUDE_CODE, (
+                f"subscriptions-only mode with no headroom ({blocked}); "
+                "claude_code as last resort"
+            )
+
         if privacy_local_only:
             return Runtime.OPEN_CODE, "privacy class requires local-only inference"
 
@@ -352,6 +460,9 @@ class CapacityManager:
         so this checks the routing table rather than merely whether a backend
         process is listening.
         """
+        if self.subscriptions_only:
+            return False
+
         from .router.policy import RoutingTable
 
         table = RoutingTable.load(

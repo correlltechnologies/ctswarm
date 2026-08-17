@@ -75,16 +75,31 @@ def _ok(flag: bool) -> str:
 @app.command()
 def doctor() -> None:
     """Report what is wired up, what is missing, and how to fix each gap."""
+    from .execution_mode import (
+        MODE_LABELS,
+        env_pinned,
+        load_mode,
+        subscription_only,
+    )
+
     host = detect_host()
+    ledger = Ledger(os.environ.get("CTSWARM_DB", "var/ctswarm.db"))
+    mode = load_mode(ledger)
+    subscriptions_only = subscription_only(ledger)
 
     console.print("\n[bold]Host[/bold]")
     host_table = Table(show_header=False, box=None, pad_edge=False)
     for key, value in host.to_dict().items():
         host_table.add_row(f"  {key}", str(value))
+    host_table.add_row(
+        "  execution_mode",
+        MODE_LABELS.get(mode, mode)
+        + (" (pinned by CTSWARM_EXECUTION_MODE)" if env_pinned() else ""),
+    )
     console.print(host_table)
 
     console.print("\n[bold]Backends[/bold]")
-    backends = build_backends(host)
+    backends = build_backends(host, subscriptions_only=subscriptions_only)
 
     async def probe() -> dict:
         found = {}
@@ -103,10 +118,27 @@ def doctor() -> None:
             name, _ok(info["healthy"]), str(len(info["models"])) + " installed"
         )
     if not probed:
-        backend_table.add_row("[dim]none detected[/dim]", "", "")
+        # "none detected" reads as a broken host. In subscriptions-only mode
+        # there is nothing to detect, which is a different and correct state.
+        backend_table.add_row(
+            "[dim]none[/dim]",
+            "",
+            "[dim]disabled by subscriptions-only mode[/dim]"
+            if subscriptions_only
+            else "[dim]none detected[/dim]",
+        )
     console.print(backend_table)
 
     installed = {ref for info in probed.values() for ref in info["models"]}
+
+    if subscriptions_only:
+        console.print(
+            "\n[dim]Model catalog and routing table are not used in "
+            "subscriptions-only mode; work runs on the Claude Code and Codex "
+            "CLIs.[/dim]"
+        )
+        _print_credentials(subscriptions_only=True)
+        return
 
     console.print("\n[bold]Model catalog[/bold]")
     catalog_table = Table("model", "placement", "tiers", "installed", "note", box=None)
@@ -144,8 +176,12 @@ def doctor() -> None:
             )
         console.print(score_table)
 
+    _print_credentials(subscriptions_only=False)
+
+
+def _print_credentials(*, subscriptions_only: bool) -> None:
     console.print("\n[bold]Credentials and runtimes[/bold]")
-    creds = _credential_status()
+    creds = _credential_status(subscriptions_only=subscriptions_only)
     cred_table = Table("capability", "available", "how to enable", box=None)
     for name, (available, fix) in creds.items():
         cred_table.add_row(name, _ok(available), "" if available else fix)
@@ -153,28 +189,46 @@ def doctor() -> None:
     console.print()
 
 
-def _credential_status() -> dict[str, tuple[bool, str]]:
+def _credential_status(*, subscriptions_only: bool = False) -> dict[str, tuple[bool, str]]:
     """What the factory can currently authenticate as.
 
     Checked by looking for real artifacts, not by trusting environment variables
     that may name an expired token.
+
+    In subscriptions-only mode an API key is not reported as a credential: the
+    mode exists precisely so that work is billed to a subscription, and showing
+    a green tick for a path the build will refuse to take is the kind of
+    dishonest inventory this command is supposed to avoid.
     """
+    from .capacity import _claude_login_present
+
     home = Path.home()
-    return {
+    status = {
         "claude_code runtime": (
-            bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
-            or bool(os.environ.get("ANTHROPIC_API_KEY")),
+            _claude_login_present(dict(os.environ))
+            or (
+                not subscriptions_only and bool(os.environ.get("ANTHROPIC_API_KEY"))
+            ),
             "run `claude setup-token` and put it in .env as CLAUDE_CODE_OAUTH_TOKEN",
         ),
         "codex runtime": (
             (home / ".codex" / "auth.json").exists()
-            or bool(os.environ.get("OPENAI_API_KEY")),
+            or (not subscriptions_only and bool(os.environ.get("OPENAI_API_KEY"))),
             "run `codex login` on this host",
         ),
-        "openrouter overflow": (
+    }
+    if not subscriptions_only:
+        status["openrouter overflow"] = (
             bool(os.environ.get("OPENROUTER_API_KEY")),
             "add OPENROUTER_API_KEY to .env (get a key at openrouter.ai/keys)",
-        ),
+        )
+    status.update(_shared_credential_status())
+    return status
+
+
+def _shared_credential_status() -> dict[str, tuple[bool, str]]:
+    """Capabilities that matter in every execution mode."""
+    return {
         "github PR creation": (
             bool(os.environ.get("GH_TOKEN")) or _gh_authed(),
             "run `gh auth login`, or set GH_TOKEN in .env",
@@ -377,14 +431,6 @@ def usage(build_id: str | None = typer.Option(None, help="Scope to one build."))
     )
 
 
-def main() -> None:
-    app()
-
-
-if __name__ == "__main__":
-    main()
-
-
 @app.command()
 def verify(
     router: str = typer.Option("http://localhost:8090", help="Router base URL."),
@@ -498,23 +544,38 @@ def committee(
     """
     from .backends import build_backends
     from .committee import Rule, convene, eligible_members
+    from .execution_mode import subscription_only
 
     context = Path(context_file).read_text(encoding="utf-8") if context_file else ""
-    table = RoutingTable.load()
-    members = eligible_members(table)
+    subscriptions_only = subscription_only(Ledger(os.environ.get("CTSWARM_DB", "var/ctswarm.db")))
 
-    if len(members) < min_families:
+    if subscriptions_only:
+        from .backends.cli_harness import CliHarnessBackend
+
+        backend = CliHarnessBackend()
+        members = asyncio.run(backend.list_models())
+        remedy = (
+            "Log in to both harnesses (`claude setup-token`, `codex login`) so "
+            "the panel has two independent vendors."
+        )
+    else:
+        table = RoutingTable.load()
+        members = eligible_members(table)
+        host = detect_host()
+        backends = build_backends(host, subscriptions_only=False)
+        backend = backends.get("ollama") or next(iter(backends.values()), None)
+        remedy = (
+            "Run `ctswarm bench`, or add a second backend "
+            "(OPENROUTER_API_KEY) for genuine independence."
+        )
+
+    if len(members) < min_families or backend is None:
         console.print(
             f"[red]only {len(members)} eligible model family/families "
             f"({members}); {min_families} required[/red]\n"
-            "[yellow]Run `ctswarm bench`, or add a second backend "
-            "(OPENROUTER_API_KEY) for genuine independence.[/yellow]"
+            f"[yellow]{remedy}[/yellow]"
         )
         raise typer.Exit(2)
-
-    host = detect_host()
-    backends = build_backends(host)
-    backend = backends.get("ollama") or next(iter(backends.values()))
 
     async def run() -> None:
         result = await convene(
@@ -767,3 +828,15 @@ def status(build_id: str | None = typer.Argument(None)) -> None:
         f"\n  PR          {payload.get('pr_url', '')}"
         f"\n  error       {payload.get('error', '')}\n"
     )
+
+
+def main() -> None:
+    app()
+
+
+# Defined last on purpose. When this module is run as `python -m ctswarm.cli`,
+# execution reaches this line partway through the file if it sits higher up, so
+# every command declared below it is never registered and the CLI silently
+# offers half its commands.
+if __name__ == "__main__":
+    main()

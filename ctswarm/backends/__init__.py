@@ -35,7 +35,10 @@ __all__ = [
 
 
 def build_backends(
-    host: HostProfile | None = None, env: dict | None = None
+    host: HostProfile | None = None,
+    env: dict | None = None,
+    *,
+    subscriptions_only: bool | None = None,
 ) -> dict[str, Backend]:
     """Assemble the backends available on this host.
 
@@ -44,10 +47,24 @@ def build_backends(
     circuit breaker, which means a backend that comes back up mid-build is picked
     up automatically instead of requiring a restart. Probe 2 depends on exactly
     this behavior.
+
+    ``subscriptions_only`` short-circuits to an empty registry. That is the
+    honest answer for a host with no model server: a backend registered "just in
+    case" shows up in the catalog as an option the operator can select and then
+    watch fail. Callers that hold a ledger should resolve the mode from it and
+    pass the result, because the operator can change the mode at runtime; the
+    environment-only fallback here is for callers that have no ledger.
     """
     host = host or detect_host()
     env = env if env is not None else dict(os.environ)
     backends: dict[str, Backend] = {}
+
+    if subscriptions_only is None:
+        from ..execution_mode import subscription_only
+
+        subscriptions_only = subscription_only(None, env)
+    if subscriptions_only:
+        return backends
 
     if host.has_ollama or env.get("CTSWARM_OLLAMA_HOST"):
         try:

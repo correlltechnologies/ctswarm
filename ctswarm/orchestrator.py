@@ -37,8 +37,10 @@ from pathlib import Path
 import httpx
 
 from .capacity import CapacityManager, Runtime
+from .execution_mode import subscription_only
 from .ledger import Ledger
 from .routing_config import (
+    LANE_ROLES,
     apply_routing_policy,
     load_routing_policy,
     normalize_routing_policy,
@@ -115,7 +117,9 @@ CONTROL_RESUME = "build_control_resume"
 CONTROL_STOP = "build_control_stop"
 
 
-def runtime_model_overrides(runtime: Runtime) -> dict[str, str]:
+def runtime_model_overrides(
+    runtime: Runtime, *, subscriptions_only: bool | None = None
+) -> dict[str, str]:
     """Return model names that are valid for the selected CLI harness.
 
     The agent containers expose ``SWE_MODEL_*`` aliases for the OpenCode/router
@@ -139,10 +143,18 @@ def runtime_model_overrides(runtime: Runtime) -> dict[str, str]:
             "default": "sonnet",
             "qa_synthesizer": "haiku",
         }
+    if subscriptions_only is None:
+        subscriptions_only = subscription_only()
     auth_mode = os.environ.get("SWE_CODEX_AUTH_MODE", "auto").strip().lower()
-    uses_api_key = auth_mode == "api_key" or (
-        auth_mode == "auto" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    )
+    if subscriptions_only:
+        # A subscription-only host has no API key by definition, so the
+        # API-key-only `-codex` model would fail on the first call. Pin the
+        # ChatGPT-login model regardless of what SWE_CODEX_AUTH_MODE says.
+        uses_api_key = False
+    else:
+        uses_api_key = auth_mode == "api_key" or (
+            auth_mode == "auto" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+        )
     # The `-codex` model is API-key-only; ChatGPT-account login needs the base
     # model. This mirrors SWE-AF's own auth-aware default selection.
     return {"default": "gpt-5.3-codex" if uses_api_key else "gpt-5.5"}
@@ -157,6 +169,57 @@ HOSTED_ROLES = (
     "code_reviewer",
     "verifier",
 )
+
+
+# Which harness owns which lane when there is no local runtime to fall back on.
+#
+# The split is not arbitrary. README's committee rule is that independence is by
+# *model family*, because models sharing training data are wrong together. Claude
+# writes the plan and the code; Codex reviews it and runs QA. That puts a genuine
+# vendor boundary between the work and its review, which the previous local
+# arrangement (two Qwen variants voting) never had.
+#
+# Maintenance goes to Codex to keep mechanical git/merge chatter off the same
+# subscription window that planning and implementation are drawing down.
+SUBSCRIPTION_LANE_RUNTIMES: dict[str, Runtime] = {
+    "planning": Runtime.CLAUDE_CODE,
+    "implementation": Runtime.CLAUDE_CODE,
+    "review": Runtime.CODEX,
+    "maintenance": Runtime.CODEX,
+}
+
+
+def subscription_role_policy(
+    *, available: set[Runtime] | None = None
+) -> tuple[dict[str, str], dict[str, str], Runtime]:
+    """Assign every role to a CLI harness, with no local runtime anywhere.
+
+    Returns the provider map, the model map, and the base runtime SWE-AF should
+    launch with. The base runtime is the one owning the implementation lane,
+    because that is what the `default` role resolves to and therefore what any
+    role without an explicit assignment inherits.
+
+    ``available`` narrows the split when only one subscription is usable: with a
+    single harness every lane collapses onto it. That is a real degradation --
+    review is no longer independent of implementation -- so the caller records
+    the reason rather than letting it pass silently.
+    """
+    usable = available if available else set(SUBSCRIPTION_LANE_RUNTIMES.values())
+    fallback = Runtime.CLAUDE_CODE if Runtime.CLAUDE_CODE in usable else Runtime.CODEX
+
+    providers: dict[str, str] = {}
+    models: dict[str, str] = {}
+    for lane, roles in LANE_ROLES.items():
+        runtime = SUBSCRIPTION_LANE_RUNTIMES.get(lane, fallback)
+        if runtime not in usable:
+            runtime = fallback
+        overrides = runtime_model_overrides(runtime, subscriptions_only=True)
+        for role in roles:
+            providers[role] = runtime.value
+            models[role] = overrides.get(role, overrides["default"])
+
+    base = Runtime(providers.get("default", fallback.value))
+    return providers, models, base
 
 
 def hybrid_role_policy(
@@ -310,22 +373,86 @@ class Orchestrator:
         """Start a SWE-AF build with a capacity-chosen runtime."""
         build_id = build_id or f"build-{uuid.uuid4().hex[:10]}"
 
+        subscriptions_only = subscription_only(self.ledger)
         planning_runtime, why = self.capacity.select(
-            require_strong=require_strong_planning
+            require_strong=require_strong_planning,
+            prefer_local=not subscriptions_only,
         )
-        runtime = Runtime.OPEN_CODE
-        providers, models = hybrid_role_policy(planning_runtime)
+        if subscriptions_only:
+            available = {
+                harness
+                for harness in (Runtime.CLAUDE_CODE, Runtime.CODEX)
+                if self.capacity.headroom(harness).available
+            }
+            if not available:
+                # Submitting anyway would send 400+ invocations at a harness
+                # already known to refuse them, and each one would burn a full
+                # agent timeout before failing. Block here, with the reason.
+                blocked = "; ".join(
+                    f"{harness.value}: {self.capacity.headroom(harness).reason}"
+                    for harness in (Runtime.CLAUDE_CODE, Runtime.CODEX)
+                )
+                record = BuildRecord(
+                    build_id=build_id,
+                    goal=goal,
+                    repo_url=repo_url,
+                    runtime=Runtime.CLAUDE_CODE,
+                )
+                record.state = BuildState.BLOCKED
+                record.error = f"no subscription harness can run this build ({blocked})"
+                self.ledger.record_event(
+                    "build_blocked",
+                    {"reason": record.error, "mode": "subscription_only"},
+                    build_id=build_id,
+                )
+                return record
+
+            providers, models, runtime = subscription_role_policy(available=available)
+            if len(available) == 1:
+                only = next(iter(available)).value
+                why = (
+                    f"subscriptions-only mode; {only} is the sole harness with "
+                    "headroom, so review is NOT independent of implementation"
+                )
+                # A degradation the operator can act on is worth a durable
+                # record, not just a log line that scrolls away.
+                self.ledger.record_event(
+                    "build_degraded",
+                    {
+                        "reason": why,
+                        "lost": "independent review",
+                        "harness": only,
+                    },
+                    build_id=build_id,
+                )
+            else:
+                why = "subscriptions-only mode; Claude implements and Codex reviews"
+        else:
+            runtime = Runtime.OPEN_CODE
+            providers, models = hybrid_role_policy(planning_runtime)
         providers, models = apply_routing_policy(
             (
-                normalize_routing_policy(routing_policy)
+                normalize_routing_policy(
+                    routing_policy, subscriptions_only=subscriptions_only
+                )
                 if routing_policy is not None
-                else load_routing_policy(self.ledger)
+                else load_routing_policy(
+                    self.ledger, subscriptions_only=subscriptions_only
+                )
             ),
             providers=providers,
             models=models,
-            claude_model=runtime_model_overrides(Runtime.CLAUDE_CODE)["default"],
-            codex_model=runtime_model_overrides(Runtime.CODEX)["default"],
+            claude_model=runtime_model_overrides(
+                Runtime.CLAUDE_CODE, subscriptions_only=subscriptions_only
+            )["default"],
+            codex_model=runtime_model_overrides(
+                Runtime.CODEX, subscriptions_only=subscriptions_only
+            )["default"],
         )
+        # An explicit operator assignment can move the `default` role, and the
+        # base runtime must follow it or SWE-AF launches one harness while every
+        # unassigned role expects another.
+        runtime = Runtime(providers.get("default", runtime.value))
         record = BuildRecord(
             build_id=build_id, goal=goal, repo_url=repo_url, runtime=runtime
         )
@@ -546,8 +673,21 @@ class Orchestrator:
             record.error = "deterministic completion gates failed or could not run"
             return gates
 
-        members = eligible_members(RoutingTable.load())
-        if len(members) < 2:
+        subscriptions_only = subscription_only(self.ledger)
+        if subscriptions_only:
+            # No routing table exists on this host, so the panel is the two CLI
+            # harnesses. They are two genuine vendor families, which is what the
+            # independence rule actually asks for.
+            from .backends.cli_harness import CliHarnessBackend
+
+            backend = CliHarnessBackend()
+            members = await backend.list_models()
+        else:
+            members = eligible_members(RoutingTable.load())
+            backends = build_backends(subscriptions_only=False)
+            backend = backends.get("ollama") or next(iter(backends.values()), None)
+
+        if len(members) < 2 or backend is None:
             gates["committee"] = {
                 "skipped": (
                     f"only {len(members)} independent model family/families "
@@ -559,9 +699,6 @@ class Orchestrator:
             record.state = BuildState.BLOCKED
             record.error = "completion committee quorum is unavailable"
             return gates
-
-        backends = build_backends()
-        backend = backends.get("ollama") or next(iter(backends.values()))
         try:
             diff = _read_diff(repo_path)
             result = await convene(

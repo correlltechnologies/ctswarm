@@ -29,6 +29,9 @@ async def test_backend_registry_enforces_configured_ollama_context_ceiling() -> 
             "CTSWARM_OLLAMA_HOST": "http://unused.invalid",
             "CTSWARM_OLLAMA_CONTEXT_CEILING": "16384",
         },
+        # Local backends only exist in hybrid mode; subscriptions-only hosts
+        # register nothing at all.
+        subscriptions_only=False,
     )
 
     backend = backends["ollama"]

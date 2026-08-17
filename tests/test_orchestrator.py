@@ -102,6 +102,8 @@ async def test_submit_uses_explicit_routing_snapshot(monkeypatch, tmp_path) -> N
             return Response()
 
     ledger = Ledger(tmp_path / "ledger.db")
+    # Routing a lane to a local model is only legal on a hybrid host.
+    monkeypatch.setenv("CTSWARM_EXECUTION_MODE", "hybrid")
     orchestrator = Orchestrator(ledger=ledger)
     monkeypatch.setattr(
         orchestrator.capacity,
@@ -154,7 +156,9 @@ def test_codex_chatgpt_auth_overrides_open_code_environment(monkeypatch) -> None
 def test_codex_api_key_auth_uses_codex_model(monkeypatch) -> None:
     monkeypatch.setenv("SWE_CODEX_AUTH_MODE", "api_key")
 
-    assert runtime_model_overrides(Runtime.CODEX) == {
+    # The API-key model only exists on a hybrid host. Subscriptions-only mode
+    # has no key by definition, which the next test covers.
+    assert runtime_model_overrides(Runtime.CODEX, subscriptions_only=False) == {
         "default": "gpt-5.3-codex"
     }
 
@@ -162,12 +166,31 @@ def test_codex_api_key_auth_uses_codex_model(monkeypatch) -> None:
 def test_codex_auto_auth_tracks_api_key_presence(monkeypatch) -> None:
     monkeypatch.setenv("SWE_CODEX_AUTH_MODE", "auto")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    assert runtime_model_overrides(Runtime.CODEX)["default"] == "gpt-5.5"
+    assert (
+        runtime_model_overrides(Runtime.CODEX, subscriptions_only=False)["default"]
+        == "gpt-5.5"
+    )
 
     monkeypatch.setenv("OPENAI_API_KEY", "present")
     assert (
-        runtime_model_overrides(Runtime.CODEX)["default"] == "gpt-5.3-codex"
+        runtime_model_overrides(Runtime.CODEX, subscriptions_only=False)["default"]
+        == "gpt-5.3-codex"
     )
+
+
+def test_subscription_mode_ignores_a_stray_api_key(monkeypatch) -> None:
+    """A key left in the environment must not silently start metered spend.
+
+    Subscriptions-only mode promises the work is billed to a subscription. The
+    API-key-only `-codex` model would break that promise, and would also fail
+    outright on a host whose codex login is a ChatGPT account.
+    """
+    monkeypatch.setenv("SWE_CODEX_AUTH_MODE", "api_key")
+    monkeypatch.setenv("OPENAI_API_KEY", "present")
+
+    assert runtime_model_overrides(Runtime.CODEX, subscriptions_only=True) == {
+        "default": "gpt-5.5"
+    }
 
 
 def test_hybrid_policy_keeps_execution_local() -> None:

@@ -123,7 +123,10 @@ def test_queue_survives_a_new_scheduler_instance(tmp_path) -> None:
     assert [item[0] for item in second.pending_requests()] == [build_id]
 
 
-def test_enqueue_snapshots_routing_policy_before_dispatch(tmp_path) -> None:
+def test_enqueue_snapshots_routing_policy_before_dispatch(monkeypatch, tmp_path) -> None:
+    # Pinning a lane to a local model is a hybrid-host policy; a
+    # subscriptions-only host would legitimately refuse it.
+    monkeypatch.setenv("CTSWARM_EXECUTION_MODE", "hybrid")
     ledger = Ledger(tmp_path / "scheduler.db")
     selected = {
         **DEFAULT_ROUTING_POLICY,
