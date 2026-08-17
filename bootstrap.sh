@@ -113,9 +113,9 @@ done
 
 if have python3; then
   PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-  PY_OK=$(python3 -c 'import sys; print(1 if (3,10) <= sys.version_info < (3,14) else 0)')
+  PY_OK=$(python3 -c 'import sys; print(1 if (3,11) <= sys.version_info < (3,14) else 0)')
   if [[ "$PY_OK" == "1" ]]; then ok "python $PY_VER"; else
-    fail "python $PY_VER is outside the supported range (3.10 to 3.13)"
+    fail "python $PY_VER is outside the supported range (3.11 to 3.13)"
     todo "install python 3.12"
   fi
 fi

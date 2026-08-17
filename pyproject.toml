@@ -2,7 +2,11 @@
 name = "ctswarm"
 version = "0.1.0"
 description = "Governance, routing, and evidence layer around SWE-AF"
-requires-python = ">=3.10,<3.14"
+# 3.11 is the real floor: `tomllib` is in the standard library from 3.11 and is
+# imported unconditionally. The previous floor of 3.10 paired with a `tomli`
+# fallback dependency that nothing imported, so a 3.10 install resolved happily
+# and then failed at startup on `import tomllib`.
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -10,7 +14,6 @@ dependencies = [
     "pydantic>=2.7",
     "typer>=0.12",
     "rich>=13.7",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
