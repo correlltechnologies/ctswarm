@@ -51,6 +51,15 @@ from .routing_config import (
     save_routing_policy,
     validate_policy_availability,
 )
+from .settings import (
+    SECTION_LABELS,
+    SETTING_SPECS,
+    SETTING_UPDATED,
+    SettingsError,
+    get_setting,
+    load_settings,
+    save_settings,
+)
 
 BUILD_ENQUEUED = "build_enqueued"
 BUILD_TERMINAL = "build_terminal"
@@ -122,6 +131,14 @@ class RoutingPolicyRequest(BaseModel):
     policy: dict[str, dict[str, str]]
 
 
+class SettingsRequest(BaseModel):
+    """A partial settings update. Absent keys are left alone."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    changes: dict[str, Any] = Field(default_factory=dict)
+
+
 def _event_detail(event: dict) -> dict:
     try:
         value = json.loads(event.get("detail") or "{}")
@@ -147,11 +164,15 @@ class BuildScheduler:
         )
         self.orchestrator = orchestrator or Orchestrator(ledger=self.ledger)
         self.notifier = notifier or StatusNotifier(ledger=self.ledger)
+        # Read through the settings registry rather than straight from the
+        # environment, so the value an operator saved in Mission Control is the
+        # value the scheduler actually enforces. Declared `applies_to: restart`
+        # because it is bound here, at construction.
         self.max_concurrent = max(
             1,
             max_concurrent
             if max_concurrent is not None
-            else int(os.environ.get("CTSWARM_MAX_CONCURRENT_BUILDS", "1")),
+            else int(get_setting(self.ledger, "scheduler.max_concurrent_builds")),
         )
         self.poll_interval_s = (
             poll_interval_s
@@ -749,6 +770,49 @@ async def get_model_overview(window_hours: float = 168.0) -> dict:
     overview["catalog_error"] = str(catalog.get("error") or "")
     overview["routing_policy"] = load_routing_policy(scheduler.ledger)
     return overview
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict:
+    """Every operator setting, its effective value, and where that value came from."""
+    return {
+        "settings": load_settings(scheduler.ledger),
+        "sections": [
+            {"key": key, "label": label} for key, label in SECTION_LABELS.items()
+        ],
+    }
+
+
+@app.put("/api/settings")
+async def put_settings(request: SettingsRequest) -> dict:
+    """Validate and persist a partial settings change."""
+    try:
+        settings = save_settings(scheduler.ledger, request.changes)
+    except SettingsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "settings": settings,
+        "message": "Settings saved.",
+        # Some of these only bind when a container restarts. Saying so beats
+        # letting an operator wonder why nothing changed.
+        "restart_required": sorted(
+            key
+            for key in request.changes
+            if SETTING_SPECS[key].applies_to == "restart"
+        ),
+    }
+
+
+@app.get("/api/settings/audit")
+async def get_settings_audit(key: str | None = None, limit: int = 50) -> dict:
+    """Who changed what, newest first."""
+    events = [
+        _event_detail(event)
+        for event in scheduler.ledger.events(kind=SETTING_UPDATED)
+    ]
+    if key:
+        events = [event for event in events if event.get("key") == key]
+    return {"changes": list(reversed(events))[: max(1, min(limit, 500))]}
 
 
 @app.get("/api/dashboard/routing-policy")

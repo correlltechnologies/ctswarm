@@ -45,6 +45,7 @@ from .routing_config import (
     load_routing_policy,
     normalize_routing_policy,
 )
+from .settings import get_setting
 
 
 class BuildState(str, Enum):
@@ -317,8 +318,13 @@ class Orchestrator:
         self.ledger = ledger or Ledger(os.environ.get("CTSWARM_DB", "var/ctswarm.db"))
         self.capacity = CapacityManager(ledger=self.ledger)
         self.status_interval_s = status_interval_s
+        # Through the settings registry, so raising the timeout from Mission
+        # Control on a slow host actually takes effect. On a Pi a healthy build
+        # can sit inside a dependency install for longer than a desktop ever
+        # would, and being killed as stalled is the failure that looks like a
+        # bug in the factory.
         self.no_progress_timeout_s = (
-            float(os.environ.get("CTSWARM_NO_PROGRESS_TIMEOUT_S", "1800"))
+            float(get_setting(self.ledger, "scheduler.no_progress_timeout_s"))
             if no_progress_timeout_s is None
             else no_progress_timeout_s
         )
