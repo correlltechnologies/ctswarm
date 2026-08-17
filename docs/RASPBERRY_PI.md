@@ -38,6 +38,27 @@ the answer is a remote runner (`docs/REMOTE_EXECUTION.md`), not more tuning.
 
 ## Host preparation
 
+### 0. Budget the memory against what the Pi is *already* running
+
+Do this first, because it decides whether the rest is worth doing:
+
+```bash
+free -h
+ps -eo rss,comm --sort=-rss | head -12 | awk '{printf "%6.0f MB  %s\n", $1/1024, $2}'
+```
+
+A Pi that is also a Pi-hole, a Grafana/InfluxDB box, or a small app server can
+easily have 1GB+ committed before ctswarm starts. ctswarm needs roughly
+1.3-1.8GB resident in normal operation, and the *target repository's* own
+`npm ci` and test run needs whatever is left. On a 4GB board that means the
+existing workload plus ctswarm plus a real build does not fit unless the box is
+close to idle.
+
+If it does not fit, the honest options are to move the other services off, to
+accept that only small targets will build, or to run the Pi as scheduler and
+dashboard with a remote runner doing the work (`docs/REMOTE_EXECUTION.md`).
+More tuning will not create memory that is not there.
+
 ### 1. Enable cgroup memory accounting (mandatory)
 
 Raspberry Pi OS ships with this off, and **every `mem_limit` in the compose
@@ -96,7 +117,63 @@ vm.vfs_cache_pressure=50
 vm.page-cluster=0
 ```
 
-### 4. Bound the logs
+### 4. Do not use the Docker snap
+
+Check what you have:
+
+```bash
+which docker            # /snap/bin/docker means the snap
+```
+
+Canonical's Docker snap is strictly confined. Bind mounts only work from `$HOME`
+and removable media, so the repository, the projects root, and every mounted
+credential file must live under your home directory or the containers start
+with empty mounts. Its socket is also `root:root` rather than group-owned, so
+the usual `usermod -aG docker` does nothing and every command needs `sudo`.
+
+Prefer the official packages:
+
+```bash
+sudo snap remove docker              # exports first if you have data in it
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"      # log out and back in
+docker compose version               # must be >= 2.24 for the Pi overlay
+```
+
+If you must keep the snap, at minimum connect the home interface and keep
+everything under `$HOME`:
+
+```bash
+sudo snap connect docker:home
+sudo addgroup --system docker && sudo adduser "$USER" docker
+sudo snap disable docker && sudo snap enable docker
+```
+
+### 5. Tailscale and Pi-hole on the same box
+
+If this Pi is *also* your tailnet DNS server, do not let it accept Tailscale
+DNS. Tailscale rewrites `/etc/resolv.conf` to point at MagicDNS on
+`100.100.100.100`, which then forwards back to this same machine. When the
+handoff breaks you get the confusing symptom of `ping 8.8.8.8` working while
+every hostname fails, and `dig @127.0.0.1` succeeding while `getent hosts`
+does not.
+
+On Raspberry Pi OS the usual cause is that `/usr/sbin/resolvconf` is a symlink
+to `resolvectl`, so Tailscale's resolvconf call fails with
+`Failed to resolve interface "tailscale": No such device` and leaves a
+`resolv.conf` pointing at a resolver that never answers. Check with
+`tailscale status` — the health section reports it.
+
+```bash
+sudo tailscale set --accept-dns=false
+```
+
+That restores the pre-Tailscale `resolv.conf` (`nameserver 127.0.0.1`, i.e.
+Pi-hole). The cost is that this node stops resolving `*.ts.net` names; it can
+still reach tailnet peers by IP, and every other device keeps using Pi-hole
+normally.
+
+### 6. Bound the logs
 
 `/etc/docker/daemon.json`:
 

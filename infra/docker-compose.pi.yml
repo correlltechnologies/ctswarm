@@ -97,7 +97,7 @@ services:
       - SWE_CODEX_AUTH_MODE=chatgpt
       # The base overlay hardcodes a macOS-shaped path. A Pi keeps its
       # checkouts wherever the operator put them.
-      - CTSWARM_PROJECTS_ROOT=${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}
+      - CTSWARM_PROJECTS_ROOT=${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}
       # A healthy build on a Pi can sit inside a dependency install for far
       # longer than on a desktop. Killing it as stalled is the failure that
       # looks like a bug in the factory.
@@ -109,7 +109,7 @@ services:
       - ctswarm-state:/state
       - ./bench/results:/bench-results:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}:/home/ctswarm/.codex:ro
-      - ${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:ro
+      - ${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:ro
     depends_on: !override
       swe-agent:
         condition: service_healthy
@@ -142,7 +142,7 @@ services:
       - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json.seed:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/auth.json:/root/.codex/auth.json:ro
-      - ${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:ro
+      - ${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:ro
     depends_on: !reset []
     logging: *pi-logging
 
@@ -160,6 +160,6 @@ services:
       - ${CTSWARM_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json.seed:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}/auth.json:/root/.codex/auth.json:ro
-      - ${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:${CTSWARM_PROJECTS_ROOT:-/home/pi/projects}:ro
+      - ${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:${CTSWARM_PROJECTS_ROOT:-${HOME}/projects}:ro
     depends_on: !reset []
     logging: *pi-logging
