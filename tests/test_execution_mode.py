@@ -43,21 +43,6 @@ from ctswarm.routing_config import (
 )
 
 
-@pytest.fixture
-def no_claude_login(monkeypatch):
-    """Pretend this host has no Claude subscription login.
-
-    Needed because the credential check consults the macOS Keychain, so a
-    developer running these tests on a logged-in machine would otherwise see a
-    real login and the "no harness available" cases could never be reached.
-    """
-    monkeypatch.setattr(
-        "ctswarm.capacity._KEYCHAIN_CACHE", {"claude": (float("inf"), False)}
-    )
-    monkeypatch.setattr("ctswarm.capacity._KEYCHAIN_TTL_S", float("inf"))
-    return None
-
-
 def _host() -> HostProfile:
     return HostProfile(
         os_name="Linux",
@@ -175,7 +160,7 @@ def test_a_policy_written_on_the_gpu_box_degrades_rather_than_exploding(
 
 
 def test_an_api_key_is_not_a_claude_credential(
-    tmp_path, monkeypatch, no_claude_login
+    tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("CTSWARM_EXECUTION_MODE", "subscription_only")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-ignored")
@@ -204,10 +189,20 @@ def test_an_api_key_is_a_claude_credential_in_hybrid_mode(tmp_path, monkeypatch)
 
 
 def test_a_subscription_login_file_counts_as_a_credential(tmp_path, monkeypatch) -> None:
-    """The docstring always claimed real artifacts were checked; now they are."""
+    """The docstring always claimed real artifacts were checked; now they are.
+
+    The payload has to be a non-empty object. `{}` is what bootstrap writes as
+    a placeholder so the container bind mount stays a file, and
+    test_an_empty_placeholder_is_not_a_login asserts that it does not count.
+    This test used to write `{}` too and passed anyway, because the credential
+    check falls back to the macOS Keychain and the machine it ran on was
+    logged in.
+    """
     credentials = tmp_path / ".claude" / ".credentials.json"
     credentials.parent.mkdir(parents=True)
-    credentials.write_text("{}", encoding="utf-8")
+    credentials.write_text(
+        '{"claudeAiOauth": {"accessToken": "test-token"}}', encoding="utf-8"
+    )
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     manager = CapacityManager(
@@ -217,7 +212,7 @@ def test_a_subscription_login_file_counts_as_a_credential(tmp_path, monkeypatch)
     assert manager.configured(Runtime.CLAUDE_CODE) is True
 
 
-def test_an_empty_placeholder_is_not_a_login(tmp_path, monkeypatch, no_claude_login) -> None:
+def test_an_empty_placeholder_is_not_a_login(tmp_path, monkeypatch) -> None:
     """bootstrap.sh writes `{}` here so the container bind mount stays a file.
 
     Treating that as a credential would launch a build against a harness that
@@ -243,7 +238,7 @@ def test_an_empty_placeholder_is_not_a_login(tmp_path, monkeypatch, no_claude_lo
     assert manager.configured(Runtime.CLAUDE_CODE) is True
 
 
-def test_a_credentials_directory_is_not_a_login(tmp_path, monkeypatch, no_claude_login) -> None:
+def test_a_credentials_directory_is_not_a_login(tmp_path, monkeypatch) -> None:
     """Docker creates a directory when a bind-mount source is missing."""
     credentials = tmp_path / ".claude" / ".credentials.json"
     credentials.mkdir(parents=True)
@@ -309,7 +304,7 @@ def test_a_single_available_harness_collapses_every_lane_onto_it() -> None:
 
 
 async def test_submit_refuses_when_no_harness_has_headroom(
-    tmp_path, monkeypatch, no_claude_login
+    tmp_path, monkeypatch
 ) -> None:
     """Launching anyway would burn a full agent timeout per invocation."""
     monkeypatch.setenv("CTSWARM_EXECUTION_MODE", "subscription_only")

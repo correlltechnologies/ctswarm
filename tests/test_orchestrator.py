@@ -52,6 +52,11 @@ async def test_submit_sends_production_contract_to_planner(monkeypatch, tmp_path
             captured.update({"url": url, "json": json})
             return Response()
 
+    # This test is about the contract sent to the planner, not about capacity.
+    # Subscriptions-only is the default mode and refuses to submit when no
+    # harness has headroom, which on a host with no logins is every time. Pin
+    # hybrid so the assertion below is measuring what it claims to measure.
+    monkeypatch.setenv("CTSWARM_EXECUTION_MODE", "hybrid")
     orchestrator = Orchestrator(ledger=Ledger(tmp_path / "ledger.db"))
     monkeypatch.setattr(orchestrator.capacity, "select", lambda **_kwargs: (Runtime.OPEN_CODE, "test"))
     monkeypatch.setattr("ctswarm.orchestrator.httpx.AsyncClient", Client)
