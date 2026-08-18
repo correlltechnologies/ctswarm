@@ -183,7 +183,10 @@ sudo tailscale set --accept-dns=false
 That is *supposed* to restore the pre-Tailscale `resolv.conf`. When resolvconf
 is the broken symlink above it cannot, and you are left with a machine that
 still cannot resolve anything even though you ran the documented fix. The
-script therefore writes `/etc/resolv.conf` directly:
+script therefore writes `/etc/resolv.conf` directly, and what it writes depends
+on whether anything is actually answering on port 53 here.
+
+With a local resolver running:
 
 ```
 nameserver 127.0.0.1
@@ -198,6 +201,10 @@ second. Without that fallback, stopping Pi-hole for thirty seconds also stops
 this host from resolving, which is how a routine container restart turns into
 an outage you cannot debug because `apt`, `git`, and `curl` have all gone dark
 at the same moment.
+
+With no local resolver, the `127.0.0.1` line is simply omitted. Naming a
+resolver that does not exist costs a refused connection on every lookup and
+implies a service someone will go looking for later.
 
 The cost of `--accept-dns=false` is that this node stops resolving `*.ts.net`
 names. It still reaches tailnet peers by IP, and every other device keeps using

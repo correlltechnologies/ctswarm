@@ -34,6 +34,14 @@ reboot_needed=0
 failures=0
 fail() { bad "$1"; failures=$((failures + 1)); }
 
+local_resolver_present() {
+  # Is anything actually answering DNS on this host? Pi-hole, dnsmasq, and
+  # systemd-resolved all count; a stopped container does not.
+  ss -lnu 2>/dev/null | grep -q ':53 ' && return 0
+  ss -lnt 2>/dev/null | grep -q ':53 ' && return 0
+  return 1
+}
+
 # --------------------------------------------------------------------- DNS
 say "1/7  DNS"
 # If this Pi is also the tailnet's DNS server, Tailscale points resolv.conf at
@@ -50,17 +58,24 @@ if command -v tailscale >/dev/null 2>&1; then
 fi
 
 if ! getent hosts github.com >/dev/null 2>&1; then
-  # Ordering matters. 127.0.0.1 is the local resolver (Pi-hole or similar).
-  # When it is down the kernel refuses the connection immediately rather than
-  # timing out, so glibc reaches the public fallback in well under a second.
-  # That keeps this machine resolving through a local-resolver outage, which
-  # is exactly the failure that otherwise takes the whole box offline.
   [[ -L /etc/resolv.conf ]] && rm -f /etc/resolv.conf
   {
     echo "# Written by ctswarm infra/pi-host-prep.sh."
-    echo "# Local resolver first, public fallback second, so an outage of the"
-    echo "# local resolver cannot take this host's own name resolution with it."
-    echo "nameserver 127.0.0.1"
+    if local_resolver_present; then
+      # Ordering matters when there *is* a local resolver. When it goes down
+      # the kernel refuses the connection immediately rather than timing out,
+      # so glibc reaches the public fallback in well under a second. That is
+      # what stops a Pi-hole restart from also taking this host's own name
+      # resolution with it.
+      echo "# Local resolver first, public fallback second, so an outage of the"
+      echo "# local resolver cannot take this host's own name resolution with it."
+      echo "nameserver 127.0.0.1"
+    else
+      # Nothing is listening on 53 here. Naming 127.0.0.1 anyway would add a
+      # refused connection to every lookup and imply a resolver that does not
+      # exist, which is the kind of leftover that wastes an afternoon later.
+      echo "# No local resolver is listening on port 53 on this host."
+    fi
     echo "nameserver 1.1.1.1"
     echo "nameserver 8.8.8.8"
   } > /etc/resolv.conf
