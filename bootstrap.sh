@@ -396,8 +396,13 @@ elif have npm; then
       || { warn "sandbox npm install failed"; todo "cd sandbox && npm install"; }
   fi
 else
-  warn "npm not found; the sandbox target cannot be built or tested"
-  todo "install Node.js 20+"
+  # Not a build blocker, so it must not join the "before this can run a build"
+  # list. The bundled sandbox is the target for `ctswarm verify` probes on this
+  # host; a real build compiles and tests the *target* repository inside the
+  # agent container, which carries its own Node. Saying otherwise sends a Pi
+  # operator off to install a toolchain the factory never touches.
+  note "npm not found; ctswarm verify will skip the bundled sandbox probes"
+  note "nothing else needs it: target repositories are built inside the agent container"
 fi
 
 # ---------------------------------------------------------------------------
