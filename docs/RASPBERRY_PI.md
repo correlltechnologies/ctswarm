@@ -3,6 +3,10 @@
 Target: **Raspberry Pi 4 Model B, 4GB, arm64**, running continuously until a
 swarm finishes and opens its pull request, reachable from a phone over Tailscale.
 
+Tested on **Ubuntu Server 24.04 LTS for Raspberry Pi**. Raspberry Pi OS works
+too and is called out wherever the two differ, which is mostly around cgroups
+and swap. `infra/pi-host-prep.sh` detects both.
+
 The Pi does no inference. Every agent role runs on the Claude Code and Codex
 CLIs, so the thinking happens at Anthropic and OpenAI and the Pi orchestrates.
 That is what makes a board with no accelerator a viable host at all.
@@ -79,14 +83,27 @@ them fails the symptom is rarely obvious.
 
 ### 2. cgroup memory accounting (mandatory)
 
-Raspberry Pi OS ships with this off, and **every `mem_limit` in the compose
-file is silently ignored until it is on.** No warning, no error: the container
-simply grows until the OOM killer takes something else. The script appends
-`cgroup_enable=memory cgroup_memory=1` to `/boot/firmware/cmdline.txt`, which
-must stay a single line. **This one needs a reboot.** Verify afterwards; if
-this prints a warning, the limits are not being applied:
+**Every `mem_limit` in the compose file is silently ignored until the kernel
+exposes a memory controller.** No warning, no error: the container simply grows
+until the OOM killer takes something else.
+
+Whether you need to do anything depends on the distribution, so the script asks
+the kernel rather than reading the boot config:
+
+| OS | Memory controller |
+|---|---|
+| Raspberry Pi OS | off by default; needs `cgroup_enable=memory cgroup_memory=1` in `/boot/firmware/cmdline.txt` and a reboot |
+| Ubuntu Server for Pi (24.04 tested) | on by default under cgroup v2; nothing to do |
+
+When the parameter is needed the script appends it, keeping the file to a
+single line, and asks for a reboot. When the controller is already live it says
+so and leaves the boot config alone, because rebooting a headless box for a
+parameter that changes nothing is a bad trade.
+
+Check it directly either way:
 
 ```bash
+grep -w memory /sys/fs/cgroup/cgroup.controllers    # the controller itself
 docker info 2>&1 | grep -i "no memory limit" && echo "NOT APPLIED" || echo "ok"
 ```
 
@@ -111,6 +128,16 @@ sudo systemctl start docker
 Compressed RAM swap is cheap; swapping to an SD card is not, and it is the
 fastest way to wear one out. `swappiness=100` is correct **only** in
 combination with zram, which is why the script sets both together.
+
+The script disables `dphys-swapfile`, which is Raspberry Pi OS's SD-card swap.
+Ubuntu does not have that unit and uses `/swap.img` instead, so on Ubuntu you
+end up with zram alongside the existing file swap. zram takes priority 100
+against the file's default of -2, so it is used first; remove `/swap.img` from
+`/etc/fstab` if you want it gone entirely.
+
+```bash
+swapon --show      # zram0 should be listed at PRIO 100
+```
 
 ### 5. Do not use the Docker snap
 

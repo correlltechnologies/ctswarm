@@ -128,22 +128,36 @@ ok "journald capped at 100M"
 
 # ----------------------------------------------------------------- cgroups
 say "4/7  cgroup memory accounting"
-# Raspberry Pi OS ships with this off, and every mem_limit in the Pi compose
-# overlay is silently ignored until it is on. Silently: no warning, no error,
-# the container simply grows until the OOM killer takes something.
-CMDLINE=/boot/firmware/cmdline.txt
-[[ -f "$CMDLINE" ]] || CMDLINE=/boot/cmdline.txt
-if [[ ! -f "$CMDLINE" ]]; then
-  fail "no cmdline.txt found; mem_limit will be silently ignored"
-elif grep -q 'cgroup_enable=memory' "$CMDLINE"; then
-  ok "already enabled"
+# Every mem_limit in the Pi compose overlay is ignored until the kernel exposes
+# a memory controller, and ignored *silently*: no warning, no error, the
+# container simply grows until the OOM killer takes something.
+#
+# Ask the kernel rather than reading the boot config. Raspberry Pi OS needs
+# `cgroup_enable=memory` on the command line; Ubuntu on the same board enables
+# the controller by default under cgroup v2 and needs nothing. Deciding from
+# cmdline.txt alone means telling an Ubuntu user to reboot a running host for a
+# parameter that would change nothing, which is a bad trade for a box you reach
+# only over SSH.
+if grep -qw memory /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
+  ok "memory controller already active; no kernel change needed"
+elif [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+  ok "memory cgroup already active (v1 hierarchy)"
 else
-  cp "$CMDLINE" "$CMDLINE.pre-ctswarm"
-  # This file must remain exactly one line; a newline in the middle silently
-  # truncates the kernel command line at that point.
-  printf '%s cgroup_enable=memory cgroup_memory=1\n' "$(tr -d '\n' < "$CMDLINE")" > "$CMDLINE"
-  ok "appended to $CMDLINE (backup at $CMDLINE.pre-ctswarm)"
-  reboot_needed=1
+  CMDLINE=/boot/firmware/cmdline.txt
+  [[ -f "$CMDLINE" ]] || CMDLINE=/boot/cmdline.txt
+  if [[ ! -f "$CMDLINE" ]]; then
+    fail "no memory controller and no cmdline.txt; mem_limit will be ignored"
+  elif grep -q 'cgroup_enable=memory' "$CMDLINE"; then
+    ok "already requested in $CMDLINE; the pending reboot will apply it"
+    reboot_needed=1
+  else
+    cp "$CMDLINE" "$CMDLINE.pre-ctswarm"
+    # This file must remain exactly one line; a newline in the middle silently
+    # truncates the kernel command line at that point.
+    printf '%s cgroup_enable=memory cgroup_memory=1\n' "$(tr -d '\n' < "$CMDLINE")" > "$CMDLINE"
+    ok "appended to $CMDLINE (backup at $CMDLINE.pre-ctswarm)"
+    reboot_needed=1
+  fi
 fi
 
 # -------------------------------------------------------------------- Swap
