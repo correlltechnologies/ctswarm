@@ -325,9 +325,26 @@ if [[ "$OS" == "Linux" && -z "${DISPLAY:-}" && -n "${SSH_CONNECTION:-}" ]]; then
   HEADLESS=1
 fi
 
+# Existence is not enough. The placeholder written above is a real file at the
+# same path, so a bare `-f` test reports a login that this script itself just
+# fabricated, and the summary then omits the one step that actually blocks a
+# build. Match ctswarm/capacity.py: the file counts only if it parses as a JSON
+# object with something in it.
+credentials_present() {
+  [[ -f "$1" ]] || return 1
+  python3 - "$1" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    payload = json.loads(open(sys.argv[1], encoding="utf-8").read() or "{}")
+except (OSError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(payload, dict) and payload else 1)
+PYEOF
+}
+
 if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] \
    || grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=sk-' .env 2>/dev/null \
-   || [[ -f "${CTSWARM_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}" ]]; then
+   || credentials_present "${CTSWARM_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"; then
   ok "claude_code runtime configured"
 else
   warn "claude_code runtime not configured"
@@ -337,7 +354,7 @@ else
   todo "configure CLAUDE_CODE_OAUTH_TOKEN"
 fi
 
-if [[ -f "${CTSWARM_CODEX_HOME:-$HOME/.codex}/auth.json" ]]; then
+if credentials_present "${CTSWARM_CODEX_HOME:-$HOME/.codex}/auth.json"; then
   ok "codex runtime configured (ChatGPT login found)"
 else
   warn "codex runtime not configured"
