@@ -311,10 +311,18 @@ if [[ $CHECK_ONLY -eq 0 ]]; then
   # and the container gets a directory where its credentials should be. An
   # unreadable directory is a hard failure; `{}` is simply "no stored
   # credentials", which falls through to CLAUDE_CODE_OAUTH_TOKEN as intended.
-  if [[ ! -e "$CLAUDE_CREDENTIALS" ]]; then
-    printf '{}\n' > "$CLAUDE_CREDENTIALS"; chmod 600 "$CLAUDE_CREDENTIALS"
-    created_placeholder=1
-  fi
+  # $CODEX_HOME/auth.json needs the same treatment for the same reason, and its
+  # absence from this list is how a root-owned *directory* appeared at
+  # ~/.codex/auth.json on the Pi: the agent services mount that exact path, so
+  # starting the stack before a `codex login` created it. Then codex login
+  # cannot write there either, and the operator is stuck needing root to undo
+  # something that setting up the stack did to them.
+  for f in "$CLAUDE_CREDENTIALS" "$CODEX_HOME/auth.json"; do
+    if [[ ! -e "$f" ]]; then
+      printf '{}\n' > "$f"; chmod 600 "$f"
+      created_placeholder=1
+    fi
+  done
   (( created_placeholder )) && note "created config placeholders so bind mounts stay files, not directories"
 fi
 

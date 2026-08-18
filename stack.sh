@@ -129,6 +129,37 @@ ensure_mcp_config() {
   export CTSWARM_MCP_GID
 }
 
+reclaim_docker_stub() {
+  # Docker materializes a missing bind source as a root-owned stub: a directory
+  # where a file should be, or a directory the operator cannot write. rmdir
+  # refuses anything non-empty, which is the safety: Docker's stub is empty and
+  # safe to replace, real content belongs to the operator and is left alone.
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  [[ -d "$path" ]] || return 0
+  rmdir "$path" 2>/dev/null && return 0
+  echo "warning: $path is a non-empty directory where a file is expected" >&2
+  return 1
+}
+
+ensure_credential_stubs() {
+  # The agent and scheduler services bind-mount these individually, so each one
+  # must already exist as a file. `{}` reads as "no stored credentials" to every
+  # consumer, including ctswarm doctor; a directory is a hard failure that
+  # surfaces later as a broken CLI, and needs root to undo.
+  local codex_home="${CTSWARM_CODEX_HOME:-$HOME/.codex}"
+  local claude_config="${CTSWARM_CLAUDE_CONFIG:-$HOME/.claude.json}"
+  mkdir -p "$codex_home"
+  local f
+  for f in "$claude_config" "$codex_home/config.toml" "$codex_home/auth.json"; do
+    reclaim_docker_stub "$f" || continue
+    if [[ ! -e "$f" ]]; then
+      if [[ "$f" == *.toml ]]; then : > "$f"; else printf '{}\n' > "$f"; fi
+      chmod 600 "$f"
+    fi
+  done
+}
+
 ensure_projects_root() {
   # Same trap as ensure_mcp_config, one level up: the scheduler bind-mounts the
   # projects root read-only, and Docker materializes a missing bind source as a
@@ -142,11 +173,7 @@ ensure_projects_root() {
   fi
 
   if [[ -d "$root" && ! -w "$root" ]]; then
-    # Already created by Docker. rmdir refuses unless it is empty, which is
-    # exactly the safety we want: an empty stub is Docker's doing and is safe to
-    # replace, while a populated directory is the operator's and is left alone.
-    rmdir "$root" 2>/dev/null \
-      || { echo "warning: $root is not writable and is not empty; leaving it alone" >&2; return 0; }
+    reclaim_docker_stub "$root" || return 0
   fi
   mkdir -p "$root"
 }
@@ -162,6 +189,7 @@ infrastructure_services() {
 bring_up() {
   local -a up_flags=("$@")
   ensure_mcp_config
+  ensure_credential_stubs
   ensure_projects_root
   refresh_mcp_inventory
   # Infrastructure first so a slow agent image build does not hide a broken

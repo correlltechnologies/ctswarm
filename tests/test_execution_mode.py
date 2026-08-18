@@ -380,3 +380,56 @@ def test_subscription_only_predicate_matches_the_mode(tmp_path, monkeypatch) -> 
     assert subscription_only(ledger) is True
     save_mode(ledger, HYBRID)
     assert subscription_only(ledger) is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["absent", "placeholder", "docker_directory"],
+    ids=["no file", "bootstrap placeholder", "docker created a directory"],
+)
+def test_doctor_agrees_with_the_gate_about_codex(tmp_path, monkeypatch, state) -> None:
+    """`ctswarm doctor` must not report a login that would refuse a launch.
+
+    doctor used `Path.exists()` while CapacityManager parsed the file, so all
+    three not-logged-in states below read as available. On the Pi that produced
+    a green tick beside "codex runtime" over a root-owned *directory* Docker had
+    created at ~/.codex/auth.json, because the agent services bind-mount that
+    exact path and nothing had created it first.
+    """
+    from ctswarm.cli import _credential_status
+
+    codex = tmp_path / ".codex"
+    codex.mkdir()
+    if state == "placeholder":
+        (codex / "auth.json").write_text("{}\n", encoding="utf-8")
+    elif state == "docker_directory":
+        (codex / "auth.json").mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    manager = CapacityManager(
+        ledger=Ledger(tmp_path / "ledger.db"),
+        env={"CTSWARM_EXECUTION_MODE": "subscription_only"},
+    )
+    reported, _ = _credential_status(subscriptions_only=True)["codex runtime"]
+    assert reported is False
+    assert reported == manager.configured(Runtime.CODEX)
+
+
+def test_doctor_reports_a_real_codex_login(tmp_path, monkeypatch) -> None:
+    """The other half: the fix must not make doctor blind to a real login."""
+    from ctswarm.cli import _credential_status
+
+    codex = tmp_path / ".codex"
+    codex.mkdir()
+    (codex / "auth.json").write_text(
+        '{"tokens": {"access_token": "real"}}', encoding="utf-8"
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    manager = CapacityManager(
+        ledger=Ledger(tmp_path / "ledger.db"),
+        env={"CTSWARM_EXECUTION_MODE": "subscription_only"},
+    )
+    reported, _ = _credential_status(subscriptions_only=True)["codex runtime"]
+    assert reported is True
+    assert reported == manager.configured(Runtime.CODEX)

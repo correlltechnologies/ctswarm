@@ -200,7 +200,7 @@ def _credential_status(*, subscriptions_only: bool = False) -> dict[str, tuple[b
     a green tick for a path the build will refuse to take is the kind of
     dishonest inventory this command is supposed to avoid.
     """
-    from .capacity import _claude_login_present
+    from .capacity import _claude_login_present, _has_credentials
 
     home = Path.home()
     status = {
@@ -212,7 +212,13 @@ def _credential_status(*, subscriptions_only: bool = False) -> dict[str, tuple[b
             "run `claude setup-token` and put it in .env as CLAUDE_CODE_OAUTH_TOKEN",
         ),
         "codex runtime": (
-            (home / ".codex" / "auth.json").exists()
+            # Not `.exists()`. bootstrap.sh writes a placeholder here so the
+            # agent container's bind mount stays a file, and Docker turns a
+            # missing source into a directory, so both "no login yet" states
+            # exist on disk. `.exists()` called them a working login and
+            # disagreed with CapacityManager, which is what actually gates a
+            # launch, so doctor said Codex was ready and the build was refused.
+            _has_credentials(home / ".codex" / "auth.json")
             or (not subscriptions_only and bool(os.environ.get("OPENAI_API_KEY"))),
             "run `codex login` on this host",
         ),
