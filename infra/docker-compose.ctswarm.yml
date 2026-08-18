@@ -197,6 +197,15 @@ services:
 
   # SWE-AF's own agent services, extended rather than redefined.
   swe-agent:
+    # SWE-AF publishes this on every interface. Nothing outside the compose
+    # network needs it: in-network callers reach the agent as swe-agent:8003,
+    # and no ctswarm process talks to the host mapping at all. On a laptop that
+    # is untidy; on a LAN-connected board reachable over Tailscale it hands the
+    # agent control API to anyone on the network, and the whole authorization
+    # story here is "you are on the tailnet". `!override` because compose merges
+    # port sequences, so appending would keep the 0.0.0.0 binding alongside.
+    ports: !override
+      - "127.0.0.1:8003:8003"
     # --project-directory relocates every relative path, including the ones in
     # SWE-AF's own compose file, so its `context: .` would resolve to the ctswarm
     # repo root and fail to find its Dockerfile. Restated here explicitly.
@@ -269,6 +278,15 @@ services:
     logging: *ctswarm-logging
 
   swe-fast:
+    # SWE-AF publishes this on every interface. Nothing outside the compose
+    # network needs it: in-network callers reach the agent as swe-agent:8004,
+    # and no ctswarm process talks to the host mapping at all. On a laptop that
+    # is untidy; on a LAN-connected board reachable over Tailscale it hands the
+    # agent control API to anyone on the network, and the whole authorization
+    # story here is "you are on the tailnet". `!override` because compose merges
+    # port sequences, so appending would keep the 0.0.0.0 binding alongside.
+    ports: !override
+      - "127.0.0.1:8004:8004"
     build:
       context: ./vendor/SWE-AF
       dockerfile: Dockerfile
