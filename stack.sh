@@ -111,6 +111,44 @@ ensure_mcp_config() {
   mkdir -p var/mcp
   [[ -f var/mcp/claude.json ]] || echo '{"mcpServers": {}}' > var/mcp/claude.json
   [[ -f var/mcp/codex.toml  ]] || : > var/mcp/codex.toml
+
+  # The scheduler image runs as uid 10001, which owns nothing on the host, so
+  # it cannot create the temporary file that materialization renames into
+  # place. It fails at startup, before serving anything. Rather than making the
+  # directory world-writable or running the scheduler as root, hand the
+  # container the directory's own group as a supplementary group and make the
+  # directory group-writable. CTSWARM_MCP_GID is read by the scheduler service
+  # in infra/docker-compose.ctswarm.yml.
+  chmod 0775 var/mcp
+  if CTSWARM_MCP_GID=$(stat -c %g var/mcp 2>/dev/null); then
+    :
+  else
+    # BSD stat, which is what macOS ships.
+    CTSWARM_MCP_GID=$(stat -f %g var/mcp 2>/dev/null || echo 0)
+  fi
+  export CTSWARM_MCP_GID
+}
+
+ensure_projects_root() {
+  # Same trap as ensure_mcp_config, one level up: the scheduler bind-mounts the
+  # projects root read-only, and Docker materializes a missing bind source as a
+  # *root-owned* directory. The operator then cannot write to their own
+  # projects directory without sudo, on a box where sudo wants a password.
+  local root
+  if [[ "${CTSWARM_PROFILE:-}" == "pi" ]]; then
+    root="${CTSWARM_PROJECTS_ROOT:-$HOME/projects}"
+  else
+    root="${CTSWARM_PROJECTS_ROOT:-$HOME/Desktop/Projects}"
+  fi
+
+  if [[ -d "$root" && ! -w "$root" ]]; then
+    # Already created by Docker. rmdir refuses unless it is empty, which is
+    # exactly the safety we want: an empty stub is Docker's doing and is safe to
+    # replace, while a populated directory is the operator's and is left alone.
+    rmdir "$root" 2>/dev/null \
+      || { echo "warning: $root is not writable and is not empty; leaving it alone" >&2; return 0; }
+  fi
+  mkdir -p "$root"
 }
 
 # The set of services started before the agents. The router belongs here only
@@ -124,6 +162,7 @@ infrastructure_services() {
 bring_up() {
   local -a up_flags=("$@")
   ensure_mcp_config
+  ensure_projects_root
   refresh_mcp_inventory
   # Infrastructure first so a slow agent image build does not hide a broken
   # control plane behind it.

@@ -158,6 +158,14 @@ services:
       - SLACK_APPROVAL_CHANNEL=${SLACK_APPROVAL_CHANNEL:-}
     ports:
       - "127.0.0.1:8092:8092"
+    # ./var/mcp belongs to the host account, and this image runs as uid 10001.
+    # Without the directory's own group the scheduler cannot create the
+    # temporary file materialization renames into place, and it dies during
+    # startup rather than degrading. stack.sh exports the real GID and makes the
+    # directory group-writable; the 0 default keeps a hand-written
+    # `docker compose` command from expanding to an empty, invalid group.
+    group_add:
+      - "${CTSWARM_MCP_GID:-0}"
     volumes:
       - ctswarm-state:/state
       - ./bench/results:/bench-results:ro
