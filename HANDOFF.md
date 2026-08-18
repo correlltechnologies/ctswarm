@@ -251,6 +251,9 @@ browser evidence; the API-only sandbox proof does not.
 | `README.md` | Architecture and design principles |
 | `docs/OPERATIONS.md` | Always-on runbook, recovery, controls, logs |
 | `docs/VERIFIED.md` | Verified facts, live evidence, assumptions |
+| `docs/RASPBERRY_PI.md` | Running the factory on a Pi: host prep, memory, access |
+| `docs/PI_DEPLOYMENT_STATUS.md` | Where the Pi deployment stands, and what to do next |
+| `docs/MCP.md` | The MCP registry, secrets, and where the two CLI formats differ |
 | `docs/REMOTE_EXECUTION.md` | VPS/local/hybrid execution and routing requirement |
 | `docs/SLACK.md` | Optional Slack approval setup |
 | `docs/OPENROUTER.md` | Hosted overflow setup and cost reasoning |
@@ -259,3 +262,14 @@ browser evidence; the API-only sandbox proof does not.
 Future expansion items (not blockers for the current scope) are branch protection
 on plans that support it, Slack delivery if desired, and browser evidence when a
 target includes a user interface.
+
+## 10. In-flight work
+
+Sections 1 through 9 describe the seven-service stack as of 2026-08-06. Work
+since then adds a subscriptions-only execution mode (now the **default**), a
+typed settings registry, and an operator-controlled MCP registry that replaces
+wholesale inheritance of the host's configuration. Both of those changed
+defaults that affect every host, not only the Pi.
+
+`docs/PI_DEPLOYMENT_STATUS.md` is the resume point: what is done, what is not,
+and the next command to run.
