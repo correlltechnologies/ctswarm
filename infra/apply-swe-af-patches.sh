@@ -26,6 +26,9 @@ patches=(
   "$repo_root/infra/patches/swe-af-harness-availability.patch"
   # Applies after swe-af-autonomous-ui.patch, which owns the same npm line.
   "$repo_root/infra/patches/swe-af-claude-cli.patch"
+  # Last: it edits the verify loop that swe-af-hybrid-runtime.patch introduces
+  # continuous_repair into, so it cannot apply before that patch has run.
+  "$repo_root/infra/patches/swe-af-verify-convergence.patch"
 )
 
 # Later patches can intentionally modify lines introduced by earlier patches.

@@ -379,6 +379,7 @@ class Orchestrator:
         mcp_context: str = "",
         routing_policy: dict[str, dict[str, str]] | None = None,
         build_id: str | None = None,
+        fast: bool = False,
     ) -> BuildRecord:
         """Start a SWE-AF build with a capacity-chosen runtime."""
         build_id = build_id or f"build-{uuid.uuid4().hex[:10]}"
@@ -521,6 +522,41 @@ class Orchestrator:
             "config": config,
         }
 
+        if fast:
+            # swe-fast has been running in the compose file all along, taking
+            # 300MB of a 4GB board, and nothing ever called it. It is a single
+            # pass: git init, plan the tasks, do them, verify once, open the PR.
+            # No product manager, no architect, no tech lead, no sprint planner,
+            # no issue writers, and no repair loop. For a change that is one
+            # obvious edit, the full pipeline spends seven planning agents
+            # before a line of code exists.
+            #
+            # Its config model forbids unknown keys and has no per-role provider
+            # map, so it gets its own dict rather than a filtered copy of the
+            # one above. One runtime for every role is also exactly what is
+            # wanted when only one subscription has capacity.
+            payload["config"] = {
+                "runtime": runtime.value,
+                "models": {"default": models.get("default", "")} if models.get("default") else None,
+                "enable_github_pr": bool(
+                    create_pull_request and scm_provider == "github"
+                ),
+                # The 600s default is a workstation number. A Pi installing
+                # dependencies and running a test suite needs the room, and
+                # being killed mid-verify is the failure that looks like a bug
+                # in the factory rather than a timeout.
+                "build_timeout_seconds": int(
+                    os.environ.get("CTSWARM_FAST_BUILD_TIMEOUT_S", "3600")
+                ),
+                "task_timeout_seconds": int(
+                    os.environ.get("CTSWARM_AGENT_TIMEOUT_SECONDS", "900")
+                ),
+                "repo_url": repo_url,
+            }
+            if source_branch:
+                payload["config"]["github_pr_base"] = source_branch
+
+        target = "swe-fast.build" if fast else "swe-planner.build"
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 # Both details verified against the live control plane:
@@ -528,7 +564,7 @@ class Orchestrator:
                 # and the body must be wrapped in `input` (a bare payload is
                 # rejected with "Missing required field: goal").
                 response = await client.post(
-                    f"{self.agentfield_url}/api/v1/execute/async/swe-planner.build",
+                    f"{self.agentfield_url}/api/v1/execute/async/{target}",
                     json={"input": payload},
                 )
             if response.status_code >= 400:  # 202 Accepted is the success case

@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -153,6 +154,65 @@ def _has_credentials(path) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(payload, dict) and bool(payload)
+
+
+# What each harness is asked during a probe, and how long it gets to answer.
+# The prompt is deliberately trivial: the question is "can this CLI do anything
+# at all", not "is it any good".
+_PROBE = {
+    Runtime.CLAUDE_CODE: ["claude", "-p", "say OK"],
+    Runtime.CODEX: ["codex", "exec", "--skip-git-repo-check", "say OK"],
+}
+
+
+def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool, str]:
+    """Ask a harness whether it can run, by running it.
+
+    Everything else in this module *reconstructs* headroom from observed usage,
+    because neither CLI exposes a quota endpoint. That inference has to travel
+    through the agent container, a structured result, a ledger, and a launch
+    gate before it changes any decision, and an eight-hour build proved every
+    one of those links can break independently while each layer reports
+    success.
+
+    A probe skips all of it. `codex exec "say OK"` answers in ten seconds with
+    an exit code and, when the subscription is spent, the sentence "You've hit
+    your usage limit". That is not an estimate. The cost is one trivial
+    invocation per build, against a build that otherwise spends hundreds
+    discovering the same fact the slow way.
+
+    Returns ``(usable, detail)``. ``usable`` is False when the binary is
+    missing, so a host that never installed a CLI is reported the same way as
+    one whose subscription is spent: not something to route work to.
+    """
+    command = _PROBE.get(runtime)
+    if command is None:
+        return False, f"no probe defined for {runtime.value}"
+    if not shutil.which(command[0]):
+        return False, f"{command[0]} is not on PATH"
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{command[0]} did not answer within {timeout_s:.0f}s"
+    except OSError as exc:
+        return False, f"{command[0]} could not be run: {exc}"
+    output = f"{completed.stdout}\n{completed.stderr}".strip()
+    if completed.returncode == 0:
+        return True, "answered a trivial prompt"
+    # The exit code says it failed; the text says why, and the wording is what
+    # tells an exhausted subscription apart from a broken install.
+    reason = next(
+        (line for line in reversed(output.splitlines()) if line.strip()),
+        f"exited {completed.returncode}",
+    )
+    return False, reason.strip()[:300]
 
 
 def _login_asserted(env: dict, name: str) -> bool | None:

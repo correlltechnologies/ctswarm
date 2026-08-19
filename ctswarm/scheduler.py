@@ -101,6 +101,11 @@ class BuildRequest(BaseModel):
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     # Zero means no scheduler deadline; the owner can still pause or stop.
     max_hours: float = Field(default=0.0, ge=0, le=720)
+    # Single-pass build on the swe-fast node: plan tasks, do them, verify once,
+    # open the PR. No planning committee and no repair loop. The full pipeline
+    # runs seven planning agents before any code exists, which is the right
+    # shape for "build me a product" and the wrong one for "add an endpoint".
+    fast: bool = False
     project_id: str = Field(default="", max_length=1024)
     project_path: str = Field(default="", max_length=4096)
     scm_provider: Literal[
@@ -132,6 +137,11 @@ class SwarmLaunchRequest(BaseModel):
     require_strong_planning: bool = True
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     max_hours: float = Field(default=0.0, ge=0, le=720)
+    # Single-pass build on the swe-fast node: plan tasks, do them, verify once,
+    # open the PR. No planning committee and no repair loop. The full pipeline
+    # runs seven planning agents before any code exists, which is the right
+    # shape for "build me a product" and the wrong one for "add an endpoint".
+    fast: bool = False
 
 
 class RoutingPolicyRequest(BaseModel):
@@ -378,6 +388,7 @@ class BuildScheduler:
                         repo_url=request.repo_url,
                         require_strong_planning=request.require_strong_planning,
                         max_ci_fix_cycles=request.max_ci_fix_cycles,
+                        fast=request.fast,
                         scm_provider=request.scm_provider,
                         source_branch=request.source_branch,
                         create_pull_request=request.create_pull_request,
@@ -786,6 +797,7 @@ async def launch_swarm(request: SwarmLaunchRequest, response: Response) -> dict:
         require_strong_planning=request.require_strong_planning,
         max_ci_fix_cycles=request.max_ci_fix_cycles,
         max_hours=request.max_hours,
+        fast=request.fast,
         project_id=request.project_id,
         project_path=project_path,
         scm_provider=scm_provider,

@@ -1,0 +1,120 @@
+diff --git a/swe_af/app.py b/swe_af/app.py
+--- a/swe_af/app.py
++++ b/swe_af/app.py
+@@ -1398,6 +1398,16 @@
+         # 3. VERIFY
+         verification = None
+         verify_cycles = count() if cfg.continuous_repair else range(cfg.max_verify_fix_cycles + 1)
++        # Continuous repair counts up forever, so the only thing that ever ended
++        # it was the build's wall clock. One run spent eight hours on
++        # sixty-seven cycles that each produced the same single criterion,
++        # because the verifier could not run and its own failure was being
++        # handed back as the thing to fix. Repair that never changes the verdict
++        # is not repair, and the agents said so in their own review notes while
++        # it kept going.
++        unchanged_verdict_limit = 2
++        previous_signature = ""
++        unchanged_verdicts = 0
+         for cycle in verify_cycles:
+             app.note(f"Verification cycle {cycle}", tags=["build", "verify"])
+             verification = _unwrap(await app.call(
+@@ -1445,6 +1455,25 @@
+                     "passed": False,
+                 }]
+ 
++            signature = "\n".join(
++                sorted(
++                    str(item.get("criterion", item.get("description", item)))
++                    for item in failed_criteria
++                )
++            )
++            unchanged_verdicts = (
++                unchanged_verdicts + 1 if signature == previous_signature else 0
++            )
++            previous_signature = signature
++            if unchanged_verdicts >= unchanged_verdict_limit:
++                app.note(
++                    f"Verification returned the same {len(failed_criteria)} "
++                    f"criteria {unchanged_verdicts + 1} cycles running; stopping "
++                    "rather than repeating a repair that is not converging",
++                    tags=["build", "verify", "stalled"],
++                )
++                break
++
+             remaining = (
+                 "continuous repair enabled"
+                 if cfg.continuous_repair
+diff --git a/swe_af/reasoners/execution_agents.py b/swe_af/reasoners/execution_agents.py
+--- a/swe_af/reasoners/execution_agents.py
++++ b/swe_af/reasoners/execution_agents.py
+@@ -14,7 +14,11 @@
+ from pydantic import BaseModel
+ 
+ from swe_af.execution import git_fast_path
+-from swe_af.execution.fatal_error import FatalHarnessError, check_fatal_harness_error
++from swe_af.execution.fatal_error import (
++    FatalHarnessError,
++    check_fatal_harness_error,
++    is_fatal_error,
++)
+ from swe_af.execution.ci_gate import watch_pr_checks
+ from swe_af.execution.dag_utils import normalize_issue_dict
+ from swe_af.execution.schemas import (
+@@ -714,6 +718,7 @@
+ 
+     provider = runtime_to_harness_adapter(ai_provider)
+ 
++    harness_detail = ""
+     try:
+         result = await router.harness(
+             task_prompt,
+@@ -741,19 +746,46 @@
+                 tags=["verifier", "complete"],
+             )
+             return parsed
++        # The harness answered with nothing usable, and every field saying why
++        # was being dropped one line before anything could act on it. Silence is
++        # then indistinguishable from "the code failed acceptance", so the build
++        # fed the verifier's own breakage back in as a criterion to satisfy and
++        # tried sixty-seven times to satisfy it.
++        #
++        # `check_fatal_harness_error` above cannot catch this on its own: it
++        # returns early unless `is_error` is set, and an exhausted subscription
++        # reaches here with no parsed output and no error flag.
++        harness_detail = (
++            str(getattr(result, "error_message", "") or "")
++            or str(getattr(result, "result", "") or "")[:400]
++            or f"failure_type={getattr(result, 'failure_type', None)!r}"
++        )
++        router.note(
++            f"Verifier produced no usable result: {harness_detail}",
++            tags=["verifier", "error"],
++        )
++        if is_fatal_error(harness_detail):
++            raise FatalHarnessError(harness_detail)
+     except FatalHarnessError:
+-        raise  # Non-retryable — propagate immediately
++        raise  # Non-retryable, propagate immediately
+     except Exception as e:
++        harness_detail = str(e)
+         router.note(
+             f"Verifier agent failed: {e}",
+             tags=["verifier", "error"],
+         )
+ 
+-    # Fallback: verification inconclusive
++    # Fallback: verification inconclusive. The reason travels with it, so the
++    # repair loop and ctswarm's own rate-limit detection can both see whether
++    # this was a finding about the code or a harness that never ran.
+     return VerificationResult(
+         passed=False,
+         criteria_results=[],
+-        summary="Verifier agent failed to produce a valid result.",
++        summary=(
++            f"Verifier agent failed to produce a valid result: {harness_detail}"
++            if harness_detail
++            else "Verifier agent failed to produce a valid result."
++        ),
+         suggested_fixes=["Re-run verification manually."],
+     ).model_dump()
+ 

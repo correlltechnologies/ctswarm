@@ -693,6 +693,36 @@ def committee(
     asyncio.run(run())
 
 
+def _probe_harnesses() -> None:
+    """Ask both harnesses whether they can run, and tell the scheduler.
+
+    Runs here rather than in the scheduler because the CLIs live on this host,
+    not in that container. Ten seconds against a build that would otherwise
+    spend hours discovering the same thing: the run that motivated this asked an
+    exhausted Codex to verify the same work sixty-seven times, because the fact
+    that Codex could not run at all had to survive four handoffs to reach the
+    launch gate, and did not.
+    """
+    from .capacity import Runtime, probe_runtime
+
+    for runtime in (Runtime.CLAUDE_CODE, Runtime.CODEX):
+        usable, detail = probe_runtime(runtime)
+        action = "clear-limit" if usable else "rate-limited"
+        try:
+            httpx.post(
+                f"{_scheduler_url()}/api/capacity/{runtime.value}/{action}",
+                timeout=20.0,
+            ).raise_for_status()
+        except httpx.HTTPError:
+            # A probe the scheduler never hears is still worth printing: the
+            # operator can act on it even when this could not.
+            pass
+        if usable:
+            console.print(f"  [green]{runtime.value}[/green] ready")
+        else:
+            console.print(f"  [yellow]{runtime.value}[/yellow] unavailable: {detail}")
+
+
 @app.command()
 def build(
     goal: str = typer.Argument(..., help="What you want built, in plain language."),
@@ -702,6 +732,14 @@ def build(
         900, help="Seconds between status posts when nothing changes."
     ),
     max_hours: float = typer.Option(12.0, help="Wall-clock ceiling for the build."),
+    fast: bool = typer.Option(
+        False,
+        "--fast",
+        help="Single pass: plan, code, verify, PR. No committee, no repair loop.",
+    ),
+    probe: bool = typer.Option(
+        True, help="Ask each harness whether it can run before spending a build on it."
+    ),
     gate_repo: str | None = typer.Option(
         None, "--gate-repo", help="Local checkout to run scanners and the committee on."
     ),
@@ -715,6 +753,9 @@ def build(
     from .capacity import Runtime
     from .orchestrator import BuildRecord, BuildState, Orchestrator
 
+    if probe:
+        _probe_harnesses()
+
     async def run() -> None:
         scheduler_url = _scheduler_url()
         try:
@@ -727,6 +768,7 @@ def build(
                         "require_strong_planning": True,
                         "max_ci_fix_cycles": 2,
                         "max_hours": max_hours,
+                        "fast": fast,
                     },
                 )
             response.raise_for_status()
