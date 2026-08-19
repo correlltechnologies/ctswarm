@@ -267,12 +267,13 @@ fi
 say "Configuration"
 # ---------------------------------------------------------------------------
 # Writes a key only when .env has it present and empty, so an operator's value
-# and a value from an earlier run both survive. The value arrives through the
-# environment rather than argv, because a process list is world-readable.
+# and a value from an earlier run both survive. A shell function's arguments are
+# not a process argument list, so the secret never reaches `ps`; it is handed to
+# python through the environment for the same reason.
 fill_if_empty() {
-  local key="$1"
-  [[ -n "${CTSWARM_FILL_VALUE:-}" ]] || return 1
-  CTSWARM_FILL_KEY="$key" python3 - <<'PYEOF'
+  local key="$1" value="$2"
+  [[ -n "$value" ]] || return 1
+  CTSWARM_FILL_KEY="$key" CTSWARM_FILL_VALUE="$value" python3 - <<'PYEOF'
 import os
 from pathlib import Path
 
@@ -309,10 +310,10 @@ else
   # agent containers went off to open a pull request with no token, at the end
   # of a build rather than before it.
   if have gh && gh auth status >/dev/null 2>&1; then
-    if CTSWARM_FILL_VALUE=$(gh auth token 2>/dev/null) && fill_if_empty GH_TOKEN; then
+    if TOKEN=$(gh auth token 2>/dev/null) && fill_if_empty GH_TOKEN "$TOKEN"; then
       ok "GH_TOKEN from gh cli"
     fi
-    unset CTSWARM_FILL_VALUE
+    unset TOKEN
   fi
   if [[ -f .env ]]; then
     ok ".env present; existing values left untouched"

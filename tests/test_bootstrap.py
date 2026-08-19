@@ -85,12 +85,19 @@ def _fill_if_empty_source() -> str:
 
 
 def _fill(env_text: str, key: str, value: str, tmp_path: Path) -> tuple[bool, str]:
+    """Call the function exactly as bootstrap.sh calls it.
+
+    The first version of this helper exported the value into the subprocess
+    environment itself. That passed while the shipped call site left the value
+    in an unexported shell variable, so the function saw nothing and died on the
+    real host. A test that supplies what the caller forgets is not a test.
+    """
     (tmp_path / ".env").write_text(env_text, encoding="utf-8")
     completed = subprocess.run(
-        ["bash", "-c", f'{_fill_if_empty_source()}\nfill_if_empty "$1"', "_", key],
+        ["bash", "-c", f'{_fill_if_empty_source()}\nfill_if_empty "$1" "$2"', "_", key, value],
         capture_output=True,
         cwd=tmp_path,
-        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "CTSWARM_FILL_VALUE": value},
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin"},
     )
     return completed.returncode == 0, (tmp_path / ".env").read_text(encoding="utf-8")
 
