@@ -152,6 +152,12 @@ function OperatorNarrative({ build, nodes }: { build: Build; nodes: TraceNode[] 
   )
 }
 
+const TIER_LABELS: Record<string, string> = {
+  scoped: "Scoped · one change, ~3 harness calls",
+  fast: "Fast · single pass",
+  full: "Full factory · 400+ agents",
+}
+
 export function BuildDetail({
   build,
   trace,
@@ -229,6 +235,7 @@ export function BuildDetail({
 
       {(build.project_path || build.scm_provider || build.mcp_servers?.length) && <Card><CardHeader><CardTitle>Workflow context</CardTitle><CardDescription>The repository and existing tool configuration attached when this swarm was launched.</CardDescription></CardHeader><CardContent className="grid gap-px bg-border p-0 sm:grid-cols-2 xl:grid-cols-4">{[
         ["Project folder", build.project_path || build.repo_url],
+        ["Tier", TIER_LABELS[build.tier || ""] || build.tier || "Unknown"],
         ["Git provider", (build.scm_provider || "other").replaceAll("_", " ")],
         ["Starting branch", build.source_branch || "Remote default"],
         ["Inherited MCP servers", build.mcp_servers?.map((server) => server.replace(/^claude:|^codex:/, "")).join(", ") || "None"],

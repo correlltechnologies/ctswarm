@@ -16,6 +16,10 @@ export type Build = {
   scm_provider?: string
   source_branch?: string
   create_pull_request?: boolean
+  // Which pipeline ran this build. Absent only on records written before
+  // tiers existed; the scheduler reports those as `full`, which is what they
+  // were.
+  tier?: string
   mcp_servers?: string[]
   delivery_notice?: string
   routing_policy?: RoutingPolicy

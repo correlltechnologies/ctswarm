@@ -57,6 +57,53 @@ Then:
 ./.venv/bin/ctswarm status
 ```
 
+## Three tiers, and why the default is the smallest
+
+The three entry points differ by roughly two orders of magnitude in cost, and
+until they were selectable every request paid for the largest one. Adding a
+button ran a product manager, an architect, a tech lead, and a sprint planner
+before a line of code existed.
+
+| Tier | Entry point | Shape | Cost |
+|---|---|---|---|
+| `scoped` | `ctswarm/scoped.py`, in-process | Clone, branch, implement, test, review, PR | ~3 harness invocations |
+| `fast` | `swe-fast.build` | Single pass: plan tasks, do them, verify once, PR | ~12 nodes |
+| `full` | `swe-planner.build` | PRD, architecture, issue DAG, parallel worktrees, acceptance | 400+ agent instances |
+
+```bash
+./.venv/bin/ctswarm build "add a button that clears the form" --repo URL
+./.venv/bin/ctswarm build "build the whole billing flow" --repo URL --tier full
+```
+
+Mission Control offers the same three as a selector on the launcher, with the
+cost printed on each option, and every build detail page reports the tier it ran
+on. Records written before tiers existed report as `full`, which is what they
+were, so the ledger can answer how often decomposition is genuinely needed.
+
+`scoped` is the default because most requests are one change. It runs in the
+scheduler process and never reaches AgentField, so a scoped build needs neither
+the control plane, the build database, nor either agent container.
+
+Four rules make it fail closed rather than fail quietly, and each one is a bug
+the full pipeline had to be patched for:
+
+- **The change gate runs before the reviewer.** Git decides whether work
+  happened, not the harness's own report, and a coder that claims completion
+  having changed nothing is rejected without a review being spent on it.
+- **A reviewer that errors is a rejection**, never an approval and never a skip.
+  So is a review with no verdict line.
+- **A scanner that could not run has not passed.** An approving reviewer cannot
+  vote away a gate that never executed.
+- **Every harness invocation is metered**, including the ones that failed.
+  `CapacityManager.record_usage` previously had no caller anywhere, so the
+  ledger saw no harness calls, headroom reported available forever, and the
+  first real sign of a spent subscription arrived as an empty verifier response
+  mid-build.
+
+Independence is still by vendor: with both subscriptions available Claude
+implements and Codex reviews. With one, the build says so in its own result
+rather than presenting a self-review as an independent one.
+
 Builds enter the durable scheduler on `127.0.0.1:8092`. It enforces the
 shared-resource concurrency limit and resumes monitoring the same AgentField
 execution after a restart. The same endpoint serves Mission Control, combining

@@ -5,10 +5,42 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { api } from "@/lib/api"
+import { cn } from "@/lib/utils"
 import type { Build, McpServer, ProjectSummary } from "@/types"
 
 const selectClass = "h-10 w-full min-w-0 rounded-[6px] border bg-background px-3 text-sm outline-none focus-visible:border-foreground focus-visible:ring-2 focus-visible:ring-ring/30"
 const textareaClass = "min-h-40 w-full resize-y rounded-[6px] border-0 bg-transparent px-0 py-1 text-base leading-7 outline-none placeholder:text-muted-foreground focus-visible:ring-0"
+
+// The three entry points differ by roughly two orders of magnitude in cost, so
+// the cost sits on the control rather than in documentation nobody opens at the
+// moment of choosing. Ordered cheapest first, and `scoped` is preselected,
+// because most requests are one change and the previous behaviour made adding a
+// button cost what building a product costs.
+const TIERS = [
+  {
+    id: "scoped",
+    name: "Scoped",
+    cost: "~3 harness calls",
+    blurb: "One change on one branch: implement, run the repo's tests, independent review, draft PR.",
+    fits: "Best for: add a button, fix a bug, change this file like this.",
+  },
+  {
+    id: "fast",
+    name: "Fast",
+    cost: "~12 agents",
+    blurb: "A single pass: plan the tasks, do them, verify once, open the PR. No committee, no repair loop.",
+    fits: "Best for: a small feature touching a few files.",
+  },
+  {
+    id: "full",
+    name: "Full factory",
+    cost: "400+ agents",
+    blurb: "Requirements, architecture, a dependency-sorted issue DAG, parallel worktrees, integration, acceptance.",
+    fits: "Best for: work that genuinely has to be decomposed first.",
+  },
+] as const
+
+type TierId = (typeof TIERS)[number]["id"]
 
 const SCM_OPTIONS = [
   ["github", "GitHub"],
@@ -49,6 +81,7 @@ export function SwarmLauncher({ initialProjectId = "", onLaunched }: { initialPr
   const [scmProvider, setScmProvider] = useState("github")
   const [sourceBranch, setSourceBranch] = useState("")
   const [goal, setGoal] = useState("")
+  const [tier, setTier] = useState<TierId>("scoped")
   const [servers, setServers] = useState<McpServer[]>([])
   const [selectedServers, setSelectedServers] = useState<string[]>([])
   const [inheritMcp, setInheritMcp] = useState(true)
@@ -137,6 +170,7 @@ export function SwarmLauncher({ initialProjectId = "", onLaunched }: { initialPr
           mcp_servers: inheritMcp ? selectedServers : [],
           require_strong_planning: strongPlanning,
           max_hours: Number(maxHours) || 0,
+          tier,
         }),
       })
       onLaunched(build)
@@ -184,6 +218,41 @@ export function SwarmLauncher({ initialProjectId = "", onLaunched }: { initialPr
             <label htmlFor="swarm-goal" className="sr-only">What should the swarm build?</label>
             <textarea id="swarm-goal" className={textareaClass} value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Describe the feature, fix, or application you want delivered. Include the user flow and what must be true before it is accepted." />
           </CardContent>
+          <fieldset className="border-t p-5 sm:p-6">
+            <legend className="sr-only">How much machinery to run</legend>
+            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+              <p className="text-[10px] uppercase tracking-[.12em] text-muted-foreground">How much machinery</p>
+              <p className="text-xs leading-5 text-muted-foreground">{TIERS.find((option) => option.id === tier)?.fits}</p>
+            </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="How much machinery to run">
+              {TIERS.map((option) => {
+                const active = tier === option.id
+                return (
+                  <label
+                    key={option.id}
+                    className={cn(
+                      "flex cursor-pointer flex-col gap-1 rounded-[6px] border p-3 transition-colors focus-within:ring-2 focus-within:ring-ring/30",
+                      active ? "border-foreground bg-muted/40" : "hover:bg-muted/20",
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="tier"
+                      value={option.id}
+                      checked={active}
+                      onChange={() => setTier(option.id)}
+                      className="sr-only"
+                    />
+                    <span className="flex flex-wrap items-baseline justify-between gap-2">
+                      <span className="text-sm font-medium">{option.name}</span>
+                      <span className="font-mono text-[10px] tabular-nums text-muted-foreground">{option.cost}</span>
+                    </span>
+                    <span className="text-xs leading-5 text-muted-foreground">{option.blurb}</span>
+                  </label>
+                )
+              })}
+            </div>
+          </fieldset>
           <div className="flex flex-col gap-3 border-t bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
             <p className="min-w-0 break-words text-xs leading-5 text-muted-foreground">{selectedProject?.remote_url || (manual ? manualRemote || "Remote URL required" : "Select the exact repository before sending")}</p>
             <Button type="submit" className="shrink-0" disabled={!canSubmit || submitting}>{submitting ? "Starting swarm…" : "Start swarm"}</Button>
@@ -199,7 +268,7 @@ export function SwarmLauncher({ initialProjectId = "", onLaunched }: { initialPr
             <CardContent className="space-y-4">
               <label className="block space-y-2 text-xs font-medium">Starting branch<Input value={sourceBranch} onChange={(event) => setSourceBranch(event.target.value)} placeholder="Remote default branch" /></label>
               <label className="flex items-start gap-3 text-sm"><input type="checkbox" className="mt-1 size-4 accent-foreground" checked={createPullRequest} disabled={scmProvider !== "github"} onChange={(event) => setCreatePullRequest(event.target.checked)} /><span><span className="block font-medium">Create a pull request</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">Automatic publishing is currently available for GitHub. Other providers run and verify the build, but do not publish it automatically yet.</span></span></label>
-              <label className="flex items-start gap-3 text-sm"><input type="checkbox" className="mt-1 size-4 accent-foreground" checked={strongPlanning} onChange={(event) => setStrongPlanning(event.target.checked)} /><span><span className="block font-medium">Strong planning and acceptance</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">Use subscription capacity for planning, issue definition, independent review, and acceptance when available.</span></span></label>
+              <label className={cn("flex items-start gap-3 text-sm", tier !== "full" && "opacity-60")}><input type="checkbox" className="mt-1 size-4 accent-foreground" checked={strongPlanning && tier === "full"} disabled={tier !== "full"} onChange={(event) => setStrongPlanning(event.target.checked)} /><span><span className="block font-medium">Strong planning and acceptance</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{tier === "full" ? "Use subscription capacity for planning, issue definition, independent review, and acceptance when available." : "Only applies to the full factory. Scoped and fast builds have no planning tier to strengthen; both still run an independent review."}</span></span></label>
               <label className="block space-y-2 text-xs font-medium">Build deadline in hours<Input type="number" min="0" max="720" step="0.5" value={maxHours} onChange={(event) => setMaxHours(event.target.value)} /><span className="block font-normal leading-5 text-muted-foreground">Use 0 for no automatic deadline. Pause and stop remain available.</span></label>
             </CardContent>
           </Card>
