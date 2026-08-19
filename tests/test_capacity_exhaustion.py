@@ -339,3 +339,75 @@ def test_a_missing_binary_is_not_something_to_route_work_to(on_path) -> None:
 
     assert usable is False
     assert "PATH" in detail
+
+
+# --- a credentials file the CLI has blanked out -----------------------------
+#
+# When an OAuth refresh fails, Claude Code rewrites this file with empty token
+# strings and expiresAt 0, keeping the harmless fields. That is a valid,
+# non-empty JSON object describing no login, so the generic credential check
+# reported a working subscription while every invocation returned
+# "OAuth access token has been revoked".
+
+_WIPED = {
+    "claudeAiOauth": {
+        "accessToken": "",
+        "refreshToken": "",
+        "expiresAt": 0,
+        "subscriptionType": "max",
+    }
+}
+_LIVE = {
+    "claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-example",
+        "refreshToken": "sk-ant-ort01-example",
+        "expiresAt": 1789489539531,
+        "subscriptionType": "max",
+    }
+}
+
+
+def _write_claude(payload) -> None:
+    path = Path.home() / ".claude" / ".credentials.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_a_blanked_credentials_file_is_not_a_login(monkeypatch) -> None:
+    from ctswarm.capacity import _claude_login_present
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    _write_claude(_WIPED)
+
+    assert _claude_login_present({}) is False
+
+
+def test_a_real_token_is_still_a_login(monkeypatch) -> None:
+    from ctswarm.capacity import _claude_login_present
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    _write_claude(_LIVE)
+
+    assert _claude_login_present({}) is True
+
+
+def test_an_unfamiliar_shape_is_not_treated_as_absent(monkeypatch) -> None:
+    """A false negative here blocks every build on a host that works fine."""
+    from ctswarm.capacity import _claude_login_present
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    _write_claude({"someOtherShape": {"token": "abc"}})
+
+    assert _claude_login_present({}) is True
+
+
+def test_doctor_warns_about_a_login_a_build_will_destroy(monkeypatch) -> None:
+    from ctswarm.cli import _claude_login_is_the_fragile_kind
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    _write_claude(_LIVE)
+    assert _claude_login_is_the_fragile_kind() is True
+
+    # A long-lived token means the file is not what the harnesses use.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-headless")
+    assert _claude_login_is_the_fragile_kind() is False

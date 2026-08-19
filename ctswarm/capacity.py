@@ -156,6 +156,40 @@ def _has_credentials(path) -> bool:
     return isinstance(payload, dict) and bool(payload)
 
 
+def _claude_tokens_present(path) -> bool:
+    """Whether the Claude credentials file still holds a usable token.
+
+    Not the same question as `_has_credentials`. When a refresh fails, the CLI
+    rewrites this file with empty `accessToken` and `refreshToken` strings and
+    `expiresAt: 0`, keeping the harmless fields like `subscriptionType`. The
+    result is a perfectly valid non-empty JSON object describing no login at
+    all, so the generic check called it a working subscription while every
+    actual invocation returned "OAuth access token has been revoked".
+
+    That state is not exotic. It is what a shared credential file looks like
+    after a build has been running against it, which is why it is worth its own
+    predicate rather than a comment on the old one.
+    """
+    try:
+        if not path.is_file():
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or not payload:
+        return False
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        # An unfamiliar shape is not evidence of absence: some installs store
+        # the token differently, and refusing them would be a false negative
+        # that blocks every build on a working host.
+        return True
+    return any(
+        isinstance(oauth.get(field), str) and oauth[field].strip()
+        for field in ("accessToken", "refreshToken")
+    )
+
+
 # What each harness is asked during a probe, and how long it gets to answer.
 # The prompt is deliberately trivial: the question is "can this CLI do anything
 # at all", not "is it any good".
@@ -298,7 +332,7 @@ def _claude_login_present(env: dict) -> bool:
     # so the container bind mount resolves to a file rather than a directory,
     # so a bare `.exists()` would report a login on a host that has none -- and
     # a build would launch against a harness that refuses on its first call.
-    if _has_credentials(credentials):
+    if _claude_tokens_present(credentials):
         return True
 
     if sys.platform != "darwin":

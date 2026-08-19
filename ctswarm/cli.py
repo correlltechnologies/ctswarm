@@ -186,7 +186,32 @@ def _print_credentials(*, subscriptions_only: bool) -> None:
     for name, (available, fix) in creds.items():
         cred_table.add_row(name, _ok(available), "" if available else fix)
     console.print(cred_table)
+    if _claude_login_is_the_fragile_kind():
+        # A working credential that running a build will destroy deserves saying
+        # out loud, because the failure arrives hours later and looks like
+        # something else. Claude Code's OAuth refresh rotates the refresh token,
+        # the agent containers share this one file, and a replayed rotation
+        # revokes the whole chain. `claude setup-token` mints a long-lived token
+        # that needs no rotation, which is why it is the advice everywhere else.
+        console.print(
+            "\n[yellow]This host's Claude login is an interactive one "
+            "(~/.claude/.credentials.json).[/yellow]\n"
+            "[dim]Builds share that file across containers, and Claude's OAuth "
+            "refresh rotates it. A rotation that cannot be shared gets replayed, "
+            "and the login is revoked mid-build.\n"
+            "Run `claude setup-token` and put the value in .env as "
+            "CLAUDE_CODE_OAUTH_TOKEN.[/dim]"
+        )
     console.print()
+
+
+def _claude_login_is_the_fragile_kind() -> bool:
+    """A file-based Claude login with no long-lived token to use instead."""
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return False
+    from .capacity import _claude_tokens_present
+
+    return _claude_tokens_present(Path.home() / ".claude" / ".credentials.json")
 
 
 def _credential_status(*, subscriptions_only: bool = False) -> dict[str, tuple[bool, str]]:

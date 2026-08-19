@@ -278,7 +278,20 @@ services:
       # Mount only the Claude credential, not the entire host profile. The full
       # profile can contain thousands of skills and hundreds of MB of caches;
       # exposing it made every CLI invocation scan unrelated host state.
-      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+      # NOT read-only, and that is the whole point. Claude Code's OAuth refresh
+      # rotates the refresh token: each refresh issues a new one and invalidates
+      # the old. A container that cannot write the rotation back keeps replaying
+      # a token the provider has already retired, which is treated as a replay
+      # attack and revokes the entire chain. That is not hypothetical; it is how
+      # an eight-hour build ended with "OAuth access token has been revoked" and
+      # a credentials file the CLI had blanked out.
+      #
+      # Writable is a mitigation, not a fix. Three processes share this one file
+      # (the host CLI and both agents) and they can still race. The supported
+      # path for an unattended host is CLAUDE_CODE_OAUTH_TOKEN from
+      # `claude setup-token`, which is long-lived, needs no rotation, and is
+      # what `ctswarm doctor` asks for.
+      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json
       # MCP configuration comes from the ctswarm registry, not from the host
       # profile. Mounting ${HOME}/.claude.json here gave every build every MCP
       # server on the box, with no way to add, remove, or scope one. These two
@@ -343,7 +356,20 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./infra/opencode/opencode.json:/root/.config/opencode/opencode.json:ro
-      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+      # NOT read-only, and that is the whole point. Claude Code's OAuth refresh
+      # rotates the refresh token: each refresh issues a new one and invalidates
+      # the old. A container that cannot write the rotation back keeps replaying
+      # a token the provider has already retired, which is treated as a replay
+      # attack and revokes the entire chain. That is not hypothetical; it is how
+      # an eight-hour build ended with "OAuth access token has been revoked" and
+      # a credentials file the CLI had blanked out.
+      #
+      # Writable is a mitigation, not a fix. Three processes share this one file
+      # (the host CLI and both agents) and they can still race. The supported
+      # path for an unattended host is CLAUDE_CODE_OAUTH_TOKEN from
+      # `claude setup-token`, which is long-lived, needs no rotation, and is
+      # what `ctswarm doctor` asks for.
+      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json
       # Rendered from the ctswarm MCP registry; see swe-agent above.
       - ./var/mcp/claude.json:/root/.claude.json.seed:ro
       - ./var/mcp/codex.toml:/root/.codex/config.toml:ro
