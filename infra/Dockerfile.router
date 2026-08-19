@@ -15,10 +15,36 @@ RUN npm run build -- --outDir /dashboard-dist
 FROM python:3.12-slim
 
 # curl is used by health checks; Git powers the dashboard's read-only repository
-# history and worktree inventory.
+# history and worktree inventory, and is also how a scoped build clones, branches,
+# and diffs.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl git \
+    && apt-get install -y --no-install-recommends curl git ca-certificates gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# The scoped tier runs its work here rather than on an agent node, so this image
+# needs the two harnesses and gh. That is a real size cost, and it buys the
+# removal of four services for every build that does not need decomposition.
+#
+# Deliberately not the full agent image: no Chromium, no browser driver, no
+# OpenCode. A scoped change is verified by the repository's own test suite and
+# an independent reviewer, and a build that genuinely needs a browser belongs on
+# the fast or full tier.
+ARG INSTALL_HARNESSES=1
+RUN if [ "$INSTALL_HARNESSES" = "1" ]; then \
+        apt-get update \
+        && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+        && apt-get install -y --no-install-recommends nodejs \
+        && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+             -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+        && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+             > /etc/apt/sources.list.d/github-cli.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends gh \
+        && npm install -g @anthropic-ai/claude-code @openai/codex \
+        && npm cache clean --force \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 
@@ -39,14 +65,15 @@ COPY --from=dashboard-builder /dashboard-dist ./ctswarm/static/dashboard
 # Writable state lives on a volume, never in the image layer, so a container
 # restart preserves the ledger. Probe 5 restarts the stack mid-build and asserts
 # that recorded state survived.
-RUN mkdir -p /state
+RUN mkdir -p /state /workspaces
 ENV CTSWARM_DB=/state/ctswarm.db \
     CTSWARM_ROUTING=/bench-results/routing.json \
+    CTSWARM_SCOPED_WORKSPACES=/workspaces \
     PYTHONUNBUFFERED=1
 
 # Run as a non-root user. The router needs no privileged access at all.
 RUN useradd --create-home --uid 10001 ctswarm \
-    && chown -R ctswarm:ctswarm /app /state
+    && chown -R ctswarm:ctswarm /app /state /workspaces
 USER ctswarm
 
 EXPOSE 8090

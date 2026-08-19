@@ -88,7 +88,15 @@ services:
     logging: *pi-logging
 
   ctswarm-scheduler:
-    mem_limit: ${CTSWARM_PI_SCHEDULER_MEM:-384m}
+    # Higher than the 384m this needed as a pure control plane, because scoped
+    # builds now run in this container: a Claude Code process, a git checkout,
+    # and the target repository's own test run.
+    #
+    # This is the number to revisit first if the board runs out. The four SWE-AF
+    # services hold 2,880m of the container budget and only the fast and full
+    # tiers use them, so a host that has settled on scoped work can put them
+    # behind a profile and give the memory back to this service.
+    mem_limit: ${CTSWARM_PI_SCHEDULER_MEM:-1024m}
     environment:
       - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
       - ANTHROPIC_API_KEY=
@@ -111,8 +119,16 @@ services:
     # re-reading the base service after changing either file.
     volumes: !override
       - ctswarm-state:/state
+      - ctswarm-workspaces:/workspaces
       - ./bench/results:/bench-results:ro
       - ${CTSWARM_CODEX_HOME:-${HOME}/.codex}:/home/ctswarm/.codex:ro
+      # Scoped builds invoke `claude` from this container, so it needs a
+      # login. Two routes work and only one needs this mount:
+      # CLAUDE_CODE_OAUTH_TOKEN (already passed above) needs nothing else,
+      # and is the route to use when the credential file is 0600 and owned
+      # by the host account, because this service runs as uid 10001 and
+      # cannot read it. When ownership does permit, this mount is enough.
+      - ${CTSWARM_CLAUDE_CREDENTIALS:-${HOME}/.claude/.credentials.json}:/home/ctswarm/.claude/.credentials.json:ro
       # Rendered MCP configuration: writable here, read-only in the agents.
       - ./var/mcp:/mcp-config
       # Read-only sources for the one-time import of the host's own servers.

@@ -177,8 +177,20 @@ services:
       - "${CTSWARM_MCP_GID:-0}"
     volumes:
       - ctswarm-state:/state
+      # Scoped builds clone here. A named volume rather than a bind mount:
+      # these are disposable checkouts that must never be able to reach the
+      # operator's own working tree, and one per build is removed on the next
+      # run with the same id.
+      - ctswarm-workspaces:/workspaces
       - ./bench/results:/bench-results:ro
       - ${HOME}/.codex:/home/ctswarm/.codex:ro
+      # Scoped builds invoke `claude` from this container, so it needs a
+      # login. Two routes work and only one needs this mount:
+      # CLAUDE_CODE_OAUTH_TOKEN (already passed above) needs nothing else,
+      # and is the route to use when the credential file is 0600 and owned
+      # by the host account, because this service runs as uid 10001 and
+      # cannot read it. When ownership does permit, this mount is enough.
+      - ${CTSWARM_CLAUDE_CREDENTIALS:-${HOME}/.claude/.credentials.json}:/home/ctswarm/.claude/.credentials.json:ro
       # The rendered MCP configuration. Writable here and read-only in the
       # agents: exactly one process decides what the harnesses can reach.
       - ./var/mcp:/mcp-config
@@ -382,4 +394,5 @@ services:
     logging: *ctswarm-logging
 
 volumes:
+  ctswarm-workspaces:
   ctswarm-state:
