@@ -500,11 +500,47 @@ def verify(
 
 
 @app.command()
-def capacity() -> None:
-    """Show remaining headroom per runtime and which one would be chosen."""
-    from .capacity import CapacityManager
+def capacity(
+    rate_limited: str | None = typer.Option(
+        None,
+        "--rate-limited",
+        help="Record that a runtime is out of usage: claude_code | codex.",
+    ),
+    clear_limit: str | None = typer.Option(
+        None,
+        "--clear-limit",
+        help="Withdraw a recorded exhaustion: claude_code | codex.",
+    ),
+) -> None:
+    """Show remaining headroom per runtime and which one would be chosen.
+
+    Exhaustion is normally recorded automatically, from the failure a build
+    reports. `--rate-limited` is for the case the product cannot see: you
+    already know a subscription is spent and would rather reroute the next
+    build than discover it by stalling one.
+    """
+    from .capacity import CapacityManager, Runtime
 
     manager = CapacityManager()
+
+    def _runtime(value: str, flag: str) -> Runtime:
+        try:
+            return Runtime(value.strip().lower())
+        except ValueError:
+            console.print(
+                f"[red]{flag} expects a runtime name, not {value!r}.[/red] "
+                "Valid: claude_code, codex, open_code"
+            )
+            raise typer.Exit(2) from None
+
+    if rate_limited:
+        runtime = _runtime(rate_limited, "--rate-limited")
+        manager.note_rate_limited(runtime, detail="recorded by the operator")
+        console.print(f"Recorded: [bold]{runtime.value}[/bold] is out of usage.")
+    if clear_limit:
+        runtime = _runtime(clear_limit, "--clear-limit")
+        manager.clear_rate_limited(runtime)
+        console.print(f"Cleared: [bold]{runtime.value}[/bold] is usable again.")
     table = Table("runtime", "available", "remaining", "spent", "why", box=None)
     for name, info in manager.report().items():
         table.add_row(

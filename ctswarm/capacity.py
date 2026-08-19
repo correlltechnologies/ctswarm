@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -50,6 +51,47 @@ class Runtime(str, Enum):
         """Whether this runtime draws on a metered subscription rather than
         local hardware."""
         return self in (Runtime.CLAUDE_CODE, Runtime.CODEX)
+
+
+# What an exhausted subscription actually says. Neither CLI reports quota as a
+# structured field, so the only signal is the wording of the failure: Claude says
+# "Claude AI usage limit reached", Codex says "You've hit your usage limit", and
+# both surface bare HTTP 429s through the harness. Keep this in one place: the
+# same wording has to be recognized by the mid-build failover inside the agent
+# container and by the orchestrator watching the build from outside, and two
+# copies of a regex like this drift into disagreeing about the same failure.
+_EXHAUSTION = re.compile(
+    r"(usage limit|quota|rate.?limit|429|too many requests|credit balance|"
+    r"insufficient credits|billing.{0,20}(expired|inactive|suspended))",
+    re.IGNORECASE,
+)
+
+_RUNTIME_HINTS: tuple[tuple[Runtime, re.Pattern[str]], ...] = (
+    (Runtime.CLAUDE_CODE, re.compile(r"claude|anthropic|sonnet|opus|haiku", re.I)),
+    (Runtime.CODEX, re.compile(r"codex|openai|chatgpt|gpt-", re.I)),
+)
+
+
+def rate_limit_signal(text: str, *, default: Runtime | None = None) -> Runtime | None:
+    """Which runtime a failure message says is out of capacity, if any.
+
+    Three outcomes, and the middle one is the point. Text that is not an
+    exhaustion report at all gives ``None``. Text that names exactly one
+    harness gives that harness. Text that names *both* also gives ``None``,
+    even when the caller passed a ``default``: two explicitly named candidates
+    contradict the caller's assumption rather than confirming it, and recording
+    the wrong runtime holds a working subscription out of service for a whole
+    window. That is worse than missing an exhaustion the next failure will
+    report again anyway. ``default`` covers the remaining case, an exhaustion
+    that names nobody, where the caller's own knowledge (the build's runtime,
+    say) is the best evidence available.
+    """
+    if not text or not _EXHAUSTION.search(text):
+        return None
+    named = [runtime for runtime, hint in _RUNTIME_HINTS if hint.search(text)]
+    if len(named) == 1:
+        return named[0]
+    return None if named else default
 
 
 @dataclass(frozen=True)
@@ -306,6 +348,52 @@ class CapacityManager:
             "runtime_rate_limited", {"runtime": runtime.value, "detail": detail[:300]}
         )
 
+    def clear_rate_limited(self, runtime: Runtime) -> None:
+        """Withdraw an exhaustion report, so the runtime is usable again now.
+
+        Needed because the report is a guess in two directions. The window is a
+        configured default rather than the real reset time, so a subscription
+        can come back before it rolls; and a transient 429 reads the same as a
+        spent allowance, so a runtime can be held out for hours over a blip.
+        Ledger history is append-only, so this supersedes rather than deletes:
+        the exhaustion still happened and is still auditable.
+        """
+        self.ledger.record_event(
+            "runtime_rate_limit_cleared", {"runtime": runtime.value}
+        )
+
+    def _rate_limit_cooldown_until(self, runtime: Runtime, window_start: float) -> float:
+        """When a reported exhaustion stops holding this runtime out."""
+        budget = self.budgets.get(runtime)
+        window = budget.window_seconds if budget else 18000.0
+
+        def _matches(event: dict) -> bool:
+            try:
+                detail = json.loads(event["detail"])
+            except (ValueError, TypeError):
+                return False
+            return isinstance(detail, dict) and detail.get("runtime") == runtime.value
+
+        cleared_at = max(
+            (
+                event["ts"]
+                for event in self.ledger.events(kind="runtime_rate_limit_cleared")
+                if _matches(event)
+            ),
+            default=0.0,
+        )
+        return max(
+            (
+                event["ts"] + window
+                for event in self.ledger.events(kind="runtime_rate_limited")
+                if _matches(event) and event["ts"] >= window_start
+                # An operator who says the subscription is back outranks a report
+                # from before they said it. Later exhaustions still count.
+                and event["ts"] > cleared_at
+            ),
+            default=0.0,
+        )
+
     def headroom(self, runtime: Runtime) -> Headroom:
         """Remaining capacity for a runtime in its current window."""
         budget = self.budgets.get(runtime)
@@ -331,21 +419,7 @@ class CapacityManager:
 
         # An observed rate limit inside this window overrides the estimate and
         # holds the runtime out until the window rolls past it.
-        cooldown_until = 0.0
-        for event in self.ledger.events(kind="runtime_rate_limited"):
-            import json
-
-            try:
-                detail = json.loads(event["detail"])
-            except (ValueError, TypeError):
-                continue
-            if detail.get("runtime") != runtime.value:
-                continue
-            if event["ts"] >= window_start:
-                cooldown_until = max(
-                    cooldown_until,
-                    event["ts"] + (budget.window_seconds if budget else 18000.0),
-                )
+        cooldown_until = self._rate_limit_cooldown_until(runtime, window_start)
 
         if cooldown_until > now:
             return Headroom(
@@ -355,7 +429,10 @@ class CapacityManager:
                 spent,
                 calls,
                 cooldown_until,
-                "rate limited; waiting for the window to roll",
+                "rate limited; about "
+                f"{max(1, round((cooldown_until - now) / 60))} min left in the "
+                "window, or clear it with `ctswarm capacity --clear-limit "
+                f"{runtime.value}`",
             )
 
         if not budget or budget.max_usd <= 0:

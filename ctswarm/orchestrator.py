@@ -36,7 +36,7 @@ from pathlib import Path
 
 import httpx
 
-from .capacity import CapacityManager, Runtime
+from .capacity import CapacityManager, Runtime, rate_limit_signal
 from .execution_mode import subscription_only
 from .ledger import Ledger
 from .routing_config import (
@@ -88,6 +88,10 @@ class BuildRecord:
     error: str = ""
     gate_results: dict = field(default_factory=dict)
     _progress_fingerprint: str = field(default="", repr=False)
+    # Which runtimes this build has already reported as exhausted. `poll` runs
+    # every few seconds against an unchanging failure message, so without this
+    # one rate limit would write hundreds of identical ledger events.
+    _rate_limited_seen: set = field(default_factory=set, repr=False)
 
     @property
     def elapsed_s(self) -> float:
@@ -599,7 +603,33 @@ class Orchestrator:
         except (httpx.HTTPError, ValueError):
             return record
 
-        return update_record_from_execution(record, body)
+        record = update_record_from_execution(record, body)
+        self._note_any_exhaustion(record)
+        return record
+
+    def _note_any_exhaustion(self, record: BuildRecord) -> None:
+        """Turn "the build failed because a subscription ran out" into a fact.
+
+        `CapacityManager.headroom` already holds a rate-limited runtime out for
+        a full window, and `submit` already reroutes every role onto the other
+        harness when only one has headroom. Both were unreachable: nothing in
+        the product ever called `note_rate_limited`, so the ledger never learned
+        that a subscription was spent and the next build walked into the same
+        wall. The build's own runtime is the fallback attribution because a
+        message that says only "usage limit reached" is still evidence about
+        whoever was running.
+        """
+        text = " ".join(filter(None, (record.error, record.phase_detail)))
+        runtime = rate_limit_signal(text, default=record.runtime)
+        if runtime is None or runtime in record._rate_limited_seen:
+            return
+        record._rate_limited_seen.add(runtime)
+        self.capacity.note_rate_limited(runtime, detail=text)
+        self.ledger.record_event(
+            "runtime_exhausted_during_build",
+            {"runtime": runtime.value, "detail": text[:300]},
+            build_id=record.build_id,
+        )
 
     async def cancel_execution(self, record: BuildRecord, reason: str) -> bool:
         """Cooperatively stop the complete AgentField workflow tree.
