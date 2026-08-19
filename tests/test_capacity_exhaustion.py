@@ -332,13 +332,37 @@ def test_a_spent_subscription_is_caught(on_path) -> None:
     assert "usage limit" in detail
 
 
-def test_a_missing_binary_is_not_something_to_route_work_to(on_path) -> None:
+def test_a_missing_binary_reaches_no_verdict(on_path, monkeypatch) -> None:
+    """"I could not ask" must not be recorded as "it refused".
+
+    Both CLIs install to ~/.local/bin, which reaches PATH only through
+    ~/.profile, so a probe run non-interactively finds neither on a host where
+    both work. Returning False there marked two live subscriptions as rate
+    limited and blocked the build.
+    """
     from ctswarm.capacity import probe_runtime
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: on_path / "empty-home")
 
     usable, detail = probe_runtime(Runtime.CODEX, timeout_s=10)
 
-    assert usable is False
-    assert "PATH" in detail
+    assert usable is None
+    assert "not found" in detail
+
+
+def test_a_cli_outside_path_is_still_found(on_path, monkeypatch) -> None:
+    """~/.local/bin is where both CLIs actually live."""
+    from ctswarm.capacity import probe_runtime
+
+    home = on_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    _fake_cli(home / ".local" / "bin", "codex", stdout="OK", exit_code=0)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("PATH", "/bin:/usr/bin")
+
+    usable, _ = probe_runtime(Runtime.CODEX, timeout_s=10)
+
+    assert usable is True
 
 
 # --- a credentials file the CLI has blanked out -----------------------------

@@ -210,7 +210,32 @@ _PROBE_FAILURE = re.compile(
 )
 
 
-def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool, str]:
+def _harness_path() -> str:
+    """Where the harness CLIs actually live, not merely where PATH points.
+
+    Both install to ``~/.local/bin`` or an npm prefix, and those reach PATH
+    through ``~/.profile``, which a non-interactive shell never runs. So a probe
+    launched from a service, a cron job, or an ssh command sees no `claude` and
+    no `codex` on a host where both work perfectly. That false negative is worse
+    than no probe: it reported both harnesses dead and blocked a build on a
+    fully working board.
+    """
+    from pathlib import Path
+
+    home = Path.home()
+    extra = [
+        home / ".local" / "bin",
+        home / ".npm-global" / "bin",
+        home / "node_modules" / ".bin",
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),
+    ]
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    parts += [str(path) for path in extra if str(path) not in parts]
+    return os.pathsep.join(part for part in parts if part)
+
+
+def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool | None, str]:
     """Ask a harness whether it can run, by running it.
 
     Everything else in this module *reconstructs* headroom from observed usage,
@@ -226,18 +251,22 @@ def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool, 
     invocation per build, against a build that otherwise spends hundreds
     discovering the same fact the slow way.
 
-    Returns ``(usable, detail)``. ``usable`` is False when the binary is
-    missing, so a host that never installed a CLI is reported the same way as
-    one whose subscription is spent: not something to route work to.
+    Returns ``(usable, detail)``. ``usable`` is ``None`` when the probe could
+    not reach a verdict: the binary is missing, or it never answered. That is
+    deliberately not ``False``. "This harness refused" and "I could not ask"
+    are different facts, and recording the second as the first is how a probe
+    that could not find `claude` on its own PATH marked a working subscription
+    as rate limited and blocked the build it was supposed to protect.
     """
     command = _PROBE.get(runtime)
     if command is None:
-        return False, f"no probe defined for {runtime.value}"
-    if not shutil.which(command[0]):
-        return False, f"{command[0]} is not on PATH"
+        return None, f"no probe defined for {runtime.value}"
+    resolved = shutil.which(command[0], path=_harness_path())
+    if not resolved:
+        return None, f"{command[0]} was not found on this host"
     try:
         completed = subprocess.run(
-            command,
+            [resolved, *command[1:]],
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -245,9 +274,9 @@ def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool, 
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return False, f"{command[0]} did not answer within {timeout_s:.0f}s"
+        return None, f"{command[0]} did not answer within {timeout_s:.0f}s"
     except OSError as exc:
-        return False, f"{command[0]} could not be run: {exc}"
+        return None, f"{command[0]} could not be run: {exc}"
     output = f"{completed.stdout}\n{completed.stderr}".strip()
     if completed.returncode == 0 and not _PROBE_FAILURE.search(output):
         return True, "answered a trivial prompt"

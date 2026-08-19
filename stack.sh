@@ -199,6 +199,18 @@ export_login_facts() {
   # check drifting away from the first.
   local python=".venv/bin/python"
   [[ -x "$python" ]] || return 0
+  # .env is where CLAUDE_CODE_OAUTH_TOKEN lives, and it is the *supported* way
+  # to hold a Claude login on an unattended host. Computing these facts without
+  # it reported "no subscription login found" on a board whose token was sitting
+  # in that file, and the launch gate then refused the build. Compose already
+  # reads .env for interpolation; this is the same values reaching the code that
+  # answers the same question.
+  if [[ -f .env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+  fi
   local facts
   facts=$("$python" - 2>/dev/null <<'PYEOF'
 import os

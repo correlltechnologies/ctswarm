@@ -732,6 +732,14 @@ def _probe_harnesses() -> None:
 
     for runtime in (Runtime.CLAUDE_CODE, Runtime.CODEX):
         usable, detail = probe_runtime(runtime)
+        if usable is None:
+            # No verdict, so change nothing. Recording "could not ask" as
+            # "refused" is how this function marked two working subscriptions
+            # rate limited and blocked the build it exists to protect, because
+            # the CLIs live in ~/.local/bin and a non-interactive shell does not
+            # put that on PATH.
+            console.print(f"  [dim]{runtime.value} not probed: {detail}[/dim]")
+            continue
         action = "clear-limit" if usable else "rate-limited"
         try:
             httpx.post(
