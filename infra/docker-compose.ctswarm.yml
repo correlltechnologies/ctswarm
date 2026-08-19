@@ -221,6 +221,15 @@ services:
       # opencode provider/model references and ctswarm virtual models, which is
       # what lets one string satisfy both systems.
       - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-open_code}
+      # The mid-build failover inside this container has to know which world
+      # it is in. In hybrid mode an exhausted harness retries on local
+      # OpenCode; on a subscriptions-only host there is no local inference to
+      # retry against, so it must hand the role to the other subscription
+      # instead. The default matches ctswarm's own, so the two cannot disagree
+      # about the mode when the variable is unset.
+      - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
+      - CTSWARM_CLAUDE_FAILOVER_MODEL=${CTSWARM_CLAUDE_FAILOVER_MODEL:-sonnet}
+      - CTSWARM_CODEX_FAILOVER_MODEL=${CTSWARM_CODEX_FAILOVER_MODEL:-gpt-5.5}
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
       - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
@@ -296,6 +305,15 @@ services:
       - cp /root/.claude.json.seed /root/.claude.json && exec python -m swe_af.fast
     environment:
       - SWE_DEFAULT_RUNTIME=${SWE_DEFAULT_RUNTIME:-open_code}
+      # The mid-build failover inside this container has to know which world
+      # it is in. In hybrid mode an exhausted harness retries on local
+      # OpenCode; on a subscriptions-only host there is no local inference to
+      # retry against, so it must hand the role to the other subscription
+      # instead. The default matches ctswarm's own, so the two cannot disagree
+      # about the mode when the variable is unset.
+      - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
+      - CTSWARM_CLAUDE_FAILOVER_MODEL=${CTSWARM_CLAUDE_FAILOVER_MODEL:-sonnet}
+      - CTSWARM_CODEX_FAILOVER_MODEL=${CTSWARM_CODEX_FAILOVER_MODEL:-gpt-5.5}
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
       - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}

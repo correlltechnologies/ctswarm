@@ -18,30 +18,73 @@ index acc0a4c..c83e00b 100644
      _workspace_root,
  )
  
-@@ -92,7 +94,25 @@ async def _harness_with_scoped_credentials(*args, env=None, **kwargs):
+@@ -92,7 +94,68 @@ async def _harness_with_scoped_credentials(*args, env=None, **kwargs):
      run_id = (getattr(ctx, "run_id", None) if ctx else None) or ""
      base_env = dict(os.environ) if env is None else dict(env)
      merged_env = inject_credentials_into_env(base_env, run_id)
 -    return await _original_harness(*args, env=merged_env, **kwargs)
 +    result = await _original_harness(*args, env=merged_env, **kwargs)
 +    provider = str(kwargs.get("provider") or "")
-+    error_message = str(getattr(result, "error_message", "") or "")
-+    hosted_exhausted = re.search(
-+        r"(quota|rate.?limit|usage.?limit|credit balance|insufficient credits|"
-+        r"billing.{0,20}(expired|inactive|suspended))",
-+        error_message,
++    # The same wording as ctswarm's capacity.rate_limit_signal, deliberately.
++    # This decides the mid-build retry and that decides whether the *next*
++    # build avoids the spent harness; the two disagreeing means one of them
++    # acts on a rate limit the other cannot see.
++    exhausted = re.compile(
++        r"(usage limit|quota|rate.?limit|429|too many requests|credit balance|"
++        r"insufficient credits|billing.{0,20}(expired|inactive|suspended))",
 +        re.IGNORECASE,
 +    )
-+    if provider in {"claude", "claude-code", "codex"} and hosted_exhausted:
-+        fallback_kwargs = dict(kwargs)
++    error_message = str(getattr(result, "error_message", "") or "")
++    if provider not in {"claude", "claude-code", "codex"} or not exhausted.search(
++        error_message
++    ):
++        return result
++    # Where an exhausted harness sends its work. In subscriptions-only mode the
++    # answer cannot be OpenCode: that runtime needs a local inference server,
++    # and a host chosen for having no accelerator has none, so retrying there
++    # turns a recoverable rate limit into a confusing failure against a backend
++    # that was never running. The other subscription is the only real capacity
++    # left. Using it costs this role its independent reviewer, which is a
++    # degradation worth taking over a dead build and worth saying out loud.
++    subscriptions_only = (
++        os.environ.get("CTSWARM_EXECUTION_MODE", "subscription_only").strip().lower()
++        != "hybrid"
++    )
++    fallback_kwargs = dict(kwargs)
++    if not subscriptions_only:
 +        fallback_kwargs["provider"] = "opencode"
 +        fallback_kwargs["model"] = os.environ.get("SWE_MODEL_HIGH", "ctswarm/high")
-+        app.note(
-+            f"{provider} capacity unavailable; retrying this role on local OpenCode",
-+            tags=["runtime", "fallback", "local"],
++        target = "local OpenCode"
++    elif provider == "codex":
++        fallback_kwargs["provider"] = "claude"
++        fallback_kwargs["model"] = os.environ.get(
++            "CTSWARM_CLAUDE_FAILOVER_MODEL", "sonnet"
 +        )
-+        return await _original_harness(*args, env=merged_env, **fallback_kwargs)
-+    return result
++        target = "Claude"
++    else:
++        fallback_kwargs["provider"] = "codex"
++        fallback_kwargs["model"] = os.environ.get(
++            "CTSWARM_CODEX_FAILOVER_MODEL", "gpt-5.5"
++        )
++        target = "Codex"
++    app.note(
++        f"{provider} capacity unavailable; retrying this role on {target}",
++        tags=["runtime", "fallback"],
++    )
++    fallback = await _original_harness(*args, env=merged_env, **fallback_kwargs)
++    if subscriptions_only and exhausted.search(
++        str(getattr(fallback, "error_message", "") or "")
++    ):
++        # Both subscriptions are spent. A third attempt would only burn another
++        # agent timeout, and returning this quietly reads as a broken build
++        # rather than a spent allowance, so name it in the words ctswarm's
++        # poll recognizes as exhaustion.
++        app.note(
++            "both subscription harnesses report a usage limit; this build has "
++            "no capacity left to retry with",
++            tags=["runtime", "fallback", "exhausted"],
++        )
++    return fallback
  
  
  app.harness = _harness_with_scoped_credentials
