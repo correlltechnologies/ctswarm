@@ -484,6 +484,17 @@ class Orchestrator:
         config: dict = {
             "runtime": runtime.value,
             "providers": providers,
+            # Without this the harness runs in its interactive permission mode
+            # and asks a human who is not there. Claude Code answers "I need
+            # permission to write to that file, please approve the Write
+            # request" and produces nothing; the coder then reports its task
+            # complete having changed no files, and the verifier fails because
+            # it could not create its own output file. "auto" is the value both
+            # adapters understand: bypassPermissions for Claude, the sandbox
+            # flag for Codex. An unattended factory cannot answer a prompt, and
+            # the container plus the disposable checkout are the boundary that
+            # makes not asking safe.
+            "permission_mode": "auto",
             "check_ci": True,
             "max_ci_fix_cycles": max_ci_fix_cycles,
             # Bound every individual agent call as well as the build-level
@@ -537,6 +548,9 @@ class Orchestrator:
             # wanted when only one subscription has capacity.
             payload["config"] = {
                 "runtime": runtime.value,
+                # Same reason as the full path above: nobody is here to approve
+                # a Write.
+                "permission_mode": "auto",
                 "models": {"default": models.get("default", "")} if models.get("default") else None,
                 "enable_github_pr": bool(
                     create_pull_request and scm_provider == "github"

@@ -435,3 +435,23 @@ def test_doctor_warns_about_a_login_a_build_will_destroy(monkeypatch) -> None:
     # A long-lived token means the file is not what the harnesses use.
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-headless")
     assert _claude_login_is_the_fragile_kind() is False
+
+
+# --- the harness has to be allowed to do the work ---------------------------
+
+
+def test_both_build_paths_grant_the_harness_permission() -> None:
+    """Without this the CLI asks a human who is not there.
+
+    Claude Code answers "I need permission to write to that file, please
+    approve the Write request" and produces nothing. The coder then reports its
+    task complete having changed no file, and the verifier fails because it
+    could not create its own output. Asserted against the source because there
+    is no cheap runtime path that reaches the config SWE-AF receives.
+    """
+    source = (
+        Path(__file__).resolve().parents[1] / "ctswarm" / "orchestrator.py"
+    ).read_text(encoding="utf-8")
+
+    # One for the full pipeline, one for the fast node.
+    assert source.count('"permission_mode": "auto"') == 2
