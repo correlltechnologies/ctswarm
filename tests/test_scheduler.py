@@ -62,10 +62,18 @@ class _RestartingOrchestrator(_ControlledOrchestrator):
         return record
 
 
-def _request(name: str) -> BuildRequest:
+def _request(name: str, tier: str = "full") -> BuildRequest:
+    """A queue item for the AgentField path.
+
+    Explicitly the full tier: these tests are about submission, polling,
+    restart recovery, and cancellation, all of which only exist on that path.
+    The scheduler's default is `scoped`, which runs in-process and has none of
+    them.
+    """
     return BuildRequest(
         goal=f"build {name}",
         repo_url=f"https://example.invalid/{name}",
+        tier=tier,
     )
 
 
@@ -305,3 +313,126 @@ async def test_control_plane_cancellation_is_retried_automatically(tmp_path) -> 
     retries = ledger.events(kind="build_infrastructure_retry", build_id=build_id)
     assert len(retries) == 1
     await scheduler.close()
+
+
+# ---------------------------------------------------------------------------
+# tier routing
+# ---------------------------------------------------------------------------
+
+
+class _TierRecordingOrchestrator(_ControlledOrchestrator):
+    """Records which path the scheduler chose for each queue item."""
+
+    def __init__(self, ledger: Ledger) -> None:
+        super().__init__(ledger)
+        self.scoped: list[str] = []
+
+    async def run_scoped(self, *, build_id: str, goal: str, repo_url: str, **_kwargs):
+        self.scoped.append(build_id)
+        return BuildRecord(
+            build_id=build_id,
+            goal=goal,
+            repo_url=repo_url,
+            runtime=Runtime.CLAUDE_CODE,
+            state=BuildState.COMPLETE,
+            pr_url="https://example.invalid/pull/1",
+        )
+
+
+def test_a_queue_item_defaults_to_the_scoped_tier() -> None:
+    """The default is the cheap path, which is the entire point of having one."""
+    assert BuildRequest(goal="add a button", repo_url="r").tier == "scoped"
+
+
+def test_the_legacy_fast_flag_still_selects_the_fast_tier() -> None:
+    assert BuildRequest(goal="g", repo_url="r", fast=True).tier == "fast"
+    # An explicit tier is the caller's stated intent and outranks the old flag.
+    assert BuildRequest(goal="g", repo_url="r", fast=True, tier="full").tier == "full"
+
+
+async def test_scoped_builds_never_reach_agentfield(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    orchestrator = _TierRecordingOrchestrator(ledger)
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=orchestrator,
+        notifier=_Notifier(),
+        poll_interval_s=0.01,
+    )
+    build_id = scheduler.enqueue(
+        _request("scoped", tier="scoped"), build_id="build-scoped"
+    )
+
+    await scheduler.run_once()
+    await asyncio.wait_for(scheduler._tasks[build_id], timeout=1)  # noqa: SLF001
+    await scheduler.run_once()
+
+    assert orchestrator.scoped == [build_id]
+    # No submission, no polling, no execution to recover.
+    assert orchestrator.submitted == []
+    assert orchestrator.started == []
+    snapshot = scheduler.snapshot(build_id)
+    assert snapshot["state"] == "complete"
+    assert snapshot["pr_url"] == "https://example.invalid/pull/1"
+    await scheduler.close()
+
+
+async def test_full_tier_still_goes_through_submission(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    orchestrator = _TierRecordingOrchestrator(ledger)
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=orchestrator,
+        notifier=_Notifier(),
+        poll_interval_s=0.01,
+    )
+    build_id = scheduler.enqueue(_request("full", tier="full"), build_id="build-full")
+
+    await scheduler.run_once()
+    await asyncio.sleep(0)
+    assert orchestrator.submitted == [build_id]
+    assert orchestrator.scoped == []
+
+    orchestrator.release.set()
+    await asyncio.wait_for(scheduler._tasks[build_id], timeout=1)  # noqa: SLF001
+    await scheduler.close()
+
+
+def test_snapshot_reports_the_tier_a_build_ran_on(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "scheduler.db")
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=_ControlledOrchestrator(ledger),
+        notifier=_Notifier(),
+    )
+    scoped = scheduler.enqueue(_request("s", tier="scoped"), build_id="build-s")
+    full = scheduler.enqueue(_request("f", tier="full"), build_id="build-f")
+
+    assert scheduler.snapshot(scoped)["tier"] == "scoped"
+    assert scheduler.snapshot(full)["tier"] == "full"
+
+
+def test_a_build_from_before_tiers_existed_reads_as_the_full_factory(tmp_path) -> None:
+    """Otherwise the ledger understates what older builds actually cost."""
+    ledger = Ledger(tmp_path / "scheduler.db")
+    scheduler = BuildScheduler(
+        ledger=ledger,
+        orchestrator=_ControlledOrchestrator(ledger),
+        notifier=_Notifier(),
+    )
+    for build_id, detail in (
+        ("build-old", {"goal": "g", "repo_url": "r"}),
+        ("build-old-fast", {"goal": "g", "repo_url": "r", "fast": True}),
+    ):
+        ledger.record_event("build_enqueued", detail, build_id=build_id)
+
+    assert scheduler.snapshot("build-old")["tier"] == "full"
+    assert scheduler.snapshot("build-old-fast")["tier"] == "fast"
+
+
+def test_mission_control_defaults_to_the_scoped_tier() -> None:
+    """The phone is the client that most needs the cheap path to be the default."""
+    from ctswarm.scheduler import SwarmLaunchRequest
+
+    assert SwarmLaunchRequest(goal="add a button").tier == "scoped"
+    assert SwarmLaunchRequest(goal="build it all", tier="full").tier == "full"

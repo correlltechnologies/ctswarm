@@ -765,10 +765,14 @@ def build(
         900, help="Seconds between status posts when nothing changes."
     ),
     max_hours: float = typer.Option(12.0, help="Wall-clock ceiling for the build."),
-    fast: bool = typer.Option(
-        False,
-        "--fast",
-        help="Single pass: plan, code, verify, PR. No committee, no repair loop.",
+    tier: str = typer.Option(
+        "scoped",
+        "--tier",
+        help=(
+            "scoped: one change, locally, ~3 harness calls (default). "
+            "fast: single pass on the fast node. "
+            "full: the complete factory, hundreds of calls."
+        ),
     ),
     probe: bool = typer.Option(
         True, help="Ask each harness whether it can run before spending a build on it."
@@ -786,6 +790,11 @@ def build(
     from .capacity import Runtime
     from .orchestrator import BuildRecord, BuildState, Orchestrator
 
+    tier = tier.strip().lower()
+    if tier not in ("scoped", "fast", "full"):
+        console.print(f"[red]unknown tier {tier!r}; use scoped, fast, or full[/red]")
+        raise typer.Exit(2)
+
     if probe:
         _probe_harnesses()
 
@@ -801,7 +810,7 @@ def build(
                         "require_strong_planning": True,
                         "max_ci_fix_cycles": 2,
                         "max_hours": max_hours,
-                        "fast": fast,
+                        "tier": tier,
                     },
                 )
             response.raise_for_status()
@@ -817,6 +826,7 @@ def build(
         build_id = snapshot["build_id"]
         console.print(
             f"\n[bold]{build_id}[/bold] queued"
+            f"\n  tier     {tier}"
             f"\n  repo     {repo}"
             f"\n  control  ctswarm pause/resume/stop {build_id}\n"
         )
@@ -890,7 +900,7 @@ def build(
                     )
                 state = record.state.value
                 snapshot["error"] = record.error
-            else:
+            elif tier != "scoped":
                 console.print(
                     "\n[yellow]--gate-repo not given, so scanners and the committee "
                     "did not run. The build is NOT verified.[/yellow]"

@@ -24,7 +24,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .approvals.status import StatusNotifier
 from .approvals.store import ApprovalStore
@@ -77,6 +77,21 @@ BUILD_TERMINAL = "build_terminal"
 BUILD_INFRASTRUCTURE_RETRY = "build_infrastructure_retry"
 
 
+def _tier_of(request_detail: dict) -> str:
+    """Which pipeline a queue item asked for, including historical ones.
+
+    Records written before tiers existed carry no `tier`, and reading them as
+    the current default would understate what they actually cost. Everything
+    back then was the full factory unless it set the old fast flag, so that is
+    what they are reported as. This is what makes "how often is decomposition
+    genuinely needed" answerable from the ledger rather than from memory.
+    """
+    tier = str(request_detail.get("tier") or "")
+    if tier:
+        return tier
+    return "fast" if request_detail.get("fast") else "full"
+
+
 def _retryable_infrastructure_stop(record: BuildRecord) -> bool:
     """True when AgentField stopped work because an agent node disappeared.
 
@@ -101,11 +116,23 @@ class BuildRequest(BaseModel):
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     # Zero means no scheduler deadline; the owner can still pause or stop.
     max_hours: float = Field(default=0.0, ge=0, le=720)
-    # Single-pass build on the swe-fast node: plan tasks, do them, verify once,
-    # open the PR. No planning committee and no repair loop. The full pipeline
-    # runs seven planning agents before any code exists, which is the right
-    # shape for "build me a product" and the wrong one for "add an endpoint".
+    # Retained so an older client keeps working. `tier` is the field to set;
+    # this one is folded into it below.
     fast: bool = False
+    # Which pipeline runs this goal. The three entry points differ by roughly
+    # two orders of magnitude in cost, and until they were selectable every
+    # request paid for the largest one.
+    #
+    #   scoped  one change, one branch: implement, test, review, PR. Local,
+    #           no AgentField, about three harness invocations.
+    #   fast    single pass on the swe-fast node: plan tasks, do them, verify
+    #           once, open the PR. No planning committee, no repair loop.
+    #   full    the complete factory: PRD, architecture, issue DAG, parallel
+    #           worktrees, integration, acceptance. Hundreds of invocations.
+    #
+    # `scoped` is the default because most requests are one change, and because
+    # the previous default made "add a button" cost what a product costs.
+    tier: Literal["scoped", "fast", "full"] = "scoped"
     project_id: str = Field(default="", max_length=1024)
     project_path: str = Field(default="", max_length=4096)
     scm_provider: Literal[
@@ -117,6 +144,18 @@ class BuildRequest(BaseModel):
     # Snapshotted when the queue item is created. A later dashboard policy edit
     # must never change a build that is already waiting for a scheduler slot.
     routing_policy: dict[str, dict[str, str]] | None = None
+
+    @model_validator(mode="after")
+    def _fold_legacy_fast_flag(self):
+        """`fast=True` from an older client means the fast tier.
+
+        Only when the caller left `tier` alone. An explicit tier is the
+        caller's stated intent and must win over a flag they may not know
+        they are still sending.
+        """
+        if self.fast and "tier" not in self.model_fields_set:
+            object.__setattr__(self, "tier", "fast")
+        return self
 
 
 class SwarmLaunchRequest(BaseModel):
@@ -137,11 +176,35 @@ class SwarmLaunchRequest(BaseModel):
     require_strong_planning: bool = True
     max_ci_fix_cycles: int = Field(default=2, ge=0, le=10)
     max_hours: float = Field(default=0.0, ge=0, le=720)
-    # Single-pass build on the swe-fast node: plan tasks, do them, verify once,
-    # open the PR. No planning committee and no repair loop. The full pipeline
-    # runs seven planning agents before any code exists, which is the right
-    # shape for "build me a product" and the wrong one for "add an endpoint".
+    # Retained so an older client keeps working. `tier` is the field to set;
+    # this one is folded into it below.
     fast: bool = False
+    # Which pipeline runs this goal. The three entry points differ by roughly
+    # two orders of magnitude in cost, and until they were selectable every
+    # request paid for the largest one.
+    #
+    #   scoped  one change, one branch: implement, test, review, PR. Local,
+    #           no AgentField, about three harness invocations.
+    #   fast    single pass on the swe-fast node: plan tasks, do them, verify
+    #           once, open the PR. No planning committee, no repair loop.
+    #   full    the complete factory: PRD, architecture, issue DAG, parallel
+    #           worktrees, integration, acceptance. Hundreds of invocations.
+    #
+    # `scoped` is the default because most requests are one change, and because
+    # the previous default made "add a button" cost what a product costs.
+    tier: Literal["scoped", "fast", "full"] = "scoped"
+
+    @model_validator(mode="after")
+    def _fold_legacy_fast_flag(self):
+        """`fast=True` from an older client means the fast tier.
+
+        Only when the caller left `tier` alone. An explicit tier is the
+        caller's stated intent and must win over a flag they may not know
+        they are still sending.
+        """
+        if self.fast and "tier" not in self.model_fields_set:
+            object.__setattr__(self, "tier", "fast")
+        return self
 
 
 class RoutingPolicyRequest(BaseModel):
@@ -292,6 +355,7 @@ class BuildScheduler:
         metadata["create_pull_request"] = bool(
             request_detail.get("create_pull_request", True)
         )
+        metadata["tier"] = _tier_of(request_detail)
         metadata["routing_policy"] = request_detail.get("routing_policy") or {}
         terminal = self.ledger.events(kind=BUILD_TERMINAL, build_id=build_id)
         if terminal:
@@ -378,6 +442,9 @@ class BuildScheduler:
 
     async def _run_request(self, build_id: str, request: BuildRequest) -> None:
         try:
+            if request.tier == "scoped":
+                await self._run_scoped_request(build_id, request)
+                return
             record = load_build(self.ledger, build_id)
             if record is not None:
                 self._active_records[build_id] = record
@@ -388,7 +455,7 @@ class BuildScheduler:
                         repo_url=request.repo_url,
                         require_strong_planning=request.require_strong_planning,
                         max_ci_fix_cycles=request.max_ci_fix_cycles,
-                        fast=request.fast,
+                        fast=request.tier == "fast",
                         scm_provider=request.scm_provider,
                         source_branch=request.source_branch,
                         create_pull_request=request.create_pull_request,
@@ -442,6 +509,28 @@ class BuildScheduler:
             )
         finally:
             self._active_records.pop(build_id, None)
+
+    async def _run_scoped_request(
+        self, build_id: str, request: BuildRequest
+    ) -> None:
+        """Dispatch a scoped build, which runs here rather than on an agent node.
+
+        Structurally simpler than the polling path because there is nothing to
+        poll: no execution id, no restart recovery, and no infrastructure retry,
+        since the work is in this process and a scheduler restart takes it with
+        it. A scoped build is minutes long, so resuming one would cost more than
+        redoing it.
+        """
+        record = await self.orchestrator.run_scoped(
+            goal=request.goal,
+            repo_url=request.repo_url,
+            build_id=build_id,
+            source_branch=request.source_branch,
+            create_pull_request=request.create_pull_request,
+            on_status=self.notifier.post,
+        )
+        self._active_records[build_id] = record
+        self._record_terminal(record)
 
     def _record_terminal(self, record: BuildRecord) -> None:
         if self.ledger.events(kind=BUILD_TERMINAL, build_id=record.build_id):
@@ -798,6 +887,7 @@ async def launch_swarm(request: SwarmLaunchRequest, response: Response) -> dict:
         max_ci_fix_cycles=request.max_ci_fix_cycles,
         max_hours=request.max_hours,
         fast=request.fast,
+        tier=request.tier,
         project_id=request.project_id,
         project_path=project_path,
         scm_provider=scm_provider,
