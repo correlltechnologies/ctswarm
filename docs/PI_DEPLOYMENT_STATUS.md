@@ -41,7 +41,7 @@ Host preparation, by `infra/pi-host-prep.sh`:
 
 | Item | State |
 |---|---|
-| DNS | `/etc/resolv.conf` written by hand, resolves |
+| DNS | `/etc/resolv.conf` names 1.1.1.1 and 8.8.8.8 only. It is a plain file, `systemd-resolved` is inactive and disabled, and `resolvconf` is not installed, so nothing regenerates it across a reboot |
 | Docker | 29.7.2, official packages, `quinn` in the `docker` group |
 | Compose | v5.5.0 (the Pi overlay needs >= 2.24) |
 | Log bounds | container 5m x 3, journal 100M |
@@ -67,13 +67,6 @@ Not done:
 
 - **Slack approvals are not configured.** Optional: the local approval UI on
   8091 is used instead. See `docs/SLACK.md`.
-- **`/etc/resolv.conf` still lists `nameserver 127.0.0.1` first.** Pi-hole is
-  gone and nothing listens on 53, so that line is a refused connection on every
-  lookup before the public fallback answers. Harmless, worth removing, needs a
-  password-gated sudo:
-  ```bash
-  printf '# No local resolver on this host.\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
-  ```
 - **Leftover directories**, 1.4GB of disk and no memory: `~/pihole-backup`
   (647M), `~/docker-services/pihole-data` (645M), `~/dht-influx` (94M). The
   `pihole:` service is still in `~/docker-services/docker-compose.yml`, so a
