@@ -237,7 +237,14 @@ bring_up() {
 
 case "${1:-up}" in
   up)
-    bring_up
+    # `--build`, because `docker compose up` builds only when an image is
+    # *missing*. Without it this command started the previously built image and
+    # reported success, so every source change since the last image existed only
+    # on disk. That is how a fixed launch gate, a rewritten SWE-AF patch, and a
+    # new compose variable all looked deployed on the Pi while the containers
+    # ran code from hours earlier. The script's own header says "build and start
+    # everything"; `start` is the path that deliberately does not.
+    bring_up --build
     ;;
   start)
     # Boot path. Never builds: a rebuild at startup turns a power cycle into a
