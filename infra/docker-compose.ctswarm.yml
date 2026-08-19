@@ -157,6 +157,14 @@ services:
       - SLACK_STATUS_CHANNEL=${SLACK_STATUS_CHANNEL:-}
       - SLACK_APPROVAL_CHANNEL=${SLACK_APPROVAL_CHANNEL:-}
       - GH_TOKEN=${GH_TOKEN:-}
+      # Whether a subscription login exists, answered by the host in stack.sh.
+      # This container is the launch gate and runs as uid 10001, so the 0600
+      # credential files it mounts are visible to it and unreadable by it. The
+      # gate needs one bit per harness, not the secret, so the bit is what
+      # crosses. Unset falls back to reading the files, which is what every
+      # other caller does.
+      - CTSWARM_CLAUDE_LOGIN=${CTSWARM_CLAUDE_LOGIN:-}
+      - CTSWARM_CODEX_LOGIN=${CTSWARM_CODEX_LOGIN:-}
     ports:
       - "127.0.0.1:8092:8092"
     # ./var/mcp belongs to the host account, and this image runs as uid 10001.

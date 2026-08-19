@@ -155,6 +155,38 @@ def _has_credentials(path) -> bool:
     return isinstance(payload, dict) and bool(payload)
 
 
+def _login_asserted(env: dict, name: str) -> bool | None:
+    """The host's answer about a credential the caller cannot read for itself.
+
+    The scheduler is the launch gate, and it runs unprivileged as uid 10001
+    while the credential files belong to the host account at mode 0600. So it
+    can see them and cannot read them, and a check written as "parse the file"
+    reports no login on a fully logged-in machine. That is not a theoretical
+    failure: it blocked the first real build on the Pi with "run `codex login`"
+    on a host where `codex login` had already been done.
+
+    Reading the file is not what the gate needs anyway. It needs one bit, and
+    the secret has no business being in this container. So `stack.sh` runs the
+    predicates below on the host, where the files are readable by their owner,
+    and passes the two answers in. Everywhere else this returns ``None`` and the
+    artifact check stands, unchanged.
+
+    The cost is staleness: a login made after the stack started is not seen
+    until the next `stack.sh up` or `start`. That is the same bargain
+    `CLAUDE_CODE_OAUTH_TOKEN` has always made, and it beats a gate that is
+    permanently wrong.
+    """
+    raw = str(env.get(name, "")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    # Anything else, empty included, is not an answer. Falling back to the
+    # artifact check is the forgiving direction: a typo here would otherwise
+    # silently disable a working harness, and nothing would say why.
+    return None
+
+
 def _claude_login_present(env: dict) -> bool:
     """Whether a Claude Code subscription login exists on this host.
 
@@ -278,7 +310,9 @@ class CapacityManager:
         """Whether credentials exist for this runtime.
 
         Checked against real artifacts rather than trusting an environment
-        variable that may name an expired token.
+        variable that may name an expired token. The one exception is
+        `_login_asserted`, and it exists because the scheduler cannot do this
+        check at all: see that function.
 
         In subscriptions-only mode an API key is deliberately *not* a
         credential. The whole point of the mode is that work is billed to a
@@ -289,11 +323,18 @@ class CapacityManager:
 
         subscriptions_only = self.subscriptions_only
         if runtime is Runtime.CLAUDE_CODE:
-            has_login = _claude_login_present(self.env)
+            has_login = _login_asserted(self.env, "CTSWARM_CLAUDE_LOGIN")
+            if has_login is None:
+                has_login = _claude_login_present(self.env)
             if subscriptions_only:
                 return has_login
             return has_login or bool(self.env.get("ANTHROPIC_API_KEY"))
         if runtime is Runtime.CODEX:
+            has_login = _login_asserted(self.env, "CTSWARM_CODEX_LOGIN")
+            if has_login is not None:
+                if subscriptions_only:
+                    return has_login
+                return has_login or bool(self.env.get("OPENAI_API_KEY"))
             has_login = _has_credentials(
                 Path(
                     self.env.get("CTSWARM_CODEX_HOME")

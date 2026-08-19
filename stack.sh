@@ -186,11 +186,43 @@ infrastructure_services() {
   printf '%s\n' "${services[@]}"
 }
 
+export_login_facts() {
+  # Answer, here on the host, the one credential question the scheduler cannot
+  # answer for itself. It runs as uid 10001 and the credential files belong to
+  # the host account at mode 0600, so inside the container they are visible and
+  # unreadable, and a gate written as "parse the file" refuses every build on a
+  # fully logged-in machine. The gate needs one bit per harness, not the
+  # secret, so the bit is what crosses the boundary.
+  #
+  # Same predicates as capacity.py, imported rather than reimplemented: this
+  # repository has already shipped two bugs from a second copy of a credential
+  # check drifting away from the first.
+  local python=".venv/bin/python"
+  [[ -x "$python" ]] || return 0
+  local facts
+  facts=$("$python" - 2>/dev/null <<'PYEOF'
+import os
+from pathlib import Path
+
+from ctswarm.capacity import _claude_login_present, _has_credentials
+
+env = dict(os.environ)
+codex_home = Path(env.get("CTSWARM_CODEX_HOME") or Path.home() / ".codex")
+print(int(_claude_login_present(env)), int(_has_credentials(codex_home / "auth.json")))
+PYEOF
+  ) || return 0
+  [[ "$facts" == *" "* ]] || return 0
+  CTSWARM_CLAUDE_LOGIN="${facts%% *}"
+  CTSWARM_CODEX_LOGIN="${facts##* }"
+  export CTSWARM_CLAUDE_LOGIN CTSWARM_CODEX_LOGIN
+}
+
 bring_up() {
   local -a up_flags=("$@")
   ensure_mcp_config
   ensure_credential_stubs
   ensure_projects_root
+  export_login_facts
   refresh_mcp_inventory
   # Infrastructure first so a slow agent image build does not hide a broken
   # control plane behind it.

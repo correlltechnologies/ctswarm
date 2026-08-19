@@ -12,6 +12,7 @@ matters.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -178,3 +179,55 @@ def test_an_ordinary_build_failure_records_nothing(tmp_path) -> None:
 
     assert not ledger.events(kind="runtime_rate_limited")
     assert orchestrator.capacity.headroom(Runtime.CODEX).available is True
+
+
+# --- the launch gate inside a container ------------------------------------
+#
+# The scheduler decides whether a build may start. It runs as uid 10001 and the
+# credential files it mounts belong to the host account at mode 0600, so it can
+# see them and not read them. Written as "parse the file", the gate refused the
+# first real build on the Pi with "run `codex login`" on a host where
+# `codex login` had already been done.
+
+
+def _manager(tmp_path, monkeypatch, **env) -> CapacityManager:
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return CapacityManager(ledger=Ledger(tmp_path / "gate.db"), env=dict(os.environ))
+
+
+def test_the_gate_still_reads_the_files_when_nobody_asserts(tmp_path, monkeypatch) -> None:
+    """The fallback is the default path; every host outside a container uses it."""
+    manager = _manager(tmp_path, monkeypatch)
+
+    assert manager.configured(Runtime.CODEX) is True  # fixture wrote auth.json
+    assert manager.configured(Runtime.CLAUDE_CODE) is True
+
+
+def test_an_unreadable_credential_can_be_vouched_for(monkeypatch, tmp_path) -> None:
+    """The container case: the file exists, this process cannot read it."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CTSWARM_CODEX_HOME", str(tmp_path / "nothing-here"))
+    manager = _manager(tmp_path, monkeypatch)
+    assert manager.configured(Runtime.CODEX) is False
+
+    manager = _manager(tmp_path, monkeypatch, CTSWARM_CODEX_LOGIN="1", CTSWARM_CLAUDE_LOGIN="1")
+
+    assert manager.configured(Runtime.CODEX) is True
+    assert manager.configured(Runtime.CLAUDE_CODE) is True
+
+
+def test_an_explicit_no_closes_the_gate(tmp_path, monkeypatch) -> None:
+    """The host is authoritative in both directions, not only the useful one."""
+    manager = _manager(tmp_path, monkeypatch, CTSWARM_CODEX_LOGIN="0", CTSWARM_CLAUDE_LOGIN="0")
+
+    assert manager.configured(Runtime.CODEX) is False
+    assert manager.configured(Runtime.CLAUDE_CODE) is False
+
+
+@pytest.mark.parametrize("value", ["", "  ", "maybe", "2"])
+def test_a_value_that_is_not_an_answer_falls_back(tmp_path, monkeypatch, value) -> None:
+    """A typo must not silently disable a harness that works."""
+    manager = _manager(tmp_path, monkeypatch, CTSWARM_CODEX_LOGIN=value)
+
+    assert manager.configured(Runtime.CODEX) is True
