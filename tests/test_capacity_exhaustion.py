@@ -231,3 +231,36 @@ def test_a_value_that_is_not_an_answer_falls_back(tmp_path, monkeypatch, value) 
     manager = _manager(tmp_path, monkeypatch, CTSWARM_CODEX_LOGIN=value)
 
     assert manager.configured(Runtime.CODEX) is True
+
+
+# --- reaching the ledger that decides --------------------------------------
+#
+# The scheduler's ledger lives in a Docker volume the host cannot open, so
+# `ctswarm capacity` on the host read an empty database and `--rate-limited`
+# wrote to one. The operator recorded a spent subscription and the launch gate
+# never heard about it. These endpoints are how the CLI reaches the real one,
+# the same way pause, resume, and stop always have.
+
+
+def test_the_capacity_endpoints_are_registered() -> None:
+    from ctswarm import scheduler as scheduler_module
+
+    paths = {route.path for route in scheduler_module.app.routes}
+
+    assert "/api/capacity" in paths
+    assert "/api/capacity/{runtime}/rate-limited" in paths
+    assert "/api/capacity/{runtime}/clear-limit" in paths
+
+
+def test_an_unknown_runtime_is_rejected_rather_than_ignored() -> None:
+    """A typo must not return 200 and silently do nothing to any runtime."""
+    from fastapi import HTTPException
+
+    from ctswarm.scheduler import _parse_runtime
+
+    assert _parse_runtime("CODEX ") is Runtime.CODEX
+
+    with pytest.raises(HTTPException) as caught:
+        _parse_runtime("gpt")
+    assert caught.value.status_code == 400
+    assert "codex" in caught.value.detail

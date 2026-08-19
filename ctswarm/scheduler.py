@@ -877,6 +877,56 @@ async def get_build_approvals(build_id: str) -> dict:
     return {"approvals": approvals}
 
 
+# Capacity lives here rather than only in the CLI because the scheduler's ledger
+# is the one that decides anything. It is inside a Docker volume the host cannot
+# reach, so `ctswarm capacity` run on the host was reading an empty database and
+# `--rate-limited` was writing to one: the operator recorded a spent
+# subscription and the gate never heard about it. Same shape as the build
+# controls, which have always gone over HTTP for the same reason.
+@app.get("/api/capacity")
+async def get_capacity() -> dict:
+    manager = scheduler.orchestrator.capacity
+    routine, why_routine = manager.select()
+    strong, why_strong = manager.select(require_strong=True)
+    return {
+        "runtimes": manager.report(),
+        "routine": {"runtime": routine.value, "reason": why_routine},
+        "strong": {"runtime": strong.value, "reason": why_strong},
+    }
+
+
+def _parse_runtime(runtime: str) -> Runtime:
+    try:
+        return Runtime(runtime.strip().lower())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown runtime {runtime!r}; expected one of "
+            + ", ".join(member.value for member in Runtime),
+        ) from exc
+
+
+@app.post("/api/capacity/{runtime}/rate-limited")
+async def post_rate_limited(runtime: str) -> dict:
+    """Record that a subscription is spent, on the operator's own knowledge."""
+    parsed = _parse_runtime(runtime)
+    scheduler.orchestrator.capacity.note_rate_limited(
+        parsed, detail="recorded by the operator"
+    )
+    return {"runtime": parsed.value, "available": False}
+
+
+@app.post("/api/capacity/{runtime}/clear-limit")
+async def post_clear_limit(runtime: str) -> dict:
+    """Withdraw a recorded exhaustion, so the runtime is usable again now."""
+    parsed = _parse_runtime(runtime)
+    scheduler.orchestrator.capacity.clear_rate_limited(parsed)
+    return {
+        "runtime": parsed.value,
+        "available": scheduler.orchestrator.capacity.headroom(parsed).available,
+    }
+
+
 @app.get("/api/dashboard/executions/{execution_id}")
 async def get_execution_detail(execution_id: str) -> dict:
     try:

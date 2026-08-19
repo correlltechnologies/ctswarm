@@ -518,10 +518,15 @@ def capacity(
     reports. `--rate-limited` is for the case the product cannot see: you
     already know a subscription is spent and would rather reroute the next
     build than discover it by stalling one.
+
+    Talks to the running scheduler, because its ledger is the one that decides
+    anything: it lives in a Docker volume this process cannot open, so reading
+    the local file would report an empty world and writing to it would record a
+    spent subscription the launch gate never hears about. With no scheduler
+    reachable the local ledger is all there is, which is the right answer during
+    bootstrap and on a host that is not running the stack.
     """
     from .capacity import CapacityManager, Runtime
-
-    manager = CapacityManager()
 
     def _runtime(value: str, flag: str) -> Runtime:
         try:
@@ -533,16 +538,52 @@ def capacity(
             )
             raise typer.Exit(2) from None
 
-    if rate_limited:
-        runtime = _runtime(rate_limited, "--rate-limited")
-        manager.note_rate_limited(runtime, detail="recorded by the operator")
-        console.print(f"Recorded: [bold]{runtime.value}[/bold] is out of usage.")
-    if clear_limit:
-        runtime = _runtime(clear_limit, "--clear-limit")
-        manager.clear_rate_limited(runtime)
-        console.print(f"Cleared: [bold]{runtime.value}[/bold] is usable again.")
+    remote: dict | None = None
+    try:
+        if rate_limited:
+            runtime = _runtime(rate_limited, "--rate-limited")
+            httpx.post(
+                f"{_scheduler_url()}/api/capacity/{runtime.value}/rate-limited",
+                timeout=15.0,
+            ).raise_for_status()
+            console.print(f"Recorded: [bold]{runtime.value}[/bold] is out of usage.")
+        if clear_limit:
+            runtime = _runtime(clear_limit, "--clear-limit")
+            httpx.post(
+                f"{_scheduler_url()}/api/capacity/{runtime.value}/clear-limit",
+                timeout=15.0,
+            ).raise_for_status()
+            console.print(f"Cleared: [bold]{runtime.value}[/bold] is usable again.")
+        response = httpx.get(f"{_scheduler_url()}/api/capacity", timeout=15.0)
+        response.raise_for_status()
+        remote = response.json()
+    except httpx.HTTPError:
+        remote = None
+
+    if remote is None:
+        manager = CapacityManager()
+        if rate_limited:
+            manager.note_rate_limited(
+                _runtime(rate_limited, "--rate-limited"),
+                detail="recorded by the operator",
+            )
+        if clear_limit:
+            manager.clear_rate_limited(_runtime(clear_limit, "--clear-limit"))
+        runtimes = manager.report()
+        routine, why_routine = manager.select()
+        strong, why_strong = manager.select(require_strong=True)
+        routine_name, strong_name = routine.value, strong.value
+        console.print(
+            "\n[yellow]No scheduler reachable; showing this host's own ledger.[/yellow]"
+            "\n[dim]Start the stack for the state that actually gates builds.[/dim]"
+        )
+    else:
+        runtimes = remote["runtimes"]
+        routine_name, why_routine = remote["routine"]["runtime"], remote["routine"]["reason"]
+        strong_name, why_strong = remote["strong"]["runtime"], remote["strong"]["reason"]
+
     table = Table("runtime", "available", "remaining", "spent", "why", box=None)
-    for name, info in manager.report().items():
+    for name, info in runtimes.items():
         table.add_row(
             name,
             _ok(info["available"]),
@@ -553,11 +594,9 @@ def capacity(
     console.print("\n[bold]Runtime capacity[/bold]")
     console.print(table)
 
-    routine, why_routine = manager.select()
-    strong, why_strong = manager.select(require_strong=True)
     console.print(
-        f"\n  routine build   [bold]{routine.value}[/bold]  [dim]{why_routine}[/dim]"
-        f"\n  planning/verify [bold]{strong.value}[/bold]  [dim]{why_strong}[/dim]\n"
+        f"\n  routine build   [bold]{routine_name}[/bold]  [dim]{why_routine}[/dim]"
+        f"\n  planning/verify [bold]{strong_name}[/bold]  [dim]{why_strong}[/dim]\n"
     )
     console.print(
         "[dim]Subscription headroom is reconstructed from observed per-call usage,\n"
