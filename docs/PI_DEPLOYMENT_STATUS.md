@@ -9,36 +9,27 @@ phone over Tailscale, running until a swarm finishes and opens its PR.
 
 ## Where to pick up
 
-**The stack is installed and running on the board.** All six services are up and
-healthy. What is missing is credentials, and only the operator can supply them,
-because all three need either a browser or a token that belongs to their
-accounts:
+**The stack is installed, running, and credentialed on the board.** All six
+services are up, and `ctswarm doctor` reports Claude, Codex, and GitHub all
+available. The next step is a first real build.
 
 ```bash
 ssh -i ~/.ssh/ctswarm_pi quinn@100.118.93.5
-
-# 1. Claude. Prints a token; paste it into ~/ctswarm/.env as
-#    CLAUDE_CODE_OAUTH_TOKEN=...
-claude setup-token
-
-# 2. Codex. Opens a local callback on 1455, so SSH must forward it:
-#    ssh -L 1455:localhost:1455 -i ~/.ssh/ctswarm_pi quinn@100.118.93.5
-codex login
-
-# 3. GitHub. Either `gh auth login` on the board, or copy a token from the
-#    laptop into ~/ctswarm/.env as GH_TOKEN=...
-gh auth login
+cd ~/ctswarm && ./.venv/bin/ctswarm doctor && ./.venv/bin/ctswarm capacity
 ```
 
-Then confirm and restart so the agent containers pick up the new `.env`:
+**Codex is currently out of usage**, recorded in the ledger on 2026-08-18, so
+`capacity` reports it unavailable and `submit` will run every role on Claude and
+write a `build_degraded` event saying review is not independent of
+implementation. That is the intended behaviour, not a fault. Two things to know
+about it:
 
-```bash
-cd ~/ctswarm && ./.venv/bin/ctswarm doctor && CTSWARM_PROFILE=pi ./stack.sh up
-```
-
-`doctor` currently reports all three as `no` and reports local backends as
-*disabled by subscriptions-only mode*, which is the intended wording and is
-deliberately different from "none detected".
+- The hold expires after `CTSWARM_CODEX_WINDOW_HOURS`, five hours by default.
+  If the real limit is weekly, the first build after the hold expires will try
+  Codex, fail, and record the exhaustion again automatically. Raise the window
+  in `.env` to skip that round trip.
+- If Codex comes back sooner, `./.venv/bin/ctswarm capacity --clear-limit codex`
+  returns it to service immediately.
 
 ## Pi state, verified 2026-08-18
 
@@ -70,12 +61,12 @@ Application, by `bootstrap.sh` and `CTSWARM_PROFILE=pi ./stack.sh up`:
 | Published ports | every one on `127.0.0.1`: 8092 scheduler, 8091 approvals, 18080 control plane, 8003 swe-agent, 8004 swe-fast |
 | MCP registry | materializes to `var/mcp/claude.json` and `var/mcp/codex.toml`, written by uid 10001 at mode 0600 |
 | Memory | 914Mi of 3.7Gi used idle, 2.8Gi available, swap untouched |
+| Credentials | Claude, Codex, and GitHub all present; `doctor` reports three yes. The agent container's `gh` is authenticated as `correlltechnologies` through `GH_TOKEN` |
 
 Not done:
 
-- **No credentials.** None of `claude setup-token`, `codex login`, or
-  `gh auth login` has been done on this box, so no build can be launched yet.
-  This is the only thing between the board and a first real build.
+- **Slack approvals are not configured.** Optional: the local approval UI on
+  8091 is used instead. See `docs/SLACK.md`.
 - **`/etc/resolv.conf` still lists `nameserver 127.0.0.1` first.** Pi-hole is
   gone and nothing listens on 53, so that line is a refused connection on every
   lookup before the public fallback answers. Harmless, worth removing, needs a
@@ -127,17 +118,26 @@ SSH key `~/.ssh/ctswarm_pi`, `quinn@100.118.93.5`. Docker works without sudo.
 Two assistant-side limits are worth recording, because they shape what can be
 automated from a session:
 
-- Piping a GitHub token into a remote command to write the Pi's `.env` is
-  refused by the permission classifier. The token has to be placed by the
-  operator.
-- Compound read-only SSH commands are sometimes refused where the same work
-  split into simpler calls succeeds. Prefer one command per call.
+- Piping a token from the laptop into a remote command to write the Pi's
+  `.env` is refused by the permission classifier. The supported path is a
+  `gh auth login` on the board and then `./bootstrap.sh`, which now discovers
+  the token on any run rather than only the first.
+- Compound SSH commands are sometimes refused where the same work split into
+  simpler calls succeeds. Prefer one command per call.
+- `gh` lives in `~/.local/bin`, which reaches PATH only through `~/.profile`.
+  Non-interactive SSH does not run it, so Pi commands need `bash -lc`.
 
 ## Repository state
 
-Nineteen commits on `main` beyond `50714cc`, CI green:
+Twenty-five commits on `main` beyond `50714cc`, CI green:
 
 ```
+9880dd7 Hand the discovered token to the process that writes it
+f2f1df0 Give the containers the GitHub credential they are told they have
+2f3c910 Let a changed patch reach a checkout that already has the old one
+d7dff8b Fail an exhausted harness over to the other subscription
+0d25f48 Let a spent subscription be a fact the next build knows
+4a8bace Record that the stack now runs on the board
 653ee6c Stop doctor reporting a Codex login that does not exist
 9f3c689 Stop publishing the agent control ports on every interface
 92a485b Let the scheduler write the MCP config it is responsible for
@@ -182,7 +182,7 @@ The approved plan is `~/.claude/plans/synchronous-snuggling-popcorn.md`.
 | C: real MCP support | done, backend only; see `docs/MCP.md` |
 | D: document context | not started |
 | E: browser evidence pipeline | not started |
-| F: Pi hosting | done: stack builds, runs, and stays healthy on the board; credentials outstanding |
+| F: Pi hosting | done: stack builds, runs, stays healthy, and is fully credentialed on the board |
 | G: UI reduction and styling | not started |
 
 G is last on purpose: the settings, MCP, document, and evidence screens are all
@@ -262,3 +262,33 @@ on the development machine.
   directory above passed the weaker test: doctor said Codex was ready and the
   launch was then refused. Tests now assert the two agree rather than testing
   each in isolation.
+- **The agent container had no GitHub credential and was told it did.** SWE-AF
+  opens the pull request from inside the container with `gh`, and its own prompt
+  says "the `GH_TOKEN` environment variable is already set". No compose service
+  declared the variable, so the value in `.env` was read for interpolation and
+  went nowhere, and a host-side `gh auth login` never enters the container
+  either. A build would have run to completion and then failed at the one step
+  the whole build exists to reach.
+- **`bootstrap.sh` looked for logins only on the run that created `.env`.** That
+  is the one moment there is nothing to find, because the operator has not
+  logged in yet and bootstrap is what tells them to. Every later run reported
+  "left untouched" and discovered nothing. It now fills any key that is present
+  and empty, on every run, and never overwrites a value.
+- **The whole exhaustion mechanism was dead code.** `CapacityManager` could hold
+  a rate-limited runtime out for a window, and `submit` could collapse every
+  role onto the harness that still had headroom and record the lost independent
+  review. Nothing ever called `note_rate_limited`, so neither could fire. `poll`
+  now reads the failure it already receives and records it.
+- **The mid-build fallback retried an exhausted harness on local OpenCode.** On
+  a host chosen for having no accelerator there is no local inference to retry
+  against, so a recoverable rate limit became a failure against a backend that
+  was never running. Subscriptions-only now fails Codex over to Claude and back.
+- **Updating a patch stranded every existing checkout.** A vendor tree with the
+  old patches applied is dirty and does not match the new expected tree, which
+  read as operator tampering, so `apply-swe-af-patches.sh` refused and the only
+  way forward was deleting `vendor/`. It now records which paths it wrote and
+  rebuilds those, saving the previous tree to a diff first.
+- **A test supplied what the caller forgot.** The `.env` fill helper read its
+  value from the environment; the shipped call site left it in an unexported
+  shell variable. The test exported it itself and passed, and the real host
+  raised `KeyError` on the first box that had a login to find.
