@@ -74,3 +74,63 @@ def test_a_directory_is_not_a_login(tmp_path: Path) -> None:
     path = tmp_path / "auth.json"
     path.mkdir()
     assert not _accepts(path)
+
+
+def _fill_if_empty_source() -> str:
+    """The shell function as it is actually shipped, not a copy of it."""
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    match = re.search(r"^fill_if_empty\(\) \{\n.*?^\}\n", text, re.MULTILINE | re.DOTALL)
+    assert match, "fill_if_empty() is no longer defined in bootstrap.sh"
+    return match.group(0)
+
+
+def _fill(env_text: str, key: str, value: str, tmp_path: Path) -> tuple[bool, str]:
+    (tmp_path / ".env").write_text(env_text, encoding="utf-8")
+    completed = subprocess.run(
+        ["bash", "-c", f'{_fill_if_empty_source()}\nfill_if_empty "$1"', "_", key],
+        capture_output=True,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "CTSWARM_FILL_VALUE": value},
+    )
+    return completed.returncode == 0, (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+def test_an_empty_key_is_filled(tmp_path: Path) -> None:
+    """The case that matters: `gh auth login` happened after the first bootstrap."""
+    filled, text = _fill("GH_TOKEN=\nOTHER=1\n", "GH_TOKEN", "gho_example", tmp_path)
+
+    assert filled
+    assert "GH_TOKEN=gho_example\n" in text
+    assert "OTHER=1\n" in text
+
+
+def test_an_existing_value_is_never_overwritten(tmp_path: Path) -> None:
+    """The operator's own token outranks anything this script can discover."""
+    filled, text = _fill("GH_TOKEN=mine\n", "GH_TOKEN", "gho_example", tmp_path)
+
+    assert not filled
+    assert text == "GH_TOKEN=mine\n"
+
+
+def test_a_key_that_is_not_there_is_not_appended(tmp_path: Path) -> None:
+    """.env.example defines the keys; inventing one hides a typo in the name."""
+    filled, text = _fill("OTHER=1\n", "GH_TOKEN", "gho_example", tmp_path)
+
+    assert not filled
+    assert "GH_TOKEN" not in text
+
+
+def test_nothing_happens_without_a_value(tmp_path: Path) -> None:
+    """`gh auth token` can succeed and print nothing."""
+    filled, text = _fill("GH_TOKEN=\n", "GH_TOKEN", "", tmp_path)
+
+    assert not filled
+    assert text == "GH_TOKEN=\n"
+
+
+def test_a_commented_key_is_left_alone(tmp_path: Path) -> None:
+    """A commented line is the operator's note, not a slot to fill."""
+    filled, text = _fill("# GH_TOKEN=\n", "GH_TOKEN", "gho_example", tmp_path)
+
+    assert not filled
+    assert text == "# GH_TOKEN=\n"

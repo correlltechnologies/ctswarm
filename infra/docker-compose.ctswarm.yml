@@ -156,6 +156,7 @@ services:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
       - SLACK_STATUS_CHANNEL=${SLACK_STATUS_CHANNEL:-}
       - SLACK_APPROVAL_CHANNEL=${SLACK_APPROVAL_CHANNEL:-}
+      - GH_TOKEN=${GH_TOKEN:-}
     ports:
       - "127.0.0.1:8092:8092"
     # ./var/mcp belongs to the host account, and this image runs as uid 10001.
@@ -230,6 +231,12 @@ services:
       - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
       - CTSWARM_CLAUDE_FAILOVER_MODEL=${CTSWARM_CLAUDE_FAILOVER_MODEL:-sonnet}
       - CTSWARM_CODEX_FAILOVER_MODEL=${CTSWARM_CODEX_FAILOVER_MODEL:-gpt-5.5}
+      # SWE-AF opens the pull request from inside this container with the gh
+      # CLI, and its own prompt tells the agent that GH_TOKEN is already set.
+      # Nothing set it. A host login does not help either: ~/.config/gh never
+      # enters the container, so a build could run all the way to the end and
+      # then fail at the one step the whole build exists to reach.
+      - GH_TOKEN=${GH_TOKEN:-}
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
       - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}
@@ -314,6 +321,12 @@ services:
       - CTSWARM_EXECUTION_MODE=${CTSWARM_EXECUTION_MODE:-subscription_only}
       - CTSWARM_CLAUDE_FAILOVER_MODEL=${CTSWARM_CLAUDE_FAILOVER_MODEL:-sonnet}
       - CTSWARM_CODEX_FAILOVER_MODEL=${CTSWARM_CODEX_FAILOVER_MODEL:-gpt-5.5}
+      # SWE-AF opens the pull request from inside this container with the gh
+      # CLI, and its own prompt tells the agent that GH_TOKEN is already set.
+      # Nothing set it. A host login does not help either: ~/.config/gh never
+      # enters the container, so a build could run all the way to the end and
+      # then fail at the one step the whole build exists to reach.
+      - GH_TOKEN=${GH_TOKEN:-}
       - SWE_MODEL_HIGH=${SWE_MODEL_HIGH:-ctswarm/high}
       - SWE_MODEL_MED=${SWE_MODEL_MED:-ctswarm/med}
       - SWE_MODEL_LOW=${SWE_MODEL_LOW:-ctswarm/low}

@@ -266,26 +266,57 @@ fi
 # ---------------------------------------------------------------------------
 say "Configuration"
 # ---------------------------------------------------------------------------
+# Writes a key only when .env has it present and empty, so an operator's value
+# and a value from an earlier run both survive. The value arrives through the
+# environment rather than argv, because a process list is world-readable.
+fill_if_empty() {
+  local key="$1"
+  [[ -n "${CTSWARM_FILL_VALUE:-}" ]] || return 1
+  CTSWARM_FILL_KEY="$key" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+
+key = os.environ["CTSWARM_FILL_KEY"]
+value = os.environ["CTSWARM_FILL_VALUE"]
+path = Path(".env")
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+for index, line in enumerate(lines):
+    if line.rstrip("\n").strip() == f"{key}=":
+        lines[index] = f"{key}={value}\n"
+        path.write_text("".join(lines), encoding="utf-8")
+        raise SystemExit(0)
+raise SystemExit(1)
+PYEOF
+}
+
 if [[ $CHECK_ONLY -eq 1 ]]; then
   note "check mode: skipping .env"
-elif [[ -f .env ]]; then
-  ok ".env exists (left untouched)"
 else
-  cp .env.example .env
-  # Fill in what can be discovered without prompting. Never invents a value.
-  if have gh && gh auth status >/dev/null 2>&1; then
-    if TOKEN=$(gh auth token 2>/dev/null) && [[ -n "$TOKEN" ]]; then
-      sed -i.bak "s|^GH_TOKEN=.*|GH_TOKEN=${TOKEN}|" .env && rm -f .env.bak
-      ok "GH_TOKEN from gh cli"
-    fi
+  if [[ ! -f .env ]]; then
+    cp .env.example .env
+    ok "created .env from .env.example"
   fi
-  if [[ $SUBSCRIPTION_ONLY -eq 1 ]]; then
+  if [[ $SUBSCRIPTION_ONLY -eq 1 ]] && ! grep -q '^CTSWARM_EXECUTION_MODE=' .env; then
     sed -i.bak "s|^# *CTSWARM_EXECUTION_MODE=.*|CTSWARM_EXECUTION_MODE=subscription_only|" .env && rm -f .env.bak
     grep -q '^CTSWARM_EXECUTION_MODE=' .env \
       || printf '\nCTSWARM_EXECUTION_MODE=subscription_only\n' >> .env
     ok "pinned CTSWARM_EXECUTION_MODE=subscription_only"
   fi
-  ok "created .env from .env.example"
+  # Discovery runs on every bootstrap, not only the run that creates .env. The
+  # first run is the worst possible moment to look for a login: the operator
+  # has not made one yet, and this script is what tells them to. Looking only
+  # then meant a `gh auth login` done afterwards never reached .env, so the
+  # agent containers went off to open a pull request with no token, at the end
+  # of a build rather than before it.
+  if have gh && gh auth status >/dev/null 2>&1; then
+    if CTSWARM_FILL_VALUE=$(gh auth token 2>/dev/null) && fill_if_empty GH_TOKEN; then
+      ok "GH_TOKEN from gh cli"
+    fi
+    unset CTSWARM_FILL_VALUE
+  fi
+  if [[ -f .env ]]; then
+    ok ".env present; existing values left untouched"
+  fi
 fi
 
 # Docker turns a bind mount of a missing host file into a *directory*, silently.
