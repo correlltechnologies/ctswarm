@@ -62,17 +62,65 @@ while IFS= read -r relative_path; do
   fi
 done <<<"$touched_files"
 
+# Which paths the last successful run wrote. Without this, a tree ctswarm
+# patched itself is indistinguishable from one an operator edited by hand, so
+# *updating* a patch stranded every existing checkout: the vendor tree no longer
+# matched the new expected tree, it was dirty because the old patches were
+# applied, and the only way forward was deleting vendor/ and re-cloning.
+stamp="$vendor_dir/.ctswarm-applied-paths"
+
 if [[ "$matches_expected" == true ]]; then
+  printf '%s\n' "$touched_files" > "$stamp"
   exit 0
 fi
 
-if [[ -n "$(git -C "$vendor_dir" status --porcelain)" ]]; then
-  echo "vendor/SWE-AF has changes that do not match the ctswarm patch set" >&2
-  echo "refusing to overwrite a partial or user-modified vendor tree" >&2
+# Modifications this script is allowed to discard: the paths it wrote last time
+# and the paths it is about to write. Anything else dirty is the operator's.
+owned="$(sort -u <(cat "$stamp" 2>/dev/null) <(printf '%s\n' "$touched_files"))"
+foreign=""
+while IFS= read -r status_line; do
+  [[ -n "$status_line" ]] || continue
+  dirty_path="${status_line:3}"
+  # This script's own bookkeeping, not part of anyone's source tree.
+  case "$dirty_path" in
+    .ctswarm-applied-paths|.ctswarm-pre-rebuild.diff) continue ;;
+  esac
+  if ! grep -Fxq "$dirty_path" <<<"$owned"; then
+    foreign+="  $dirty_path"$'\n'
+  fi
+done < <(git -C "$vendor_dir" status --porcelain)
+
+if [[ -n "$foreign" ]]; then
+  echo "vendor/SWE-AF has changes ctswarm did not make:" >&2
+  printf '%s' "$foreign" >&2
+  echo "refusing to overwrite a user-modified vendor tree" >&2
   exit 1
 fi
+
+# Every discarded byte is recoverable. The ownership check above says these
+# paths are ctswarm's to rewrite, but "ctswarm wrote it" is inferred from a
+# stamp file that a first upgrade does not have yet, and being wrong about that
+# would destroy work with no way back.
+backup="$vendor_dir/.ctswarm-pre-rebuild.diff"
+if git -C "$vendor_dir" diff HEAD > "$backup" && [[ -s "$backup" ]]; then
+  echo "saved the previous vendor state to $backup"
+else
+  rm -f "$backup"
+fi
+
+# Return the tree to the pinned commit before applying, so a patch that changed
+# since last time does not have to apply on top of its own older self.
+while IFS= read -r relative_path; do
+  [[ -n "$relative_path" ]] || continue
+  if git -C "$vendor_dir" ls-files --error-unmatch "$relative_path" >/dev/null 2>&1; then
+    git -C "$vendor_dir" checkout --force HEAD -- "$relative_path"
+  else
+    rm -f "$vendor_dir/$relative_path"
+  fi
+done <<<"$owned"
 
 for patch_path in "${patches[@]}"; do
   git -C "$vendor_dir" apply "$patch_path"
   echo "applied SWE-AF patch: $(basename "$patch_path")"
 done
+printf '%s\n' "$touched_files" > "$stamp"
