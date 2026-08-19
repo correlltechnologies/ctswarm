@@ -122,6 +122,16 @@ class BuildRecord:
 # and this default is chosen for the image ctswarm actually ships, which is root.
 PERMISSION_MODE = os.environ.get("CTSWARM_PERMISSION_MODE", "acceptEdits").strip()
 
+#: How a scoped outcome lands on the shared build state machine. Exhausted
+#: capacity is *blocked* rather than *failed*: nothing is wrong with the request
+#: or the code, and the right operator action is to wait or clear the hold,
+#: which is a different decision from fixing a rejected change.
+SCOPED_TERMINAL_STATES = {
+    "complete": BuildState.COMPLETE,
+    "blocked": BuildState.BLOCKED,
+    "capacity_exhausted": BuildState.BLOCKED,
+}
+
 CONTROL_PAUSE = "build_control_pause"
 CONTROL_RESUME = "build_control_resume"
 CONTROL_STOP = "build_control_stop"
@@ -741,6 +751,84 @@ class Orchestrator:
         except httpx.HTTPError:
             return False
         return response.status_code < 400
+
+    # -- scoped path -------------------------------------------------------
+
+    async def run_scoped(
+        self,
+        *,
+        goal: str,
+        repo_url: str,
+        build_id: str,
+        source_branch: str = "",
+        create_pull_request: bool = True,
+        on_status=None,
+    ) -> BuildRecord:
+        """Run one scoped change locally, with no AgentField involved.
+
+        The record this returns is the same shape the polling path produces, so
+        the scheduler's queue accounting, snapshots, terminal ledger entry, and
+        controls all work unchanged. What differs is that there is no execution
+        to poll: the work happens in this process and the record moves straight
+        from executing to a terminal state.
+
+        Pause is not offered here and that is deliberate. A scoped build is
+        three harness invocations, so the honest control is stop, and a pause
+        that could only take effect after the work was already done would be a
+        lie of the kind this codebase has removed elsewhere.
+        """
+        from .scoped import ScopedBuild
+
+        record = BuildRecord(
+            build_id=build_id,
+            goal=goal,
+            repo_url=repo_url,
+            runtime=Runtime.CLAUDE_CODE,
+            state=BuildState.EXECUTING,
+            phase_detail="scoped build starting",
+        )
+
+        if self.control_state(build_id) == "stopped":
+            record.state = BuildState.STOPPED
+            record.phase_detail = "stopped by owner before any work started"
+            return record
+
+        def note(message: str) -> None:
+            record.phase_detail = message[:300]
+            record.updated_at = time.time()
+            record.last_progress_at = time.time()
+
+        runner = ScopedBuild(ledger=self.ledger, capacity=self.capacity)
+        outcome = await runner.run(
+            goal=goal,
+            repo_url=repo_url,
+            build_id=build_id,
+            source_branch=source_branch,
+            create_pull_request=create_pull_request,
+            note=note,
+        )
+
+        record.pr_url = outcome.pr_url
+        record.gate_results = {
+            "scoped": outcome.to_dict(),
+            "scanners": outcome.scanners,
+        }
+        record.phase_detail = outcome.detail[:300]
+        record.state = SCOPED_TERMINAL_STATES.get(outcome.outcome, BuildState.FAILED)
+        if record.state is not BuildState.COMPLETE:
+            record.error = f"{outcome.outcome}: {outcome.detail}"[:600]
+        record.updated_at = time.time()
+
+        # A stop that landed while the harness was mid-invocation cannot
+        # interrupt it, but it must still decide the outcome rather than being
+        # silently overwritten by whatever the harness happened to return.
+        if self.control_state(build_id) == "stopped":
+            record.state = BuildState.STOPPED
+            record.error = "stopped by owner"
+
+        if on_status is not None:
+            await on_status(record)
+        return record
 
     # -- gating ------------------------------------------------------------
 
