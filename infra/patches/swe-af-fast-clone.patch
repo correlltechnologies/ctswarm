@@ -1,0 +1,43 @@
+diff --git a/swe_af/fast/app.py b/swe_af/fast/app.py
+--- a/swe_af/fast/app.py
++++ b/swe_af/fast/app.py
+@@ -97,6 +97,39 @@
+     if not repo_path:
+         raise ValueError("Either repo_path or repo_url must be provided")
+ 
++    # The docstring above says this accepts the same interface as swe-planner's
++    # build(), and it does, apart from the one part that matters: swe-planner
++    # clones repo_url and this never did. It created the directory, run_git_init
++    # found no repository and initialized an empty one, and the build reported
++    # success in six minutes by writing a brand new project into an empty
++    # folder. No remote meant no pull request, and all twelve nodes said
++    # "succeeded" while the target repository was never touched.
++    if effective_repo_url and not os.path.isdir(os.path.join(repo_path, ".git")):
++        if os.path.isdir(repo_path) and os.listdir(repo_path):
++            raise RuntimeError(
++                f"{repo_path} already holds files but is not a git checkout; "
++                "refusing to clone over it. Remove it and retry."
++            )
++        os.makedirs(os.path.dirname(repo_path) or ".", exist_ok=True)
++        process = await asyncio.create_subprocess_exec(
++            "git",
++            "clone",
++            effective_repo_url,
++            repo_path,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++        )
++        _, stderr = await process.communicate()
++        if process.returncode != 0:
++            raise RuntimeError(
++                f"git clone {effective_repo_url!r} failed: "
++                f"{stderr.decode(errors='replace')[:400]}"
++            )
++        app.note(
++            f"Fast build: cloned {effective_repo_url}",
++            tags=["fast_build", "git_init", "clone"],
++        )
++
+     os.makedirs(repo_path, exist_ok=True)
+ 
+     resolved = fast_resolve_models(cfg)

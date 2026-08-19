@@ -29,6 +29,7 @@ patches=(
   # Last: it edits the verify loop that swe-af-hybrid-runtime.patch introduces
   # continuous_repair into, so it cannot apply before that patch has run.
   "$repo_root/infra/patches/swe-af-verify-convergence.patch"
+  "$repo_root/infra/patches/swe-af-fast-clone.patch"
 )
 
 # Later patches can intentionally modify lines introduced by earlier patches.
