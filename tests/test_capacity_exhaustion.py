@@ -264,3 +264,78 @@ def test_an_unknown_runtime_is_rejected_rather_than_ignored() -> None:
         _parse_runtime("gpt")
     assert caught.value.status_code == 400
     assert "codex" in caught.value.detail
+
+
+# --- probing a harness rather than inferring its state ----------------------
+
+
+def _fake_cli(tmp_path, name: str, *, stdout: str, exit_code: int) -> None:
+    """A stand-in CLI on PATH, so the probe is tested against real subprocesses."""
+    script = tmp_path / name
+    script.write_text(
+        f"#!/bin/sh\ncat <<'OUT'\n{stdout}\nOUT\nexit {exit_code}\n", encoding="utf-8"
+    )
+    script.chmod(0o755)
+
+
+@pytest.fixture
+def on_path(tmp_path, monkeypatch):
+    # The stand-ins come first, but the real /bin stays reachable so the scripts
+    # can use ordinary tools. A harness the test never creates is still absent,
+    # which is what the missing-binary case needs.
+    monkeypatch.setenv("PATH", f"{tmp_path}:/bin:/usr/bin")
+    return tmp_path
+
+
+def test_a_working_harness_is_usable(on_path) -> None:
+    from ctswarm.capacity import probe_runtime
+
+    _fake_cli(on_path, "claude", stdout="OK", exit_code=0)
+
+    usable, detail = probe_runtime(Runtime.CLAUDE_CODE, timeout_s=10)
+
+    assert usable is True
+    assert detail
+
+
+def test_a_revoked_token_is_caught_despite_a_zero_exit(on_path) -> None:
+    """`claude -p` prints the 401 and exits 0. This is the real observed output."""
+    from ctswarm.capacity import probe_runtime
+
+    _fake_cli(
+        on_path,
+        "claude",
+        stdout="Failed to authenticate. API Error: 401 OAuth access token has been revoked.",
+        exit_code=0,
+    )
+
+    usable, detail = probe_runtime(Runtime.CLAUDE_CODE, timeout_s=10)
+
+    assert usable is False
+    assert "revoked" in detail
+
+
+def test_a_spent_subscription_is_caught(on_path) -> None:
+    """Codex's real wording, verbatim, when the weekly allowance is gone."""
+    from ctswarm.capacity import probe_runtime
+
+    _fake_cli(
+        on_path,
+        "codex",
+        stdout="ERROR: You've hit your usage limit. Upgrade to Pro or try again later.",
+        exit_code=1,
+    )
+
+    usable, detail = probe_runtime(Runtime.CODEX, timeout_s=10)
+
+    assert usable is False
+    assert "usage limit" in detail
+
+
+def test_a_missing_binary_is_not_something_to_route_work_to(on_path) -> None:
+    from ctswarm.capacity import probe_runtime
+
+    usable, detail = probe_runtime(Runtime.CODEX, timeout_s=10)
+
+    assert usable is False
+    assert "PATH" in detail

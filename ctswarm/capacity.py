@@ -164,6 +164,17 @@ _PROBE = {
     Runtime.CODEX: ["codex", "exec", "--skip-git-repo-check", "say OK"],
 }
 
+# Wording that means the harness did not do the work, whatever the exit code
+# said. Exhaustion is one reason; a dead login is the other, and it is the one
+# that hides, because `claude -p` prints "OAuth access token has been revoked"
+# and then exits 0.
+_PROBE_FAILURE = re.compile(
+    _EXHAUSTION.pattern
+    + r"|failed to authenticate|not authenticated|unauthorized|invalid api key"
+    + r"|oauth.{0,40}(revoked|expired|invalid)|\b401\b|\b403\b",
+    re.IGNORECASE,
+)
+
 
 def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool, str]:
     """Ask a harness whether it can run, by running it.
@@ -204,8 +215,19 @@ def probe_runtime(runtime: Runtime, *, timeout_s: float = 120.0) -> tuple[bool, 
     except OSError as exc:
         return False, f"{command[0]} could not be run: {exc}"
     output = f"{completed.stdout}\n{completed.stderr}".strip()
-    if completed.returncode == 0:
+    if completed.returncode == 0 and not _PROBE_FAILURE.search(output):
         return True, "answered a trivial prompt"
+    if completed.returncode == 0:
+        # `claude -p` prints "Failed to authenticate. API Error: 401 OAuth
+        # access token has been revoked." and then exits 0. Trusting the exit
+        # code alone would have reported a revoked token as a working harness,
+        # which is the same shape as every other defect this probe exists to
+        # catch: a failure that reports success.
+        reason = next(
+            (line for line in output.splitlines() if _PROBE_FAILURE.search(line)),
+            "reported a failure while exiting 0",
+        )
+        return False, reason.strip()[:300]
     # The exit code says it failed; the text says why, and the wording is what
     # tells an exhausted subscription apart from a broken install.
     reason = next(
