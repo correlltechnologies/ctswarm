@@ -117,6 +117,11 @@ class BuildRecord:
 # Control signals are stored in the ledger rather than held in memory, so a
 # pause survives an orchestrator restart. A pause that evaporates when the
 # process restarts is not a pause.
+# Overridable because the right value depends on how the agent image is built:
+# a container running as a non-root user can use the stricter bypassPermissions,
+# and this default is chosen for the image ctswarm actually ships, which is root.
+PERMISSION_MODE = os.environ.get("CTSWARM_PERMISSION_MODE", "acceptEdits").strip()
+
 CONTROL_PAUSE = "build_control_pause"
 CONTROL_RESUME = "build_control_resume"
 CONTROL_STOP = "build_control_stop"
@@ -489,12 +494,20 @@ class Orchestrator:
             # permission to write to that file, please approve the Write
             # request" and produces nothing; the coder then reports its task
             # complete having changed no files, and the verifier fails because
-            # it could not create its own output file. "auto" is the value both
-            # adapters understand: bypassPermissions for Claude, the sandbox
-            # flag for Codex. An unattended factory cannot answer a prompt, and
-            # the container plus the disposable checkout are the boundary that
-            # makes not asking safe.
-            "permission_mode": "auto",
+            # it could not create its own output file.
+            #
+            # Not "auto", which the adapter maps to bypassPermissions. The agent
+            # containers run as root, and Claude Code refuses that mode outright:
+            # "--dangerously-skip-permissions cannot be used with root/sudo
+            # privileges for security reasons". acceptEdits carries no such
+            # restriction and was verified in the running container to allow both
+            # Write and Bash. Codex is unaffected: its wrapper already runs
+            # danger-full-access inside this container.
+            #
+            # An unattended factory cannot answer a prompt by definition, and the
+            # container plus the disposable checkout are the boundary that makes
+            # not asking safe.
+            "permission_mode": PERMISSION_MODE,
             "check_ci": True,
             "max_ci_fix_cycles": max_ci_fix_cycles,
             # Bound every individual agent call as well as the build-level
@@ -550,7 +563,7 @@ class Orchestrator:
                 "runtime": runtime.value,
                 # Same reason as the full path above: nobody is here to approve
                 # a Write.
-                "permission_mode": "auto",
+                "permission_mode": PERMISSION_MODE,
                 "models": {"default": models.get("default", "")} if models.get("default") else None,
                 "enable_github_pr": bool(
                     create_pull_request and scm_provider == "github"

@@ -454,4 +454,10 @@ def test_both_build_paths_grant_the_harness_permission() -> None:
     ).read_text(encoding="utf-8")
 
     # One for the full pipeline, one for the fast node.
-    assert source.count('"permission_mode": "auto"') == 2
+    assert source.count('"permission_mode": PERMISSION_MODE') == 2
+
+    from ctswarm.orchestrator import PERMISSION_MODE
+
+    # Not bypassPermissions: the agent containers run as root, and Claude Code
+    # refuses that mode outright rather than degrading to it.
+    assert PERMISSION_MODE == "acceptEdits"
